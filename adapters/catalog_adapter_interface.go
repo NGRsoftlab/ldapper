@@ -1,12 +1,16 @@
 // Copyright 2020-2026 NGR Softlab
-package ldapper
+package adapters
 
-import "github.com/go-ldap/ldap/v3"
+import (
+	"github.com/go-ldap/ldap/v3"
+
+	"github.com/NGRsoftlab/ldapper/types"
+)
 
 type CatalogAdapter interface {
 	// cast things
-	GetNormalizedUserInfo(ldapUser LDAPUser) *UserNormalizedInfo
-	OUInfoFromEntry(entry ldap.Entry) *OUInfo
+	GetNormalizedUserInfo(ldapUser types.LDAPUser) *types.UserNormalizedInfo
+	OUInfoFromEntry(entry ldap.Entry) *types.OUInfo
 
 	// object type filters
 	UserObjectFilter() string
@@ -16,7 +20,7 @@ type CatalogAdapter interface {
 	// search filters
 	SearchUserFilterTemplate() string       // NB: 1 arg
 	SearchUserGroupsFilterTemplate() string // NB: N args, use with arglist unpacking
-	SearchUserGroupsFilterTemplateArgs(ldapUser LDAPUser) []any
+	SearchUserGroupsFilterTemplateArgs(ldapUser types.LDAPUser) []any
 	SearchOUFilterTemplate() string    // NB: 1 arg
 	SearchGroupFilterTemplate() string // NB: 1 arg
 

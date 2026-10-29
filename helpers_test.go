@@ -1,9 +1,13 @@
 // Copyright 2020-2026 NGR Softlab
 package ldapper
 
-import "github.com/go-ldap/ldap/v3"
+import (
+	"github.com/go-ldap/ldap/v3"
 
-func newTestConnection(adapter CatalogAdapter, conn LDAPConn) *LDAPConnection {
+	"github.com/NGRsoftlab/ldapper/adapters"
+)
+
+func newTestConnection(adapter adapters.CatalogAdapter, conn LDAPConn) *LDAPConnection {
 	return &LDAPConnection{catalogAdapter: adapter, connection: conn}
 }
 
@@ -14,11 +18,4 @@ func newLDAPEntry(dn string, attrs map[string][]string) *ldap.Entry {
 		entry.Attributes = append(entry.Attributes, &ldap.EntryAttribute{Name: name, Values: values})
 	}
 	return entry
-}
-
-func newLDAPUser(dn string, attrs map[string][]string) LDAPUser {
-	if attrs == nil {
-		attrs = map[string][]string{}
-	}
-	return LDAPUser{DN: dn, Attributes: attrs}
 }

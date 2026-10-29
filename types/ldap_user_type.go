@@ -1,5 +1,5 @@
 // Copyright 2020-2026 NGR Softlab
-package ldapper
+package types
 
 type LDAPUser struct {
 	DN         string              // distinguished Name of the user

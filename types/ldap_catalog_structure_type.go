@@ -1,4 +1,4 @@
-package ldapper
+package types
 
 type OUInfo struct {
 	Name     string    `json:"name"`

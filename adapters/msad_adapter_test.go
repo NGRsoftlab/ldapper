@@ -1,11 +1,13 @@
 // Copyright 2020-2026 NGR Softlab
-package ldapper
+package adapters
 
 import (
 	"testing"
 
 	"github.com/go-ldap/ldap/v3"
 	"github.com/stretchr/testify/assert"
+
+	"github.com/NGRsoftlab/ldapper/types"
 )
 
 func TestMSADAdapter_GetNormalizedUserInfo_FullAttributes(t *testing.T) {
@@ -75,7 +77,7 @@ func TestMSADAdapter_GetNormalizedUserInfo_NoPhoto(t *testing.T) {
 func TestMSADAdapter_GetNormalizedUserInfo_EmptyUser(t *testing.T) {
 	// empty LDAPUser (zero value) — all fields empty, must be no error/panic
 	adapter := MSADAdapter{}
-	user := LDAPUser{}
+	user := types.LDAPUser{}
 
 	info := adapter.GetNormalizedUserInfo(user)
 
@@ -100,7 +102,7 @@ func TestMSADAdapter_GetNormalizedUserInfo_NilAttributesMap(t *testing.T) {
 	// Attributes == nil must not lead to panic:
 	// GetAttributeValue/GetFirstNonNullAttributeValue must process correctly nil-map (check fact behavior).
 	adapter := MSADAdapter{}
-	user := LDAPUser{DN: "cn=User,dc=example,dc=com", Attributes: nil}
+	user := types.LDAPUser{DN: "cn=User,dc=example,dc=com", Attributes: nil}
 
 	assert.NotPanics(t, func() {
 		info := adapter.GetNormalizedUserInfo(user)
@@ -168,7 +170,7 @@ func TestMSADAdapter_OUInfoFromEntry_ChildrenAppendable(t *testing.T) {
 	info := adapter.OUInfoFromEntry(entry)
 
 	assert.NotPanics(t, func() {
-		info.Children = append(info.Children, &OUInfo{DN: "ou=Sub,ou=IT,dc=example,dc=com"})
+		info.Children = append(info.Children, &types.OUInfo{DN: "ou=Sub,ou=IT,dc=example,dc=com"})
 	})
 	assert.Len(t, info.Children, 1)
 }
@@ -344,7 +346,7 @@ func TestMSADAdapter_SearchUserGroupsFilterTemplateArgs_IgnoresDistinguishedName
 
 func TestMSADAdapter_SearchUserGroupsFilterTemplateArgs_EmptyDN(t *testing.T) {
 	adapter := MSADAdapter{}
-	user := LDAPUser{}
+	user := types.LDAPUser{}
 
 	args := adapter.SearchUserGroupsFilterTemplateArgs(user)
 

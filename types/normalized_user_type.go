@@ -1,7 +1,7 @@
 // Copyright 2020-2026 NGR Softlab
-package ldapper
+package types
 
-// TODO: think what else we need in normalized info
+// TODO: think what else we need in normalized user info
 type UserNormalizedInfo struct {
 	DistinguishedName string
 	CommonName        string

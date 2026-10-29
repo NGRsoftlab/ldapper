@@ -1,16 +1,20 @@
 // Copyright 2020-2026 NGR Softlab
-package ldapper
+package adapters
 
-import "github.com/go-ldap/ldap/v3"
+import (
+	"github.com/go-ldap/ldap/v3"
+
+	"github.com/NGRsoftlab/ldapper/types"
+)
 
 type OPENLDAPAdapter struct{}
 
 // CAST
 
-func (a OPENLDAPAdapter) GetNormalizedUserInfo(ldapUser LDAPUser) *UserNormalizedInfo {
-	// TODO: think what else we need in normalized info
+func (a OPENLDAPAdapter) GetNormalizedUserInfo(ldapUser types.LDAPUser) *types.UserNormalizedInfo {
+	// TODO: think what else we need in normalized user info
 
-	return &UserNormalizedInfo{
+	return &types.UserNormalizedInfo{
 		DistinguishedName: ldapUser.GetAttributeValue("dn"),
 		CommonName:        ldapUser.GetAttributeValue("cn"),
 		Mobile:            ldapUser.GetAttributeValue("mobile"),
@@ -28,12 +32,12 @@ func (a OPENLDAPAdapter) GetNormalizedUserInfo(ldapUser LDAPUser) *UserNormalize
 	}
 }
 
-func (a OPENLDAPAdapter) OUInfoFromEntry(entry ldap.Entry) *OUInfo {
-	return &OUInfo{
+func (a OPENLDAPAdapter) OUInfoFromEntry(entry ldap.Entry) *types.OUInfo {
+	return &types.OUInfo{
 		DN:       entry.DN,
 		Name:     entry.DN,
 		OU:       entry.GetAttributeValue("ou"),
-		Children: make([]*OUInfo, 0),
+		Children: make([]*types.OUInfo, 0),
 	}
 }
 
@@ -61,7 +65,7 @@ func (a OPENLDAPAdapter) SearchUserGroupsFilterTemplate() string {
 	return "(|(&(objectClass=groupOfNames)(member=%s))(&(objectClass=posixGroup)(memberUid=%s)))"
 }
 
-func (a OPENLDAPAdapter) SearchUserGroupsFilterTemplateArgs(ldapUser LDAPUser) []any {
+func (a OPENLDAPAdapter) SearchUserGroupsFilterTemplateArgs(ldapUser types.LDAPUser) []any {
 	return []any{ldapUser.DN, ldapUser.GetAttributeValue("uid")}
 }
 

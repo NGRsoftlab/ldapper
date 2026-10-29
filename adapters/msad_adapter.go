@@ -1,16 +1,20 @@
 // Copyright 2020-2026 NGR Softlab
-package ldapper
+package adapters
 
-import "github.com/go-ldap/ldap/v3"
+import (
+	"github.com/go-ldap/ldap/v3"
+
+	"github.com/NGRsoftlab/ldapper/types"
+)
 
 type MSADAdapter struct{}
 
 // CAST
 
-func (a MSADAdapter) GetNormalizedUserInfo(ldapUser LDAPUser) *UserNormalizedInfo {
-	// TODO: think what else we need in normalized info
+func (a MSADAdapter) GetNormalizedUserInfo(ldapUser types.LDAPUser) *types.UserNormalizedInfo {
+	// TODO: think what else we need in normalized user info
 
-	return &UserNormalizedInfo{
+	return &types.UserNormalizedInfo{
 		DistinguishedName: ldapUser.GetAttributeValue("distinguishedName"),
 		CommonName:        ldapUser.GetAttributeValue("cn"),
 		Mobile:            ldapUser.GetAttributeValue("mobile"),
@@ -28,12 +32,12 @@ func (a MSADAdapter) GetNormalizedUserInfo(ldapUser LDAPUser) *UserNormalizedInf
 	}
 }
 
-func (a MSADAdapter) OUInfoFromEntry(entry ldap.Entry) *OUInfo {
-	return &OUInfo{
+func (a MSADAdapter) OUInfoFromEntry(entry ldap.Entry) *types.OUInfo {
+	return &types.OUInfo{
 		DN:       entry.DN,
 		Name:     entry.GetAttributeValue("name"),
 		OU:       entry.DN,
-		Children: make([]*OUInfo, 0),
+		Children: make([]*types.OUInfo, 0),
 	}
 }
 
@@ -61,7 +65,7 @@ func (a MSADAdapter) SearchUserGroupsFilterTemplate() string {
 	return "(&(objectCategory=group)(member:1.2.840.113556.1.4.1941:=%s))"
 }
 
-func (a MSADAdapter) SearchUserGroupsFilterTemplateArgs(ldapUser LDAPUser) []any {
+func (a MSADAdapter) SearchUserGroupsFilterTemplateArgs(ldapUser types.LDAPUser) []any {
 	return []any{ldapUser.DN}
 }
 

@@ -1,5 +1,5 @@
 // Copyright 2020-2026 NGR Softlab
-package ldapper
+package adapters
 
 import (
 	"fmt"
@@ -8,6 +8,8 @@ import (
 
 	"github.com/go-ldap/ldap/v3"
 	"github.com/stretchr/testify/assert"
+
+	"github.com/NGRsoftlab/ldapper/types"
 )
 
 func TestOPENLDAPAdapter_GetNormalizedUserInfo_FullAttributes(t *testing.T) {
@@ -79,7 +81,7 @@ func TestOPENLDAPAdapter_GetNormalizedUserInfo_DistinguishedNameFromAttrNotFromF
 
 func TestOPENLDAPAdapter_GetNormalizedUserInfo_EmptyUser(t *testing.T) {
 	adapter := OPENLDAPAdapter{}
-	user := LDAPUser{}
+	user := types.LDAPUser{}
 
 	info := adapter.GetNormalizedUserInfo(user)
 
@@ -99,7 +101,7 @@ func TestOPENLDAPAdapter_GetNormalizedUserInfo_EmptyUser(t *testing.T) {
 func TestOPENLDAPAdapter_GetNormalizedUserInfo_NilAttributesMap(t *testing.T) {
 	// A nil Attributes map must not cause a panic.
 	adapter := OPENLDAPAdapter{}
-	user := LDAPUser{DN: "uid=jdoe,dc=example,dc=com", Attributes: nil}
+	user := types.LDAPUser{DN: "uid=jdoe,dc=example,dc=com", Attributes: nil}
 
 	assert.NotPanics(t, func() {
 		info := adapter.GetNormalizedUserInfo(user)
@@ -219,7 +221,7 @@ func TestOPENLDAPAdapter_OUInfoFromEntry_ChildrenAppendable(t *testing.T) {
 	info := adapter.OUInfoFromEntry(entry)
 
 	assert.NotPanics(t, func() {
-		info.Children = append(info.Children, &OUInfo{DN: "ou=Sub,ou=IT,dc=example,dc=com"})
+		info.Children = append(info.Children, &types.OUInfo{DN: "ou=Sub,ou=IT,dc=example,dc=com"})
 	})
 	assert.Len(t, info.Children, 1)
 }
@@ -490,7 +492,7 @@ func TestOPENLDAPAdapter_SearchUserGroupsFilterTemplateArgs_DNUsesStructField(t 
 
 func TestOPENLDAPAdapter_SearchUserGroupsFilterTemplateArgs_EmptyUser(t *testing.T) {
 	adapter := OPENLDAPAdapter{}
-	user := LDAPUser{}
+	user := types.LDAPUser{}
 
 	args := adapter.SearchUserGroupsFilterTemplateArgs(user)
 
@@ -501,7 +503,7 @@ func TestOPENLDAPAdapter_SearchUserGroupsFilterTemplateArgs_EmptyUser(t *testing
 
 func TestOPENLDAPAdapter_SearchUserGroupsFilterTemplateArgs_NilAttributesMap(t *testing.T) {
 	adapter := OPENLDAPAdapter{}
-	user := LDAPUser{DN: "uid=jdoe,dc=example,dc=com", Attributes: nil}
+	user := types.LDAPUser{DN: "uid=jdoe,dc=example,dc=com", Attributes: nil}
 
 	assert.NotPanics(t, func() {
 		args := adapter.SearchUserGroupsFilterTemplateArgs(user)

@@ -4,10 +4,10 @@ package ldapper
 import (
 	"github.com/go-ldap/ldap/v3"
 
-	"github.com/NGRsoftlab/ldapper/adapters"
+	"github.com/NGRsoftlab/ldapper/interfaces"
 )
 
-func newTestConnection(adapter adapters.CatalogAdapter, conn LDAPConn) *LDAPConnection {
+func newTestConnection(adapter interfaces.CatalogAdapter, conn interfaces.LDAPConn) *LDAPConnection {
 	return &LDAPConnection{catalogAdapter: adapter, connection: conn}
 }
 

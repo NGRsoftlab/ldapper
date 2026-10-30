@@ -8,21 +8,14 @@ import (
 
 	"github.com/go-ldap/ldap/v3"
 
-	"github.com/NGRsoftlab/ldapper/adapters"
 	"github.com/NGRsoftlab/ldapper/constants"
+	"github.com/NGRsoftlab/ldapper/interfaces"
 	"github.com/NGRsoftlab/ldapper/types"
 )
 
-type LDAPConn interface {
-	StartTLS(config *tls.Config) error
-	Bind(username, password string) error
-	Search(request *ldap.SearchRequest) (*ldap.SearchResult, error)
-	Close() error
-}
-
 type LDAPConnection struct {
-	catalogAdapter  adapters.CatalogAdapter
-	connection      LDAPConn
+	catalogAdapter  interfaces.CatalogAdapter
+	connection      interfaces.LDAPConn
 	isAuthenticated bool
 	bindUser        string
 	bindPassword    string
@@ -35,7 +28,7 @@ func NewConnection(
 	useSSL bool,
 	skipTLS bool,
 	tlsCfg *tls.Config,
-	catalogAdapter adapters.CatalogAdapter) (*LDAPConnection, error) {
+	catalogAdapter interfaces.CatalogAdapter) (*LDAPConnection, error) {
 
 	var connection *ldap.Conn
 	var err error
@@ -83,7 +76,7 @@ func NewAuthenticatedConnection(
 	useSSL bool,
 	skipTLS bool,
 	tlsCfg *tls.Config,
-	catalogAdapter adapters.CatalogAdapter) (*LDAPConnection, *types.LDAPUser, error) {
+	catalogAdapter interfaces.CatalogAdapter) (*LDAPConnection, *types.LDAPUser, error) {
 
 	if username == "" || password == "" {
 		return nil, nil, errors.New("empty username/password passed")

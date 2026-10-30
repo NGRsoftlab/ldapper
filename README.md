@@ -34,7 +34,7 @@
 
 - 🔐 **Two authentication modes**:
   - `AuthenticateConn` — initial authentication that stores the service account credentials for subsequent operations.
-  - `AuthenticatedUser` — verifies end-user credentials and rebinds back to the service account.
+  - `AuthenticateUser` — verifies end-user credentials and rebinds back to the service account.
 - 🌐 **LDAP and LDAPS support** (TLS/StartTLS).
 - 👤 **User search** by login with a configurable set of attributes.
 - 👥 **User group search** with support for recursive search (AD) and two group types (OpenLDAP: `groupOfNames` and `posixGroup`).
@@ -187,10 +187,10 @@ if err != nil {
 - `"too many entries returned"` — more than one entry matched.
 - `"unsuccessful bind with passed bind credentials"` — invalid password (the original error is **not** returned to avoid leaking sensitive data).
 
-#### `AuthenticatedUser` — user verification with rebind
+#### `AuthenticateUser` — user verification with rebind
 
 ```go
-user, err := conn.AuthenticatedUser("jdoe", "user-password", "dc=example,dc=com")
+user, err := conn.AuthenticateUser("jdoe", "user-password", "dc=example,dc=com")
 if err != nil {
     log.Fatal(err)
 }
@@ -494,7 +494,7 @@ go tool cover -html=coverage.out
 
 | File | What is covered |
 | :--- | :--- |
-| `ldap_connection_test.go` | `NewConnection`, `NewAuthenticatedConnection`, `AuthenticateConn`, `AuthenticatedUser`, `Close`, `CustomSearch`, `GetUser`, `GetUserGroups`, `GetOUUsers`, `GetCatalogTree`, `GetRootOUs`, `GetSubOUs`, `GetRecursiveOUSearchResult`. |
+| `ldap_connection_test.go` | `NewConnection`, `NewAuthenticatedConnection`, `AuthenticateConn`, `AuthenticateUser`, `Close`, `CustomSearch`, `GetUser`, `GetUserGroups`, `GetOUUsers`, `GetCatalogTree`, `GetRootOUs`, `GetSubOUs`, `GetRecursiveOUSearchResult`. |
 | `msad_adapter_test.go` | `GetNormalizedUserInfo`, `OUInfoFromEntry`, filters, templates, `SearchUserGroupsFilterTemplateArgs`, attribute lists. |
 | `openldap_adapter_test.go` | Same for OpenLDAP + parentheses balance checks across all search templates. |
 | `helpers_test.go` | Helpers `newTestConnection`, `newLDAPEntry`, `newLDAPUser`. |

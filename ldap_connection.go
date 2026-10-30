@@ -13,6 +13,8 @@ import (
 	"github.com/NGRsoftlab/ldapper/types"
 )
 
+var dialURL = ldap.DialURL
+
 type LDAPConnection struct {
 	catalogAdapter  interfaces.CatalogAdapter
 	connection      interfaces.LDAPConn
@@ -42,7 +44,7 @@ func NewConnection(
 	}
 
 	if !useSSL {
-		connection, err = ldap.DialURL(fmt.Sprintf(constants.LDAPURITemplate, host, port))
+		connection, err = dialURL(fmt.Sprintf(constants.LDAPURITemplate, host, port))
 		if err != nil {
 			return nil, fmt.Errorf("unsuccessful dial: %s", err.Error())
 		}
@@ -55,7 +57,7 @@ func NewConnection(
 			}
 		}
 	} else {
-		connection, err = ldap.DialURL(fmt.Sprintf(constants.LDAPSURITemplate, host, port), ldap.DialWithTLSConfig(tlsCfg))
+		connection, err = dialURL(fmt.Sprintf(constants.LDAPSURITemplate, host, port), ldap.DialWithTLSConfig(tlsCfg))
 		if err != nil {
 			return nil, fmt.Errorf("unsuccessful dial: %s", err.Error())
 		}
@@ -79,7 +81,7 @@ func NewAuthenticatedConnection(
 	catalogAdapter interfaces.CatalogAdapter) (*LDAPConnection, *types.LDAPUser, error) {
 
 	if username == "" || password == "" {
-		return nil, nil, errors.New("empty username/password passed")
+		return nil, nil, errors.New("empty bind username/password passed")
 	}
 
 	connection, err := NewConnection(host, port, useSSL, skipTLS, tlsCfg, catalogAdapter)
@@ -89,6 +91,7 @@ func NewAuthenticatedConnection(
 
 	user, err := connection.AuthenticateConn(username, password, baseDN)
 	if err != nil {
+		connection.Close()
 		return nil, nil, err
 	}
 
@@ -101,34 +104,42 @@ func (conn *LDAPConnection) AuthenticateConn(username, password, baseDN string) 
 		return nil, errors.New("connection not initialized")
 	}
 
+	if username == "" || password == "" {
+		return nil, errors.New("empty bind username/password passed")
+	}
+
+	// bind check
+	err := conn.connection.Bind(username, password)
+	if err != nil {
+		// NB: no err value return - it can contain sensitive data
+		return nil, errors.New("unsuccessful bind with passed bind credentials")
+	}
+
 	// user is ok check
 	user, err := conn.GetUser(username, baseDN)
 	if err != nil {
 		return nil, err
 	}
 
-	// bind check
-	err = conn.connection.Bind(user.DN, password)
-	if err != nil {
-		// NB: no err value return - it can contain sensitive data
-		return user, errors.New("unsuccessful bind with passed bind credentials")
-	}
-
 	conn.isAuthenticated = true
-	conn.bindUser = user.DN
+	conn.bindUser = username
 	conn.bindPassword = password
 
 	return user, nil
 }
 
 // NB: can not be used with non-authenticated conn or with non-read-access-granted bindUser in conn cfg
-func (conn *LDAPConnection) AuthenticatedUser(username, password, baseDN string) (*types.LDAPUser, error) {
+func (conn *LDAPConnection) AuthenticateUser(username, password, baseDN string) (*types.LDAPUser, error) {
 	if conn.connection == nil {
 		return nil, errors.New("connection not initialized")
 	}
 
 	if !conn.isAuthenticated {
 		return nil, errors.New("connection not authenticated")
+	}
+
+	if username == "" || password == "" {
+		return nil, errors.New("empty username/password passed")
 	}
 
 	// user is ok check
@@ -144,7 +155,7 @@ func (conn *LDAPConnection) AuthenticatedUser(username, password, baseDN string)
 		return user, errors.New("unsuccessful bind with passed user credentials")
 	}
 
-	// rebind onto read access granted bind user
+	// rebind onto potentially ok access granted bind user
 	err = conn.connection.Bind(conn.bindUser, conn.bindPassword)
 	if err != nil {
 		// NB: no err value return - it can contain sensitive data

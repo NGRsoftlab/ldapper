@@ -7,8 +7,8 @@ A lightweight, adapter-based LDAP client for Go. LDAPper wraps
 
 - **Multi-host failover** and transparent reconnection.
 - **Pluggable catalog adapters** so the same API works against Microsoft
-  Active Directory and OpenLDAP (and any other directory you write an
-  adapter for).
+  Active Directory, OpenLDAP, ALD Pro, FreeIPA, and any other directory you
+  write an adapter for.
 - **Connection-level search limits** so callers don't pass `SizeLimit` /
   `TimeLimit` on every query.
 - **Efficient catalog tree discovery** — a single paged subtree search,
@@ -20,10 +20,12 @@ A lightweight, adapter-based LDAP client for Go. LDAPper wraps
 
 - [Installation](#installation)
 - [Quick start](#quick-start)
+- [Architecture](#architecture)
 - [Core concepts](#core-concepts)
   - [Connections](#connections)
   - [Adapters](#adapters)
   - [Search limits](#search-limits)
+- [Shipped adapters](#shipped-adapters)
 - [API overview](#api-overview)
   - [Authentication](#authentication)
   - [Searching](#searching)
@@ -79,7 +81,7 @@ func main() {
 	}
 	defer conn.Close()
 
-	log.Printf("connected to %s as %s", conn.CurrentHost(), user.DN)
+	log.Printf("authenticated as %s", user.DN)
 
 	// Fetch a user by sAMAccountName.
 	u, err := conn.GetUser("jdoe", "DC=corp,DC=example,DC=com")
@@ -90,6 +92,183 @@ func main() {
 	info := adapter.GetNormalizedUserInfo(*u)
 	log.Printf("%s <%s>", info.CommonName, info.Mail)
 }
+```
+
+---
+
+## Architecture
+
+LDAPper is intentionally small and layered. Only two things are pluggable
+(`interfaces.LDAPConn` and `interfaces.CatalogAdapter`); everything else is
+plain structs and functions.
+
+### Layers
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│  User code                                                       │
+│    conn, _ := ldapper.NewAuthenticatedConnection(...)            │
+│    conn.GetUser(...)  /  conn.GetCatalogTree(...)  /  ...        │
+└──────────────────────────────┬───────────────────────────────────┘
+                               │
+┌──────────────────────────────▼───────────────────────────────────┐
+│  LDAPper — public API                                            │
+│                                                                  │
+│  ldapper.go                        connection lifecycle:        │
+│                                    dial / failover, auth,        │
+│                                    IsAlive / Reconnect / Close   │
+│  ldapper_search.go                 user / group / OU-user search │
+│  ldapper_search_params.go          SearchLimits + newSearchRequest│
+│  ldapper_catalog_tree_discovery.go paged subtree + tree builder  │
+└──────────────┬───────────────────────────────────┬───────────────┘
+               │                                   │
+     uses      │                                   │  uses
+               ▼                                   ▼
+┌──────────────────────────────┐    ┌──────────────────────────────┐
+│  interfaces.LDAPConn         │    │  interfaces.CatalogAdapter   │
+│  (thin subset of go-ldap)    │    │  (schema-specific glue)      │
+│                              │    │                              │
+│  StartTLS / Bind / Search /  │    │  Filters / Attrs / Casts     │
+│  IsClosing / Close           │    │                              │
+└──────────────┬───────────────┘    └──────────────┬───────────────┘
+               │                                   │
+   prod: *ldap.Conn                  prod: adapters.{MSAD, OPENLDAP,
+   test: mocks.MockLDAPConn                ALDRPO, FREEIPA}Adapter
+                                     test: mocks.MockCatalogAdapter
+                                           or testCatalogAdapter
+
+                               │
+┌──────────────────────────────▼───────────────────────────────────┐
+│  go-ldap/ldap/v3                                                 │
+└──────────────────────────────┬───────────────────────────────────┘
+                               │
+                          LDAP server
+```
+
+The two interfaces are the only seams:
+
+- **`interfaces.LDAPConn`** is a 5-method subset of `*ldap.Conn`. Production
+  uses the real `*ldap.Conn`; tests inject `mocks.MockLDAPConn`.
+- **`interfaces.CatalogAdapter`** is the *only* place LDAPper knows anything
+  about directory schema. All filters, attribute lists, and value casts go
+  through it.
+
+### `LDAPper` struct
+
+```
+LDAPper
+├── catalogAdapter  interfaces.CatalogAdapter   schema-specific behavior
+├── connection      interfaces.LDAPConn         active network connection
+│
+├── isAuthenticated bool                        set by AuthenticateConn
+├── bindUser        string                      stored for Reconnect re-bind
+├── bindPassword    string
+│
+├── hosts           []string                    failover list (≤ 50)
+├── currentHost     string                      host of the active connection
+├── port            uint
+│
+├── useSSL          bool                        LDAPS vs plain LDAP
+├── skipTLS         bool                        disable StartTLS upgrade
+├── tlsCfg          *tls.Config
+│
+└── searchLimits    SearchLimits                injected via newSearchRequest
+```
+
+Every search method goes through `newSearchRequest(...)`, which injects
+`searchLimits`. Changing limits at runtime (`SetSearchLimits`) is therefore
+a single assignment with no plumbing.
+
+### Search flow (`GetUser` as example)
+
+```
+conn.GetUser("jdoe", baseDN)
+        │
+        ├── catalogAdapter.SearchUserFilterTemplate()
+        │       → "(uid=%s)" → fmt.Sprintf → "(uid=jdoe)"
+        ├── catalogAdapter.UserAttrs()
+        │       → []string{"cn", "mail", ...}
+        │
+        ▼
+   newSearchRequest(baseDN, WholeSubtree, NeverDerefAliases,
+                    false, filter, attrs, nil)
+        │
+        │  injects conn.searchLimits.{SizeLimit, TimeLimit}
+        ▼
+   conn.connection.Search(req)  ─────►  LDAP server
+        │
+        ▼
+   0 entries   → error "user does not exist"
+   1 entry     → build types.LDAPUser{DN, Attributes}
+   >1 entries  → error "too many entries returned"
+```
+
+### Catalog tree flow (`GetCatalogTree`)
+
+```
+conn.GetCatalogTree(baseDN, maxDepth)
+        │
+        ▼
+   loop:
+     Search(baseDN, WholeSubtree, paging=1000)
+       │
+       ├── server echoes ControlPaging  →  read cookie
+       │
+       ▼
+     next request with cookie  …  until empty cookie
+        │
+        ▼
+   allEntries []*ldap.Entry
+        │
+        ▼
+   for each entry:
+       catalogAdapter.OUInfoFromEntry(entry)
+       drop if !baseDN.AncestorOf(entry.DN)
+       byDN[info.DN] = info
+        │
+        ▼
+   attach each node to parentDNOf(info.DN)  →  tree roots
+        │
+        ▼
+   if maxDepth > 0:  trimDepth(tree, maxDepth)
+        │
+        ▼
+   types.CatalogTree{Tree: [...]}
+```
+
+This is the whole reason `GetCatalogTree` is O(1) round-trips instead of
+O(N): the server streams pages of the subtree, and the parent-child wiring
+is done locally in `O(N)` with a single `map[DN]*OUInfo`.
+
+### Repository layout
+
+```
+ldapper/
+├── ldapper.go                        constructors + connection lifecycle
+├── ldapper_search.go                 CustomSearch / GetUser / GetUserGroups / GetOUUsers
+├── ldapper_search_params.go          SearchLimits + newSearchRequest
+├── ldapper_catalog_tree_discovery.go GetCatalogTree / GetRootOUs / GetSubOUs
+│
+├── interfaces/
+│   ├── catalog_adapter_interface.go  interfaces.CatalogAdapter
+│   └── ldap_native_conn_interface.go interfaces.LDAPConn
+│
+├── adapters/
+│   ├── msad_adapter.go               Microsoft Active Directory
+│   ├── openldap_adapter.go           OpenLDAP / RFC-4519
+│   ├── aldpro_adapter.go             ALD Pro
+│   └── freeipa_adapter.go            FreeIPA
+│
+├── types/
+│   ├── ldap_user_type.go             LDAPUser + attribute helpers
+│   ├── ldap_catalog_structure_type.go OUInfo / CatalogTree
+│   └── normalized_user_type.go       UserNormalizedInfo
+│
+├── constants/constants.go            all defaults in one place
+│
+└── mocks/
+    ├── ldap_native_conn_mock.go      MockLDAPConn (function-field style)
+    └── catalog_adapter_mock.go       MockCatalogAdapter (testify)
 ```
 
 ---
@@ -157,14 +336,9 @@ type CatalogAdapter interface {
 }
 ```
 
-Two adapters ship with the library:
-
-| Adapter                | Directory                          |
-|------------------------|------------------------------------|
-| `adapters.MSADAdapter` | Microsoft Active Directory         |
-| `adapters.OPENLDAPAdapter` | OpenLDAP (and most RFC-4519 dialects) |
-
-The adapter is the only place LDAPper assumes anything about schema.
+The adapter is the only place LDAPper assumes anything about schema. See
+[Shipped adapters](#shipped-adapters) for the four adapters that ship with
+the library.
 
 ### Search limits
 
@@ -187,6 +361,73 @@ conn.SetSearchLimits(old.SizeLimit, old.TimeLimit)
 - Negative values are clamped to `0`.
 - `SetSearchLimits` is **not concurrency-safe** — do not call it while
   searches are in flight.
+
+---
+
+## Shipped adapters
+
+| Adapter                     | Directory                          | Notes |
+|-----------------------------|------------------------------------|-------|
+| `adapters.MSADAdapter`      | Microsoft Active Directory         | Uses `objectCategory`-based filters; recursive group search via the `LDAP_MATCHING_RULE_IN_CHAIN` OID (`1.2.840.113556.1.4.1941`); prefers `thumbnailPhoto` over `jpegPhoto`. |
+| `adapters.OPENLDAPAdapter`  | OpenLDAP (and most RFC-4519 dialects) | Handles both `groupOfNames` and `posixGroup`; user search keyed by `uid` **or** `cn`; address mapped from `postalAddress`. |
+| `adapters.ALDRPOAdapter`    | ALD Pro                            | Recognizes `rbta-org-unit` alongside `organizationalUnit`; department mapped from `rbtadp`; supports `groupOfNames`, `posixGroup`, `ipausergroup`. |
+| `adapters.FREEIPAAdapter`   | FreeIPA                            | Recognizes `nsContainer` alongside `organizationalUnit`; department intentionally **not** mapped (FreeIPA schemas vary); uses FreeIPA-specific attrs `nsAccountLock` and `ipaUniqueID`. |
+
+### Adapter-specific gotchas
+
+- **`MSADAdapter`** — the base DN for search must be a valid AD naming
+  context. `GetUser` matches on `sAMAccountName`; the bind DN in
+  `NewAuthenticatedConnection` can be a UPN (`user@domain`), not necessarily
+  a full DN.
+- **`OPENLDAPAdapter`** — the user filter uses the indexed format
+  placeholder `%[1]s` so the same argument is substituted into both `uid=`
+  and `cn=`. Computer objects are explicitly excluded.
+- **`ALDRPOAdapter`** / **`FREEIPAAdapter`** — the user-groups filter
+  template is `member=uid=%s`, which expects the short `uid` (not a DN).
+  `SearchUserGroupsFilterTemplateArgs` returns exactly one argument to match
+  the single placeholder. If your directory stores full DNs in `member`,
+  override `SearchUserGroupsFilterTemplate` in a custom adapter.
+
+All four adapters are stateless and safe to reuse across connections.
+
+### Attribute mapping in `GetNormalizedUserInfo`
+
+Each adapter maps the same `UserNormalizedInfo` fields from different LDAP
+attributes. `—` means the field is **hardcoded to empty** in that adapter
+(the attribute is not read even if present).
+
+| `UserNormalizedInfo` field | MSAD                     | OpenLDAP           | ALD Pro           | FreeIPA      |
+|----------------------------|--------------------------|--------------------|-------------------|--------------|
+| `DistinguishedName`        | `distinguishedName`      | `dn`               | `dn`              | `dn`         |
+| `CommonName`               | `cn`                     | `cn`               | `cn`              | `cn`         |
+| `Mobile`                   | `mobile`                 | `mobile`           | `mobile`          | `mobile`     |
+| `Phone`                    | `telephoneNumber`        | `telephoneNumber`  | `telephoneNumber` | `telephoneNumber` |
+| `Mail`                     | `mail`                   | `mail`             | `mail`            | `mail`       |
+| `Department`               | `department`             | `departmentNumber` | `rbtadp`          | —            |
+| `Title`                    | `title`                  | `title`            | `title`           | `title`      |
+| `Manager`                  | `manager`                | `manager`          | `manager`         | `manager`    |
+| `Photo`                    | `thumbnailPhoto` → `jpegPhoto` | `jpegPhoto`  | `jpegPhoto`       | `jpegPhoto`  |
+| `Company`                  | `company`                | —                  | —                 | —            |
+| `Country`                  | `co`                     | —                  | `co`              | `co`         |
+| `Address`                  | `streetAddress`          | `postalAddress`    | `streetAddress`   | `street`     |
+| `City`                     | `l`                      | —                  | `l`               | `l`          |
+| `Index`                    | `postalCode`             | —                  | `postalCode`      | `postalCode` |
+
+Key differences to keep in mind when picking an adapter:
+
+- **`DistinguishedName`** — MSAD reads it from the `distinguishedName`
+  attribute, all other adapters read it from `dn`.
+- **`Department`** — four different sources (`department`,
+  `departmentNumber`, `rbtadp`, or none). FreeIPA simply does not map it.
+- **`Address`** — MSAD and ALD Pro use `streetAddress`, OpenLDAP uses
+  `postalAddress`, FreeIPA uses `street`.
+- **`Photo`** — only MSAD falls back from `thumbnailPhoto` to `jpegPhoto`;
+  the other three adapters read `jpegPhoto` only and do **not** consult
+  `thumbnailPhoto`.
+- **`Company` / `Country` / `City` / `Index`** — OpenLDAP hardcodes
+  `Company`, `Country`, `City` and `Index` to empty regardless of the entry's
+  attributes. If you need them populated against OpenLDAP, write a custom
+  adapter that overrides `GetNormalizedUserInfo`.
 
 ---
 
@@ -247,7 +488,7 @@ tree, err := conn.GetCatalogTree("DC=corp,DC=example,DC=com", 2)
   `2` = roots + first level, etc.
 
 ```go
-// Only root-level OUs, one level at a time (useful for lazy UIs):
+// Only root-level OUs (single-level scope, one round-trip):
 roots, err := conn.GetRootOUs("DC=corp,DC=example,DC=com")
 
 // Direct children of an OU:
@@ -256,8 +497,8 @@ children, err := conn.GetSubOUs("OU=Staff,DC=corp,DC=example,DC=com",
 ```
 
 `GetCatalogTree` is the recommended path for large catalogs: it round-trips
-once, streams results page-by-page, and assembles the tree in `O(N)` using a
-`map[DN]*OUInfo` + parent-DN walk.
+once per page, streams results page-by-page, and assembles the tree in
+`O(N)` using a `map[DN]*OUInfo` + parent-DN walk.
 
 ### Health checks & reconnection
 
@@ -311,7 +552,8 @@ func (MyAdapter) UserAttrs() []string      { return []string{"cn", "mail"} }
 // ... remaining methods
 ```
 
-See `adapters/msad_adapter.go` and `adapters/openldap_adapter.go` for
+See `adapters/msad_adapter.go`, `adapters/openldap_adapter.go`,
+`adapters/aldpro_adapter.go` and `adapters/freeipa_adapter.go` for
 complete, production-quality examples.
 
 ---
@@ -326,7 +568,6 @@ Defaults live in `constants/constants.go`:
 | `LDAPSURITemplate`             | `"ldaps://%s:%d"` | Used for LDAPS dials |
 | `DefaultSearchSizeLimit`       | `0`     | `0` = no client-side size limit |
 | `DefaultSearchTimeLimit`       | `30`    | Seconds |
-| `DefaultSearchDepth`           | `5`     | Legacy depth for the level-by-level walker |
 | `DefaultMaxHostsLength`        | `50`    | Upper bound on the `hosts` slice |
 | `DefaultCatalogTreePageSize`   | `1000`  | Paging control size for `GetCatalogTree` |
 

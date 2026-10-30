@@ -61,6 +61,7 @@ func (a MSADAdapter) SearchUserFilterTemplate() string {
 	return "(&(objectCategory=person)(objectClass=user)(sAMAccountName=%s))"
 }
 
+// NB: filter syntax need check
 func (a MSADAdapter) SearchUserGroupsFilterTemplate() string {
 	return "(&(objectCategory=group)(member:1.2.840.113556.1.4.1941:=%s))"
 }

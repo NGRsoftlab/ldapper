@@ -2,6 +2,8 @@
 package adapters
 
 import (
+	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/go-ldap/ldap/v3"
@@ -9,6 +11,8 @@ import (
 
 	"github.com/NGRsoftlab/ldapper/types"
 )
+
+// ---------- GetNormalizedUserInfo ----------
 
 func TestMSADAdapter_GetNormalizedUserInfo_FullAttributes(t *testing.T) {
 	adapter := MSADAdapter{}
@@ -33,6 +37,7 @@ func TestMSADAdapter_GetNormalizedUserInfo_FullAttributes(t *testing.T) {
 	info := adapter.GetNormalizedUserInfo(user)
 
 	assert.NotNil(t, info)
+	// MSAD reads DN from the "distinguishedName" attribute, not the struct field.
 	assert.Equal(t, "cn=John Doe,ou=people,dc=example,dc=com", info.DistinguishedName)
 	assert.Equal(t, "John Doe", info.CommonName)
 	assert.Equal(t, "+7-999-123-45-67", info.Mobile)
@@ -41,7 +46,9 @@ func TestMSADAdapter_GetNormalizedUserInfo_FullAttributes(t *testing.T) {
 	assert.Equal(t, "IT", info.Department)
 	assert.Equal(t, "Engineer", info.Title)
 	assert.Equal(t, "cn=Jane Boss,ou=people,dc=example,dc=com", info.Manager)
-	assert.Equal(t, "thumb-bytes", info.Photo, "if there is thumbnailPhoto - it has more priority")
+	// thumbnailPhoto wins over jpegPhoto when both are present.
+	assert.Equal(t, "thumb-bytes", info.Photo,
+		"thumbnailPhoto takes precedence over jpegPhoto")
 	assert.Equal(t, "Example Inc.", info.Company)
 	assert.Equal(t, "RU", info.Country)
 	assert.Equal(t, "Tverskaya 1", info.Address)
@@ -49,84 +56,91 @@ func TestMSADAdapter_GetNormalizedUserInfo_FullAttributes(t *testing.T) {
 	assert.Equal(t, "101000", info.Index)
 }
 
-func TestMSADAdapter_GetNormalizedUserInfo_PhotoFallbackToJpeg(t *testing.T) {
-	adapter := MSADAdapter{}
-	user := newLDAPUser("cn=John Doe,dc=example,dc=com", map[string][]string{
-		"cn":        {"John Doe"},
-		"jpegPhoto": {"jpeg-bytes"},
-	})
-
-	info := adapter.GetNormalizedUserInfo(user)
-
-	assert.NotNil(t, info)
-	assert.Equal(t, "jpeg-bytes", info.Photo, "when no thumbnailPhoto - take jpegPhoto")
-}
-
-func TestMSADAdapter_GetNormalizedUserInfo_NoPhoto(t *testing.T) {
-	adapter := MSADAdapter{}
-	user := newLDAPUser("cn=John Doe,dc=example,dc=com", map[string][]string{
-		"cn": {"John Doe"},
-	})
-
-	info := adapter.GetNormalizedUserInfo(user)
-
-	assert.NotNil(t, info)
-	assert.Equal(t, "", info.Photo)
+// TestMSADAdapter_GetNormalizedUserInfo_PhotoFallback documents the
+// GetFirstNonNullAttributeValue(["thumbnailPhoto", "jpegPhoto"]) chain:
+// thumbnailPhoto if set, else jpegPhoto, else empty.
+func TestMSADAdapter_GetNormalizedUserInfo_PhotoFallback(t *testing.T) {
+	tests := []struct {
+		name  string
+		attrs map[string][]string
+		want  string
+	}{
+		{
+			name:  "both present, thumbnail wins",
+			attrs: map[string][]string{"thumbnailPhoto": {"thumb"}, "jpegPhoto": {"jpeg"}},
+			want:  "thumb",
+		},
+		{
+			name:  "only jpeg",
+			attrs: map[string][]string{"jpegPhoto": {"jpeg"}},
+			want:  "jpeg",
+		},
+		{
+			name:  "thumbnail empty value, jpeg used",
+			attrs: map[string][]string{"thumbnailPhoto": {""}, "jpegPhoto": {"jpeg"}},
+			want:  "jpeg",
+		},
+		{
+			name:  "neither",
+			attrs: map[string][]string{},
+			want:  "",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			info := MSADAdapter{}.GetNormalizedUserInfo(newLDAPUser("cn=u", tc.attrs))
+			assert.Equal(t, tc.want, info.Photo)
+		})
+	}
 }
 
 func TestMSADAdapter_GetNormalizedUserInfo_EmptyUser(t *testing.T) {
-	// empty LDAPUser (zero value) — all fields empty, must be no error/panic
-	adapter := MSADAdapter{}
-	user := types.LDAPUser{}
-
-	info := adapter.GetNormalizedUserInfo(user)
+	info := MSADAdapter{}.GetNormalizedUserInfo(types.LDAPUser{})
 
 	assert.NotNil(t, info)
-	assert.Equal(t, "", info.DistinguishedName)
-	assert.Equal(t, "", info.CommonName)
-	assert.Equal(t, "", info.Mobile)
-	assert.Equal(t, "", info.Phone)
-	assert.Equal(t, "", info.Mail)
-	assert.Equal(t, "", info.Department)
-	assert.Equal(t, "", info.Title)
-	assert.Equal(t, "", info.Manager)
-	assert.Equal(t, "", info.Photo)
-	assert.Equal(t, "", info.Company)
-	assert.Equal(t, "", info.Country)
-	assert.Equal(t, "", info.Address)
-	assert.Equal(t, "", info.City)
-	assert.Equal(t, "", info.Index)
+	assert.Empty(t, info.DistinguishedName)
+	assert.Empty(t, info.CommonName)
+	assert.Empty(t, info.Mobile)
+	assert.Empty(t, info.Phone)
+	assert.Empty(t, info.Mail)
+	assert.Empty(t, info.Department)
+	assert.Empty(t, info.Title)
+	assert.Empty(t, info.Manager)
+	assert.Empty(t, info.Photo)
+	assert.Empty(t, info.Company)
+	assert.Empty(t, info.Country)
+	assert.Empty(t, info.Address)
+	assert.Empty(t, info.City)
+	assert.Empty(t, info.Index)
 }
 
 func TestMSADAdapter_GetNormalizedUserInfo_NilAttributesMap(t *testing.T) {
-	// Attributes == nil must not lead to panic:
-	// GetAttributeValue/GetFirstNonNullAttributeValue must process correctly nil-map (check fact behavior).
-	adapter := MSADAdapter{}
-	user := types.LDAPUser{DN: "cn=User,dc=example,dc=com", Attributes: nil}
+	user := types.LDAPUser{DN: "cn=u,dc=x", Attributes: nil}
 
 	assert.NotPanics(t, func() {
-		info := adapter.GetNormalizedUserInfo(user)
+		info := MSADAdapter{}.GetNormalizedUserInfo(user)
 		assert.NotNil(t, info)
 		assert.Empty(t, info.CommonName)
 		assert.Empty(t, info.Photo)
 	})
 }
 
-func TestMSADAdapter_GetNormalizedUserInfo_OnlyDistinguishedName(t *testing.T) {
-	adapter := MSADAdapter{}
-	user := newLDAPUser("cn=User,dc=example,dc=com", map[string][]string{
-		"distinguishedName": {"cn=User,dc=example,dc=com"},
+func TestMSADAdapter_GetNormalizedUserInfo_DistinguishedNameFromAttrOnly(t *testing.T) {
+	// DN comes from the "distinguishedName" attribute; the struct field is
+	// ignored.
+	user := newLDAPUser("cn=IGNORED,dc=x", map[string][]string{
+		"cn": {"John"},
 	})
 
-	info := adapter.GetNormalizedUserInfo(user)
+	info := MSADAdapter{}.GetNormalizedUserInfo(user)
 
-	assert.NotNil(t, info)
-	assert.Equal(t, "cn=User,dc=example,dc=com", info.DistinguishedName)
-	assert.Empty(t, info.CommonName)
+	assert.Empty(t, info.DistinguishedName,
+		"DistinguishedName must be filled only from the \"distinguishedName\" attribute")
 }
 
+// ---------- OUInfoFromEntry ----------
+
 func TestMSADAdapter_OUInfoFromEntry_FullAttributes(t *testing.T) {
-	adapter := MSADAdapter{}
 	entry := ldap.Entry{
 		DN: "ou=IT,ou=Departments,dc=example,dc=com",
 		Attributes: []*ldap.EntryAttribute{
@@ -134,50 +148,18 @@ func TestMSADAdapter_OUInfoFromEntry_FullAttributes(t *testing.T) {
 		},
 	}
 
-	info := adapter.OUInfoFromEntry(entry)
+	info := MSADAdapter{}.OUInfoFromEntry(entry)
 
 	assert.NotNil(t, info)
 	assert.Equal(t, "ou=IT,ou=Departments,dc=example,dc=com", info.DN)
+	// MSAD: Name comes from the "name" attribute.
 	assert.Equal(t, "IT", info.Name)
-	// OU is intentionally set to the entry DN, not to a separate attribute.
+	// MSAD: OU is set to the entry DN, not the "ou" attribute.
 	assert.Equal(t, "ou=IT,ou=Departments,dc=example,dc=com", info.OU)
 }
 
-func TestMSADAdapter_OUInfoFromEntry_ChildrenInitialized(t *testing.T) {
-	// Children must be a non-nil, empty slice so callers can safely append
-	// without a nil check.
-	adapter := MSADAdapter{}
-	entry := ldap.Entry{
-		DN: "ou=IT,dc=example,dc=com",
-		Attributes: []*ldap.EntryAttribute{
-			{Name: "name", Values: []string{"IT"}},
-		},
-	}
-
-	info := adapter.OUInfoFromEntry(entry)
-
-	assert.NotNil(t, info.Children, "Children must be initialized, not nil")
-	assert.Empty(t, info.Children)
-}
-
-func TestMSADAdapter_OUInfoFromEntry_ChildrenAppendable(t *testing.T) {
-	// Verify that appending to Children does not panic — a nil slice
-	// would also support append, but the test documents the intended
-	// non-nil contract and catches accidental removal of the initialization.
-	adapter := MSADAdapter{}
-	entry := ldap.Entry{DN: "ou=IT,dc=example,dc=com"}
-
-	info := adapter.OUInfoFromEntry(entry)
-
-	assert.NotPanics(t, func() {
-		info.Children = append(info.Children, &types.OUInfo{DN: "ou=Sub,ou=IT,dc=example,dc=com"})
-	})
-	assert.Len(t, info.Children, 1)
-}
-
 func TestMSADAdapter_OUInfoFromEntry_MissingNameAttribute(t *testing.T) {
-	// If the "name" attribute is absent, Name stays empty — no error, no panic.
-	adapter := MSADAdapter{}
+	// If "name" is absent, Name stays empty; DN and OU keep their values.
 	entry := ldap.Entry{
 		DN: "ou=IT,dc=example,dc=com",
 		Attributes: []*ldap.EntryAttribute{
@@ -185,50 +167,15 @@ func TestMSADAdapter_OUInfoFromEntry_MissingNameAttribute(t *testing.T) {
 		},
 	}
 
-	info := adapter.OUInfoFromEntry(entry)
+	info := MSADAdapter{}.OUInfoFromEntry(entry)
 
-	assert.NotNil(t, info)
 	assert.Equal(t, "ou=IT,dc=example,dc=com", info.DN)
 	assert.Empty(t, info.Name)
 	assert.Equal(t, "ou=IT,dc=example,dc=com", info.OU)
 }
 
-func TestMSADAdapter_OUInfoFromEntry_EmptyEntry(t *testing.T) {
-	// An empty ldap.Entry (zero value) must not cause a panic.
-	adapter := MSADAdapter{}
-	entry := ldap.Entry{}
-
-	assert.NotPanics(t, func() {
-		info := adapter.OUInfoFromEntry(entry)
-		assert.NotNil(t, info)
-		assert.Empty(t, info.DN)
-		assert.Empty(t, info.Name)
-		assert.Empty(t, info.OU)
-		assert.NotNil(t, info.Children)
-		assert.Empty(t, info.Children)
-	})
-}
-
-func TestMSADAdapter_OUInfoFromEntry_NilAttributes(t *testing.T) {
-	// Attributes == nil must not cause a panic when reading "name".
-	adapter := MSADAdapter{}
-	entry := ldap.Entry{
-		DN:         "ou=IT,dc=example,dc=com",
-		Attributes: nil,
-	}
-
-	assert.NotPanics(t, func() {
-		info := adapter.OUInfoFromEntry(entry)
-		assert.NotNil(t, info)
-		assert.Equal(t, "ou=IT,dc=example,dc=com", info.DN)
-		assert.Empty(t, info.Name)
-	})
-}
-
 func TestMSADAdapter_OUInfoFromEntry_UsesFirstValueOfMultiValuedName(t *testing.T) {
-	// ldap.Entry.GetAttributeValue returns the first value for multi-valued
-	// attributes. Pin this behavior so a refactor cannot silently change it.
-	adapter := MSADAdapter{}
+	// GetAttributeValue returns the first value of a multi-valued attribute.
 	entry := ldap.Entry{
 		DN: "ou=IT,dc=example,dc=com",
 		Attributes: []*ldap.EntryAttribute{
@@ -236,129 +183,148 @@ func TestMSADAdapter_OUInfoFromEntry_UsesFirstValueOfMultiValuedName(t *testing.
 		},
 	}
 
-	info := adapter.OUInfoFromEntry(entry)
+	info := MSADAdapter{}.OUInfoFromEntry(entry)
 
-	assert.Equal(t, "IT", info.Name,
-		"GetAttributeValue returns the first value of a multi-valued attribute")
+	assert.Equal(t, "IT", info.Name)
 }
 
-func TestMSADAdapter_OUInfoFromEntry_IgnoresUnrelatedAttributes(t *testing.T) {
-	// Only "name" is used; other attributes present on the entry must not
-	// leak into the resulting OUInfo fields.
-	adapter := MSADAdapter{}
-	entry := ldap.Entry{
-		DN: "ou=IT,dc=example,dc=com",
-		Attributes: []*ldap.EntryAttribute{
-			{Name: "name", Values: []string{"IT"}},
-			{Name: "description", Values: []string{"IT department"}},
-			{Name: "managedBy", Values: []string{"cn=boss,dc=example,dc=com"}},
-			{Name: "objectGUID", Values: []string{"guid-bytes"}},
-		},
+// TestMSADAdapter_OUInfoFromEntry_DegenerateInputs covers empty entries and
+// nil attributes; Children must always be a non-nil empty slice.
+func TestMSADAdapter_OUInfoFromEntry_DegenerateInputs(t *testing.T) {
+	tests := []struct {
+		name  string
+		entry ldap.Entry
+	}{
+		{"empty entry", ldap.Entry{}},
+		{"nil attributes", ldap.Entry{DN: "ou=IT,dc=x", Attributes: nil}},
 	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.NotPanics(t, func() {
+				info := MSADAdapter{}.OUInfoFromEntry(tc.entry)
+				assert.NotNil(t, info)
+				assert.Equal(t, tc.entry.DN, info.DN)
+				assert.NotNil(t, info.Children)
+				assert.Empty(t, info.Children)
+			})
+		})
+	}
+}
 
-	info := adapter.OUInfoFromEntry(entry)
+func TestMSADAdapter_OUInfoFromEntry_ChildrenAppendable(t *testing.T) {
+	// Pin the non-nil contract: callers must be able to append to Children.
+	info := MSADAdapter{}.OUInfoFromEntry(ldap.Entry{DN: "ou=IT,dc=x"})
 
-	assert.Equal(t, "ou=IT,dc=example,dc=com", info.DN)
-	assert.Equal(t, "IT", info.Name)
-	assert.Equal(t, "ou=IT,dc=example,dc=com", info.OU)
-	assert.Empty(t, info.Children)
-	// OUInfo has no fields for description/managedBy/objectGUID —
-	// this assertion documents that the mapping is limited to DN/Name/OU.
+	assert.NotPanics(t, func() {
+		info.Children = append(info.Children, &types.OUInfo{DN: "ou=Sub,ou=IT,dc=x"})
+	})
+	assert.Len(t, info.Children, 1)
 }
 
 // ---------- TYPE FILTERS ----------
 
-func TestMSADAdapter_OUObjectFilter(t *testing.T) {
+func TestMSADAdapter_TypeFilters(t *testing.T) {
 	adapter := MSADAdapter{}
+
 	assert.Equal(t, "(&(objectClass=organizationalUnit))", adapter.OUObjectFilter())
-}
-
-func TestMSADAdapter_GroupObjectFilter(t *testing.T) {
-	adapter := MSADAdapter{}
 	assert.Equal(t, "(&(objectCategory=group))", adapter.GroupObjectFilter())
-}
-
-func TestMSADAdapter_UserObjectFilter(t *testing.T) {
-	adapter := MSADAdapter{}
 	assert.Equal(t, "(&(objectClass=user)(objectCategory=person))", adapter.UserObjectFilter())
 }
 
 // ---------- SEARCH ----------
 
 func TestMSADAdapter_SearchUserFilterTemplate(t *testing.T) {
-	adapter := MSADAdapter{}
 	assert.Equal(t,
 		"(&(objectCategory=person)(objectClass=user)(sAMAccountName=%s))",
-		adapter.SearchUserFilterTemplate(),
+		MSADAdapter{}.SearchUserFilterTemplate(),
 	)
 }
 
+// TestMSADAdapter_SearchUserGroupsFilterTemplate verifies the LDAP_MATCHING_RULE_IN_CHAIN
+// OID (1.2.840.113556.1.4.1941) is used for recursive group expansion — without
+// it AD would return only direct memberships.
 func TestMSADAdapter_SearchUserGroupsFilterTemplate(t *testing.T) {
-	adapter := MSADAdapter{}
-	// Check being present OID 1.2.840.113556.1.4.1941 (LDAP_MATCHING_RULE_IN_CHAIN) —
-	// without it - no recursive search in AD
+	tmpl := MSADAdapter{}.SearchUserGroupsFilterTemplate()
+
 	assert.Equal(t,
 		"(&(objectCategory=group)(member:1.2.840.113556.1.4.1941:=%s))",
-		adapter.SearchUserGroupsFilterTemplate(),
+		tmpl,
 	)
+	assert.Contains(t, tmpl, "1.2.840.113556.1.4.1941",
+		"LDAP_MATCHING_RULE_IN_CHAIN OID must be present for recursive group search")
 }
 
 func TestMSADAdapter_SearchOUFilterTemplate(t *testing.T) {
-	adapter := MSADAdapter{}
 	assert.Equal(t,
 		"(&(objectClass=organizationalUnit)(ou=%s))",
-		adapter.SearchOUFilterTemplate(),
+		MSADAdapter{}.SearchOUFilterTemplate(),
 	)
 }
 
 func TestMSADAdapter_SearchGroupFilterTemplate(t *testing.T) {
-	adapter := MSADAdapter{}
 	assert.Equal(t,
 		"(&(objectCategory=group)(cn=%s))",
-		adapter.SearchGroupFilterTemplate(),
+		MSADAdapter{}.SearchGroupFilterTemplate(),
 	)
+}
+
+// TestMSADAdapter_AllSearchTemplates_BalancedParentheses is a regression guard
+// against malformed filters that AD would reject.
+func TestMSADAdapter_AllSearchTemplates_BalancedParentheses(t *testing.T) {
+	adapter := MSADAdapter{}
+	templates := map[string]string{
+		"SearchUserFilterTemplate":       adapter.SearchUserFilterTemplate(),
+		"SearchUserGroupsFilterTemplate": adapter.SearchUserGroupsFilterTemplate(),
+		"SearchOUFilterTemplate":         adapter.SearchOUFilterTemplate(),
+		"SearchGroupFilterTemplate":      adapter.SearchGroupFilterTemplate(),
+	}
+	for name, tmpl := range templates {
+		t.Run(name, func(t *testing.T) {
+			assert.Equal(t, strings.Count(tmpl, "("), strings.Count(tmpl, ")"),
+				"parentheses must be balanced")
+			assert.True(t, strings.HasPrefix(tmpl, "("))
+			assert.True(t, strings.HasSuffix(tmpl, ")"))
+		})
+	}
 }
 
 // ---------- SearchUserGroupsFilterTemplateArgs ----------
 
-func TestMSADAdapter_SearchUserGroupsFilterTemplateArgs_UsesUserDN(t *testing.T) {
-	adapter := MSADAdapter{}
-	user := newLDAPUser("cn=John Doe,ou=people,dc=example,dc=com", nil)
-
-	args := adapter.SearchUserGroupsFilterTemplateArgs(user)
-
-	assert.Len(t, args, 1)
-	assert.Equal(t, "cn=John Doe,ou=people,dc=example,dc=com", args[0])
-}
-
-func TestMSADAdapter_SearchUserGroupsFilterTemplateArgs_IgnoresDistinguishedNameAttr(t *testing.T) {
-	adapter := MSADAdapter{}
-	user := newLDAPUser("uid=other,dc=example,dc=com", map[string][]string{
-		"distinguishedName": {"cn=IGNORED,dc=example,dc=com"},
-	})
-
-	args := adapter.SearchUserGroupsFilterTemplateArgs(user)
-
-	assert.Len(t, args, 1)
-	assert.Equal(t, "uid=other,dc=example,dc=com", args[0],
-		"user DN must be in arg, no distinguishedName")
-}
-
-func TestMSADAdapter_SearchUserGroupsFilterTemplateArgs_EmptyDN(t *testing.T) {
-	adapter := MSADAdapter{}
-	user := types.LDAPUser{}
-
-	args := adapter.SearchUserGroupsFilterTemplateArgs(user)
-
-	assert.Len(t, args, 1)
-	assert.Equal(t, "", args[0])
+func TestMSADAdapter_SearchUserGroupsFilterTemplateArgs(t *testing.T) {
+	tests := []struct {
+		name string
+		user types.LDAPUser
+		want string
+	}{
+		{
+			name: "uses struct DN field",
+			user: newLDAPUser("cn=John Doe,ou=people,dc=x", nil),
+			want: "cn=John Doe,ou=people,dc=x",
+		},
+		{
+			name: "distinguishedName attribute is ignored",
+			user: newLDAPUser("uid=other,dc=x",
+				map[string][]string{"distinguishedName": {"cn=IGNORED,dc=x"}}),
+			want: "uid=other,dc=x",
+		},
+		{
+			name: "empty user",
+			user: types.LDAPUser{},
+			want: "",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			args := MSADAdapter{}.SearchUserGroupsFilterTemplateArgs(tc.user)
+			assert.Len(t, args, 1)
+			assert.Equal(t, tc.want, args[0])
+		})
+	}
 }
 
 // ---------- ATTRS ----------
 
 func TestMSADAdapter_UserAttrs(t *testing.T) {
-	adapter := MSADAdapter{}
-
 	expected := []string{
 		// common
 		"cn", "distinguishedName",
@@ -376,66 +342,58 @@ func TestMSADAdapter_UserAttrs(t *testing.T) {
 		// photo
 		"thumbnailPhoto", "jpegPhoto",
 	}
-
-	assert.Equal(t, expected, adapter.UserAttrs())
+	assert.Equal(t, expected, MSADAdapter{}.UserAttrs())
 }
 
 func TestMSADAdapter_UserAttrs_ContainsCriticalAttributes(t *testing.T) {
-	adapter := MSADAdapter{}
-	attrs := adapter.UserAttrs()
+	// Less brittle than exact equality — catches accidental removal during
+	// refactoring.
+	attrs := MSADAdapter{}.UserAttrs()
 
 	critical := []string{
 		"sAMAccountName", "userPrincipalName", "mail", "distinguishedName",
 		"thumbnailPhoto", "jpegPhoto", "objectGUID", "objectSid", "memberOf",
 		"telephoneNumber", "mobile", "department", "title", "manager",
 	}
-
 	for _, attr := range critical {
-		assert.Contains(t, attrs, attr, "critical attr %q is not present UserAttrs", attr)
+		assert.Contains(t, attrs, attr, "critical attribute %q is missing", attr)
 	}
 }
 
 func TestMSADAdapter_UserAttrs_NoDuplicates(t *testing.T) {
-	adapter := MSADAdapter{}
-	seen := make(map[string]struct{}, len(adapter.UserAttrs()))
-
-	for _, attr := range adapter.UserAttrs() {
+	seen := make(map[string]struct{})
+	for _, attr := range (MSADAdapter{}).UserAttrs() {
 		if _, exists := seen[attr]; exists {
-			t.Fatalf("attr duplicate in UserAttrs: %q", attr)
+			t.Fatalf("duplicate attribute in UserAttrs: %q", attr)
 		}
 		seen[attr] = struct{}{}
 	}
 }
 
 func TestMSADAdapter_OUAttrs(t *testing.T) {
-	adapter := MSADAdapter{}
-
 	expected := []string{
 		"distinguishedName", "name", "objectClass", "objectGUID", "description", "managedBy",
 	}
-
-	assert.Equal(t, expected, adapter.OUAttrs())
+	assert.Equal(t, expected, MSADAdapter{}.OUAttrs())
 }
 
 func TestMSADAdapter_GroupAttrs(t *testing.T) {
-	adapter := MSADAdapter{}
-
 	expected := []string{
 		"cn", "distinguishedName", "sAMAccountName", "groupType",
 		"member", "memberOf", "description", "objectGUID",
 	}
-
-	assert.Equal(t, expected, adapter.GroupAttrs())
+	assert.Equal(t, expected, MSADAdapter{}.GroupAttrs())
 }
 
 func TestMSADAdapter_GroupAttrs_NoDuplicates(t *testing.T) {
-	adapter := MSADAdapter{}
-	seen := make(map[string]struct{}, len(adapter.GroupAttrs()))
-
-	for _, attr := range adapter.GroupAttrs() {
+	seen := make(map[string]struct{})
+	for _, attr := range (MSADAdapter{}).GroupAttrs() {
 		if _, exists := seen[attr]; exists {
-			t.Fatalf("attr duplicate in GroupAttrs: %q", attr)
+			t.Fatalf("duplicate attribute in GroupAttrs: %q", attr)
 		}
 		seen[attr] = struct{}{}
 	}
 }
+
+// Silence unused import when only compilation of fmt is needed elsewhere.
+var _ = fmt.Sprintf

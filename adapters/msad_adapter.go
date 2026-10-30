@@ -129,17 +129,6 @@ func (a MSADAdapter) UserAttrs() []string {
 	}
 }
 
-func (a MSADAdapter) ShortUserAttrs() []string {
-	return []string{
-		"distinguishedName",
-		"cn",
-		"mail",
-		"userPrincipalName",
-		"title",
-		"department",
-	}
-}
-
 func (a MSADAdapter) OUAttrs() []string {
 	return []string{
 		"distinguishedName",

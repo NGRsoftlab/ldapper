@@ -1,552 +1,384 @@
-# ldapper
+# LDAPper
 
-> A Go library for working with LDAP directories (supported for now: Microsoft Active Directory and OpenLDAP) with support for authentication, user and group search, and building the organizational unit (OU) tree.
+[![Go Reference](https://pkg.go.dev/badge/github.com/NGRsoftlab/ldapper.svg)](https://pkg.go.dev/github.com/NGRsoftlab/ldapper)
 
-[![Go Version](https://img.shields.io/badge/go-%3E%3D1.26-blue)](https://go.dev/)
-[![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
-[![Module](https://img.shields.io/badge/module-github.com%2FNGRsoftlab%2Fldapper-blue)](https://github.com/NGRsoftlab/ldapper)
+A lightweight, adapter-based LDAP client for Go. LDAPper wraps
+[`go-ldap/ldap`](https://github.com/go-ldap/ldap) with:
+
+- **Multi-host failover** and transparent reconnection.
+- **Pluggable catalog adapters** so the same API works against Microsoft
+  Active Directory and OpenLDAP (and any other directory you write an
+  adapter for).
+- **Connection-level search limits** so callers don't pass `SizeLimit` /
+  `TimeLimit` on every query.
+- **Efficient catalog tree discovery** — a single paged subtree search,
+  assembled into an `OU` tree on the client, with optional depth trimming.
 
 ---
 
-## 📋 Table of Contents
+## Table of contents
 
-- [Features](#-features)
-- [Installation](#-installation)
-- [Quick Start](#-quick-start)
-- [Architecture](#-architecture)
-- [Usage](#-usage)
-  - [Connecting](#connecting)
+- [Installation](#installation)
+- [Quick start](#quick-start)
+- [Core concepts](#core-concepts)
+  - [Connections](#connections)
+  - [Adapters](#adapters)
+  - [Search limits](#search-limits)
+- [API overview](#api-overview)
   - [Authentication](#authentication)
-  - [User Search](#user-search)
-  - [User Groups](#user-groups)
-  - [Users in an OU](#users-in-an-ou)
-  - [Catalog Tree](#catalog-tree)
-  - [Custom Search](#custom-search)
-- [Catalog Adapters](#-catalog-adapters)
-- [Data Types](#-data-types)
-- [Constants](#-constants)
-- [Testing](#-testing)
-- [Limitations and TODO](#-limitations-and-todo)
+  - [Searching](#searching)
+  - [Catalog tree discovery](#catalog-tree-discovery)
+  - [Health checks & reconnection](#health-checks--reconnection)
+- [Writing your own adapter](#writing-your-own-adapter)
+- [Configuration & tuning](#configuration--tuning)
+- [Testing](#testing)
+- [License](#license)
 
 ---
 
-## ✨ Features
-
-- 🔐 **Two authentication modes**:
-  - `AuthenticateConn` — initial authentication that stores the service account credentials for subsequent operations.
-  - `AuthenticateUser` — verifies end-user credentials and rebinds back to the service account.
-- 🌐 **LDAP and LDAPS support** (TLS/StartTLS).
-- 👤 **User search** by login with a configurable set of attributes.
-- 👥 **User group search** with support for recursive search (AD) and two group types (OpenLDAP: `groupOfNames` and `posixGroup`).
-- 🗂️ **Users in an OU** search.
-- 🌳 **Catalog tree building** (OU) with recursive traversal and depth limit.
-- 🔍 **Arbitrary LDAP search** via `CustomSearch`.
-- 🧩 **Pluggable adapters** for different directories: `MSADAdapter` and `OPENLDAPAdapter`.
-- 🧪 **Full unit-test coverage** using `testify/mock`.
-
----
-
-## 📦 Installation
+## Installation
 
 ```bash
 go get github.com/NGRsoftlab/ldapper
 ```
 
-**Dependencies:**
-
-```
-github.com/go-ldap/ldap/v3 v3.4.15
-github.com/stretchr/testify v1.8.1
-```
-
-Go version: **1.26.10** or later.
+Requires Go 1.21+ (module tested against Go 1.26). Depends on
+`github.com/go-ldap/ldap/v3`.
 
 ---
 
-## 🚀 Quick Start
+## Quick start
 
 ```go
 package main
 
 import (
-    "crypto/tls"
-    "fmt"
-    "log"
+	"crypto/tls"
+	"log"
 
-    "github.com/NGRsoftlab/ldapper"
+	"github.com/NGRsoftlab/ldapper"
+	"github.com/NGRsoftlab/ldapper/adapters"
 )
 
 func main() {
-    tlsCfg := &tls.Config{InsecureSkipVerify: true} // example only — do not use in production!
-    adapter := ldapper.MSADAdapter{}
+	adapter := adapters.MSADAdapter{}
 
-    conn, user, err := ldapper.NewAuthenticatedConnection(
-        "svc-reader", "password", "dc=example,dc=com",
-        "ldap.example.com", 636,
-        true,  // useSSL
-        false, // skipTLS
-        tlsCfg,
-        adapter,
-    )
-    if err != nil {
-        log.Fatal(err)
-    }
-    defer conn.Close()
+	conn, user, err := ldapper.NewAuthenticatedConnection(
+		"svc-reader@corp.example.com", "secret", // bind credentials
+		"DC=corp,DC=example,DC=com",             // base DN for user search
+		[]string{"dc1.corp.example.com", "dc2.corp.example.com"}, // hosts
+		636,        // port
+		true,       // useSSL (LDAPS)
+		false,      // skipTLS (irrelevant when useSSL is true)
+		&tls.Config{MinVersion: tls.VersionTLS12},
+		adapter,
+		ldapper.WithSearchLimits(0, 30), // no size limit, 30s time limit
+	)
+	if err != nil {
+		log.Fatalf("connect: %v", err)
+	}
+	defer conn.Close()
 
-    fmt.Printf("Authenticated: %s (%s)\n", user.DN, user.GetAttributeValue("cn"))
+	log.Printf("connected to %s as %s", conn.CurrentHost(), user.DN)
+
+	// Fetch a user by sAMAccountName.
+	u, err := conn.GetUser("jdoe", "DC=corp,DC=example,DC=com")
+	if err != nil {
+		log.Fatalf("get user: %v", err)
+	}
+
+	info := adapter.GetNormalizedUserInfo(*u)
+	log.Printf("%s <%s>", info.CommonName, info.Mail)
 }
 ```
 
 ---
 
-## 🏗 Architecture
+## Core concepts
 
-```
-┌──────────────────────────────────────────────────────────┐
-│                     LDAPConnection                       │
-│  ┌──────────────┐  ┌───────────────┐  ┌────────────────┐ │
-│  │ LDAPConn     │  │ CatalogAdapter│  │ auth state     │ │
-│  │ (interface)  │  │ (interface)   │  │ (bind user/pw) │ │
-│  └──────────────┘  └───────────────┘  └────────────────┘ │
-└──────────────────────────────────────────────────────────┘
-         │                    │
-         ▼                    ▼
-  ┌────────────┐      ┌──────────────────┐
-  │ *ldap.Conn │      │ MSADAdapter      │
-  │ (real)     │      │ OPENLDAPAdapter  │
-  │ MockLDAPConn│     │ MockCatalogAdapter│
-  └────────────┘      └──────────────────┘
-```
+### Connections
 
-**Key interfaces:**
-
-| Interface | Purpose |
-| :--- | :--- |
-| `LDAPConn` | Abstraction over `*ldap.Conn` (`StartTLS`, `Bind`, `Search`, `Close`). Enables mocking the connection. |
-| `CatalogAdapter` | Strategy for a specific directory: filters, search templates, attribute lists, entry conversion. |
-
----
-
-## 📖 Usage
-
-### Connecting
+`LDAPper` is created with one of two constructors:
 
 ```go
-// Unauthenticated — read-only, useful when the server allows anonymous access.
-conn, err := ldapper.NewConnection(
-    "ldap.example.com", 389,
-    false, // useSSL
-    true,  // skipTLS (do not use StartTLS)
-    nil,   // tlsCfg is not needed when skipTLS is true
-    ldapper.OPENLDAPAdapter{},
-)
-if err != nil {
-    log.Fatal(err)
-}
-defer conn.Close()
+// Unauthenticated: no bind performed, suitable for directories that allow
+// anonymous reads or when you only need to dial.
+NewConnection(hosts []string, port uint, useSSL, skipTLS bool,
+              tlsCfg *tls.Config, adapter interfaces.CatalogAdapter,
+              opts ...Option) (*LDAPper, error)
+
+// Authenticated: dials, then binds as `username` and looks the user up
+// via the adapter's user filter to confirm the credentials.
+NewAuthenticatedConnection(username, password, baseDN string,
+                           hosts []string, port uint,
+                           useSSL, skipTLS bool, tlsCfg *tls.Config,
+                           adapter interfaces.CatalogAdapter,
+                           opts ...Option) (*LDAPper, *types.LDAPUser, error)
 ```
 
-**Parameters:**
+Highlights:
 
-| Parameter | Description |
-| :--- | :--- |
-| `host` | LDAP server host. |
-| `port` | Port (389 for LDAP, 636 for LDAPS). |
-| `useSSL` | `true` — use `ldaps://` with TLS from the start. |
-| `skipTLS` | `true` — do not perform `StartTLS` after connecting (only for `!useSSL`). |
-| `tlsCfg` | TLS configuration. Required if `useSSL` or `!skipTLS`. |
-| `catalogAdapter` | Catalog adapter (`MSADAdapter` or `OPENLDAPAdapter`). |
+- **Host failover** — hosts are tried in order until one accepts the
+  connection. The maximum list length is `constants.DefaultMaxHostsLength`
+  (50) — a guard against accidentally passing a million hosts.
+- **TLS** — either native LDAPS (`useSSL = true`) or StartTLS
+  (`skipTLS = false`). A non-nil `*tls.Config` is required whenever TLS is
+  used.
+- **`dialURL` is a package-level variable** (`ldap.DialURL`) so tests can
+  swap it out via `withMockDialURL(...)` without touching production code.
 
-**Validation:**
-- `tlsCfg == nil && (!skipTLS || useSSL)` → error `"nil tls config passed"`.
-- `catalogAdapter == nil` → error `"nil catalog adapter passed"`.
+### Adapters
+
+All directory-specific behavior lives in an adapter — a value that
+implements `interfaces.CatalogAdapter`:
+
+```go
+type CatalogAdapter interface {
+    // Cast / convert
+    GetNormalizedUserInfo(ldapUser types.LDAPUser) *types.UserNormalizedInfo
+    OUInfoFromEntry(entry ldap.Entry) *types.OUInfo
+
+    // Object-class filters
+    UserObjectFilter()  string
+    GroupObjectFilter() string
+    OUObjectFilter()    string
+
+    // Search filter templates
+    SearchUserFilterTemplate()       string
+    SearchUserGroupsFilterTemplate() string
+    SearchUserGroupsFilterTemplateArgs(ldapUser types.LDAPUser) []any
+    SearchOUFilterTemplate()    string
+    SearchGroupFilterTemplate() string
+
+    // Attribute lists
+    UserAttrs()  []string
+    OUAttrs()    []string
+    GroupAttrs() []string
+}
+```
+
+Two adapters ship with the library:
+
+| Adapter                | Directory                          |
+|------------------------|------------------------------------|
+| `adapters.MSADAdapter` | Microsoft Active Directory         |
+| `adapters.OPENLDAPAdapter` | OpenLDAP (and most RFC-4519 dialects) |
+
+The adapter is the only place LDAPper assumes anything about schema.
+
+### Search limits
+
+Every search request is built by a single helper that applies
+**connection-level** `SearchLimits{SizeLimit, TimeLimit}`. Callers never
+pass these per call:
+
+```go
+conn, _ := ldapper.NewConnection(..., ldapper.WithSearchLimits(500, 30))
+
+// Later, temporarily raise limits for one heavy pass:
+old := conn.GetSearchLimits()
+conn.SetSearchLimits(0, 120)
+tree, _ := conn.GetCatalogTree("DC=corp,DC=example,DC=com", 0)
+conn.SetSearchLimits(old.SizeLimit, old.TimeLimit)
+```
+
+- `SizeLimit == 0` means "server default / no client limit".
+- `TimeLimit == 0` means "server default / no client limit".
+- Negative values are clamped to `0`.
+- `SetSearchLimits` is **not concurrency-safe** — do not call it while
+  searches are in flight.
 
 ---
+
+## API overview
 
 ### Authentication
 
-#### `AuthenticateConn` — initial authentication
-
 ```go
-user, err := conn.AuthenticateConn("jdoe", "secret", "dc=example,dc=com")
-if err != nil {
-    log.Fatal(err)
-}
-// The connection is now authenticated as jdoe.
-// The service account credentials are stored in conn.bindUser / conn.bindPassword.
+// Bind as `username` and store the credentials for later re-binds.
+user, err := conn.AuthenticateConn(username, password, baseDN)
+
+// Check a user's password against an already-authenticated connection,
+// then rebind back to the service account.
+user, err := conn.AuthenticateUser(username, password, baseDN)
 ```
 
-**What happens:**
-1. User lookup by login (`GetUser`).
-2. `Bind` as the found `user.DN` with the provided password.
-3. On success: `isAuthenticated = true`, `bindUser`, `bindPassword` are stored.
+Notes:
 
-**Errors:**
-- `"connection not initialized"` — connection was not created.
-- `"user does not exist"` — user not found.
-- `"too many entries returned"` — more than one entry matched.
-- `"unsuccessful bind with passed bind credentials"` — invalid password (the original error is **not** returned to avoid leaking sensitive data).
+- `AuthenticateUser` requires the connection to have been created via
+  `NewAuthenticatedConnection` (or a prior `AuthenticateConn`). The
+  connection must have *read* access to look the user up before binding
+  as them.
+- Error messages intentionally do **not** echo the underlying LDAP error
+  text, to avoid leaking credentials in logs.
 
-#### `AuthenticateUser` — user verification with rebind
+### Searching
 
 ```go
-user, err := conn.AuthenticateUser("jdoe", "user-password", "dc=example,dc=com")
-if err != nil {
-    log.Fatal(err)
-}
-// After verification, the connection is rebound to the service account.
+// Escape hatch: build any *ldap.SearchRequest yourself.
+res, err := conn.CustomSearch(&ldap.SearchRequest{...})
+
+// Fetch a single user by the adapter's user filter template.
+user, err := conn.GetUser("jdoe", baseDN)
+
+// Fetch the CNs of all groups a user belongs to.
+groups, err := conn.GetUserGroups("jdoe", baseDN)
+
+// Fetch every user under an OU (subtree search, adapter user filter).
+users, err := conn.GetOUUsers("OU=Staff,DC=corp,DC=example,DC=com")
 ```
 
-**Requirements:**
-- The connection must be previously authenticated via `AuthenticateConn` (otherwise: `"connection not authenticated"`).
-- The service account must have read access to the directory.
+`GetUser` returns an error when the filter matches zero or more than one
+entry — user lookups are assumed to be unique.
 
-**What happens:**
-1. User lookup (`GetUser`).
-2. `Bind` as the user with their password.
-3. On success — `Bind` back as `conn.bindUser` / `conn.bindPassword`.
+### Catalog tree discovery
 
-**Errors:**
-- `"connection not authenticated"` — `AuthenticateConn` was not called.
-- `"unsuccessful bind with passed user credentials"` — invalid user password (rebind is not performed).
-- `"unsuccessful rebind with bind-config credentials"` — failed to rebind back to the service account.
+```go
+tree, err := conn.GetCatalogTree("DC=corp,DC=example,DC=com", 2)
+```
+
+- Performs **one paged subtree search** (`ControlPaging`) and builds the
+  `OU` tree on the client, instead of issuing one round-trip per level.
+- Filters out entries that are not strict descendants of `baseDn`
+  (via `ldap.DN.AncestorOf`) — misbehaving servers and cross-tree
+  referrals can't leak foreign entries into the result.
+- Skips malformed DNs returned by the server rather than aborting.
+- `maxDepth` trims the resulting tree: `0` = no limit, `1` = roots only,
+  `2` = roots + first level, etc.
+
+```go
+// Only root-level OUs, one level at a time (useful for lazy UIs):
+roots, err := conn.GetRootOUs("DC=corp,DC=example,DC=com")
+
+// Direct children of an OU:
+children, err := conn.GetSubOUs("OU=Staff,DC=corp,DC=example,DC=com",
+                                ldap.ScopeSingleLevel)
+```
+
+`GetCatalogTree` is the recommended path for large catalogs: it round-trips
+once, streams results page-by-page, and assembles the tree in `O(N)` using a
+`map[DN]*OUInfo` + parent-DN walk.
+
+### Health checks & reconnection
+
+```go
+if !conn.IsAlive() {
+    _ = conn.Reconnect()
+}
+
+// Or the combined form, suitable as a pre-flight check:
+if err := conn.EnsureAlive(); err != nil {
+    return err
+}
+```
+
+- `IsAlive` checks the local connection state (`IsClosing`) and issues a
+  cheap root-DSE search with hard-coded `SizeLimit=1, TimeLimit=1`. It is
+  intentionally independent of the user-configured search limits.
+- `Reconnect` closes the current connection, dials any host in
+  `hosts` again, and — if the connection was authenticated — re-binds with
+  the stored credentials.
+- `Close` is idempotent and swallows `Close` errors (best-effort).
 
 ---
 
-### User Search
+## Writing your own adapter
 
-```go
-user, err := conn.GetUser("jdoe", "dc=example,dc=com")
-if err != nil {
-    log.Fatal(err)
-}
-
-fmt.Println(user.DN)                                // uid=jdoe,dc=example,dc=com
-fmt.Println(user.GetAttributeValue("cn"))           // John Doe
-fmt.Println(user.GetAttributeValue("mail"))         // jdoe@example.com
-fmt.Println(user.GetFirstNonNullAttributeValue([]string{"thumbnailPhoto", "jpegPhoto"}))
-```
-
-**Returns:**
-- `*LDAPUser` with `DN` and `Attributes map[string][]string`.
-- Errors: `"user does not exist"`, `"too many entries returned"`, `"unsuccessful user search: ..."`.
-
-**Notes:**
-- The filter is built from `catalogAdapter.SearchUserFilterTemplate()` with `username` substituted.
-- Requested attributes come from `catalogAdapter.UserAttrs()`.
-- `TimeLimit` = `defaultSearchTimeLimit` (60 seconds).
-
----
-
-### User Groups
-
-```go
-groups, err := conn.GetUserGroups("jdoe", "dc=example,dc=com")
-if err != nil {
-    log.Fatal(err)
-}
-fmt.Println(groups) // ["admins", "users", ...]
-```
-
-**What happens:**
-1. `GetUser` — user lookup.
-2. Filter built from `SearchUserGroupsFilterTemplate()` + `SearchUserGroupsFilterTemplateArgs(user)`.
-3. Group search and extraction of the `cn` attribute.
-
-**Adapter differences:**
-
-| Directory | Filter template | Arguments |
-| :--- | :--- | :--- |
-| **MSAD** | `(&(objectCategory=group)(member:1.2.840.113556.1.4.1941:=%s))` — recursive search via `LDAP_MATCHING_RULE_IN_CHAIN`. | `[user.DN]` |
-| **OpenLDAP** | `(\|(&(objectClass=groupOfNames)(member=%s))(&(objectClass=posixGroup)(memberUid=%s)))` | `[user.DN, user.GetAttributeValue("uid")]` |
-
----
-
-### Users in an OU
-
-```go
-users, err := conn.GetOUUsers("ou=people,dc=example,dc=com")
-if err != nil {
-    log.Fatal(err)
-}
-for _, u := range users {
-    fmt.Println(u.DN)
-}
-```
-
-**Notes:**
-- `ScopeWholeSubtree` — recursive search over the entire subtree.
-- Filter — `catalogAdapter.UserObjectFilter()`.
-- Attributes — `catalogAdapter.UserAttrs()`.
-
----
-
-### Catalog Tree
-
-```go
-tree, err := conn.GetCatalogTree("dc=example,dc=com")
-if err != nil {
-    log.Fatal(err)
-}
-
-for _, ou := range tree.Tree {
-    fmt.Printf("%s (%s)\n", ou.Name, ou.DN)
-    for _, child := range ou.Children {
-        fmt.Printf("  └─ %s\n", child.DN)
-    }
-}
-```
-
-**How it works:**
-1. `GetRootOUs(baseDN)` — first-level OU search (`ScopeSingleLevel`).
-2. `GetRecursiveOUSearchResult(&rootOUs, 2)` — recursive traversal limited by `defaultSearchDepth = 5`.
-3. `GetSubOUs(group, level)` — child OU search for each node.
-
-**Important:**
-- **Depth** is limited by `defaultSearchDepth` (5).
-- **Filtering** in `GetSubOUs`: an entry is included only if its `DN` ends with `","+group` (i.e., it is genuinely a child) and is not equal to `group`. This avoids false positives like `ou=root2,...` matching `ou=root`.
-- `Children` is always initialized as a non-nil empty slice — safe for `append` and JSON serialization.
-
----
-
-### Custom Search
-
-```go
-req := ldap.NewSearchRequest(
-    "dc=example,dc=com",
-    ldap.ScopeWholeSubtree,
-    ldap.NeverDerefAliases,
-    0, 0, false,
-    "(objectClass=person)",
-    []string{"cn", "mail"},
-    nil,
-)
-
-result, err := conn.CustomSearch(req)
-if err != nil {
-    log.Fatal(err)
-}
-for _, entry := range result.Entries {
-    fmt.Println(entry.DN)
-}
-```
-
-**Notes:**
-- The error is **not** wrapped — returned as-is (unlike `GetUser`/`GetOUUsers`).
-- `connection == nil` check → `"connection not initialized"`.
-
----
-
-## 🧩 Catalog Adapters
-
-### `MSADAdapter` (Microsoft Active Directory)
-
-| Method | Value |
-| :--- | :--- |
-| `OUObjectFilter` | `(&(objectClass=organizationalUnit))` |
-| `GroupObjectFilter` | `(&(objectCategory=group))` |
-| `UserObjectFilter` | `(&(objectClass=user)(objectCategory=person))` |
-| `SearchUserFilterTemplate` | `(&(objectCategory=person)(objectClass=user)(sAMAccountName=%s))` |
-| `SearchUserGroupsFilterTemplate` | `(&(objectCategory=group)(member:1.2.840.113556.1.4.1941:=%s))` |
-| `SearchOUFilterTemplate` | `(&(objectClass=organizationalUnit)(ou=%s))` |
-| `SearchGroupFilterTemplate` | `(&(objectCategory=group)(cn=%s))` |
-| `GetNormalizedUserInfo` | `Department` ← `department`, `Photo` ← `thumbnailPhoto` → `jpegPhoto` (fallback) |
-| `OUInfoFromEntry` | `Name` ← `name` attribute, `OU` ← `entry.DN` |
-
-### `OPENLDAPAdapter` (OpenLDAP)
-
-| Method | Value |
-| :--- | :--- |
-| `OUObjectFilter` | `(&(objectClass=organizationalUnit))` |
-| `GroupObjectFilter` | `(\|(objectClass=groupOfNames)(objectClass=posixGroup))` |
-| `UserObjectFilter` | `(&(objectClass=person))` |
-| `SearchUserFilterTemplate` | `(&(!(objectClass=computer))(\|(uid=%[1]s)(cn=%[1]s)))` — a single argument substituted twice via `%[1]s` |
-| `SearchUserGroupsFilterTemplate` | `(\|(&(objectClass=groupOfNames)(member=%s))(&(objectClass=posixGroup)(memberUid=%s)))` |
-| `SearchOUFilterTemplate` | `(&(objectClass=organizationalUnit)(ou=%s))` |
-| `SearchGroupFilterTemplate` | `(&(\|(objectClass=groupOfNames)(objectClass=posixGroup))(cn=%s))` |
-| `GetNormalizedUserInfo` | `Department` ← `departmentNumber`, `Photo` ← `jpegPhoto`, `Company`/`Country`/`City`/`Index` — always empty |
-| `OUInfoFromEntry` | `Name` ← `entry.DN`, `OU` ← `ou` attribute |
-
-### Implementing a Custom Adapter
+Implement `interfaces.CatalogAdapter` for your directory. The adapter is
+stateless and safe to reuse across connections. Example skeleton:
 
 ```go
 type MyAdapter struct{}
 
-func (a MyAdapter) GetNormalizedUserInfo(u ldapper.LDAPUser) *ldapper.UserNormalizedInfo { /* ... */ }
-func (a MyAdapter) OUInfoFromEntry(e ldap.Entry) *ldapper.OUInfo { /* ... */ }
-func (a MyAdapter) UserObjectFilter() string { /* ... */ }
-func (a MyAdapter) GroupObjectFilter() string { /* ... */ }
-func (a MyAdapter) OUObjectFilter() string { /* ... */ }
-func (a MyAdapter) SearchUserFilterTemplate() string { /* ... */ }
-func (a MyAdapter) SearchUserGroupsFilterTemplate() string { /* ... */ }
-func (a MyAdapter) SearchUserGroupsFilterTemplateArgs(u ldapper.LDAPUser) []any { /* ... */ }
-func (a MyAdapter) SearchOUFilterTemplate() string { /* ... */ }
-func (a MyAdapter) SearchGroupFilterTemplate() string { /* ... */ }
-func (a MyAdapter) UserAttrs() []string { /* ... */ }
-func (a MyAdapter) ShortUserAttrs() []string { /* ... */ }
-func (a MyAdapter) OUAttrs() []string { /* ... */ }
-func (a MyAdapter) GroupAttrs() []string { /* ... */ }
+func (MyAdapter) GetNormalizedUserInfo(u types.LDAPUser) *types.UserNormalizedInfo {
+    return &types.UserNormalizedInfo{
+        DistinguishedName: u.DN,
+        CommonName:        u.GetAttributeValue("cn"),
+        Mail:              u.GetAttributeValue("mail"),
+    }
+}
+
+func (MyAdapter) OUInfoFromEntry(e ldap.Entry) *types.OUInfo {
+    return &types.OUInfo{
+        DN:       e.DN,
+        Name:     e.GetAttributeValue("ou"),
+        Children: make([]*types.OUInfo, 0),
+    }
+}
+
+func (MyAdapter) UserObjectFilter() string { return "(&(objectClass=inetOrgPerson))" }
+func (MyAdapter) UserAttrs() []string      { return []string{"cn", "mail"} }
+// ... remaining methods
 ```
+
+See `adapters/msad_adapter.go` and `adapters/openldap_adapter.go` for
+complete, production-quality examples.
 
 ---
 
-## 📐 Data Types
+## Configuration & tuning
 
-### `LDAPUser`
+Defaults live in `constants/constants.go`:
 
-```go
-type LDAPUser struct {
-    DN         string              // distinguished name
-    Attributes map[string][]string // user attributes
-}
+| Constant                       | Default | Meaning |
+|--------------------------------|---------|---------|
+| `LDAPURITemplate`              | `"ldap://%s:%d"`  | Used for plain / StartTLS dials |
+| `LDAPSURITemplate`             | `"ldaps://%s:%d"` | Used for LDAPS dials |
+| `DefaultSearchSizeLimit`       | `0`     | `0` = no client-side size limit |
+| `DefaultSearchTimeLimit`       | `30`    | Seconds |
+| `DefaultSearchDepth`           | `5`     | Legacy depth for the level-by-level walker |
+| `DefaultMaxHostsLength`        | `50`    | Upper bound on the `hosts` slice |
+| `DefaultCatalogTreePageSize`   | `1000`  | Paging control size for `GetCatalogTree` |
 
-func (lu *LDAPUser) GetAttributeValue(attribute string) string
-func (lu *LDAPUser) GetFirstNonNullAttributeValue(alternatives []string) string
-```
+Options:
 
-- `GetAttributeValue` returns the **first** value of an attribute, or `""`.
-- `GetFirstNonNullAttributeValue` iterates over alternatives and returns the first non-empty value.
-
-### `UserNormalizedInfo`
-
-```go
-type UserNormalizedInfo struct {
-    DistinguishedName string
-    CommonName        string
-    Mobile            string
-    Phone             string
-    Mail              string
-    Department        string
-    Title             string
-    Manager           string
-    Photo             string
-    Company           string
-    Country           string
-    Address           string
-    City              string
-    Index             string
-}
-```
-
-### `OUInfo`
-
-```go
-type OUInfo struct {
-    Name     string    `json:"name"`
-    DN       string    `json:"distinguishedName"`
-    OU       string    `json:"ou"`
-    Children []*OUInfo `json:"children"`
-}
-```
-
-### `CatalogTree`
-
-```go
-type CatalogTree struct {
-    Tree []*OUInfo `json:"tree"`
-}
-```
+| Option                        | Effect |
+|-------------------------------|--------|
+| `WithSearchLimits(size, time)`| Overrides the connection-level search limits |
+| `SetSearchLimits(size, time)` | Runtime override (not concurrency-safe) |
+| `GetSearchLimits()`           | Reads current limits |
 
 ---
 
-## ⚙️ Constants
+## Testing
 
-```go
-const (
-    ldapURITemplate  = "ldap://%s:%d"
-    ldapsURITemplate = "ldaps://%s:%d"
+The package is designed for testability:
 
-    defaultSearchTimeLimit = 60 // seconds
-    defaultSearchDepth     = 5  // maximum recursion depth for the OU tree
-)
-```
+- `dialURL` is a package-level `var` — tests can substitute it with
+  `withMockDialURL(t, fn)` (see `helpers_test.go`).
+- `interfaces.LDAPConn` and `interfaces.CatalogAdapter` can both be mocked.
+  Ready-made fakes live in `mocks/`:
+  - `mocks.MockLDAPConn` — `BindFunc`, `SearchFunc`, `CloseFunc`,
+    `IsClosingFunc`, `StartTLSFunc` fields.
+  - `mocks.MockCatalogAdapter` — testify-based catalog adapter.
+- Integration tests against an in-memory directory are kept behind
+  `//go:build integration` (see `ldapper_integration_test.go`) and can be
+  run with:
 
-| Constant | Value | Purpose |
-| :--- | :--- | :--- |
-| `ldapURITemplate` | `ldap://%s:%d` | URI template for plain LDAP. |
-| `ldapsURITemplate` | `ldaps://%s:%d` | URI template for LDAPS. |
-| `defaultSearchTimeLimit` | `60` | LDAP search timeout (seconds). |
-| `defaultSearchDepth` | `5` | Maximum recursion depth for the OU tree. |
+  ```bash
+  go test -tags=integration ./...
+  ```
 
----
-
-## 🧪 Testing
-
-All methods are covered by unit tests using `testify/mock`. Mocks:
-
-- **`MockLDAPConn`** — implementation of the `LDAPConn` interface (`StartTLS`, `Bind`, `Search`, `Close`).
-- **`MockCatalogAdapter`** — implementation of the `CatalogAdapter` interface.
-
-**Run tests:**
+Run the unit tests:
 
 ```bash
-go test ./... -v
+go test ./...
 ```
 
-**Coverage:**
+Run with the race detector:
 
 ```bash
-go test ./... -coverprofile=coverage.out
-go tool cover -html=coverage.out
+go test -race ./...
 ```
 
-**Test structure:**
-
-| File | What is covered |
-| :--- | :--- |
-| `ldap_connection_test.go` | `NewConnection`, `NewAuthenticatedConnection`, `AuthenticateConn`, `AuthenticateUser`, `Close`, `CustomSearch`, `GetUser`, `GetUserGroups`, `GetOUUsers`, `GetCatalogTree`, `GetRootOUs`, `GetSubOUs`, `GetRecursiveOUSearchResult`. |
-| `msad_adapter_test.go` | `GetNormalizedUserInfo`, `OUInfoFromEntry`, filters, templates, `SearchUserGroupsFilterTemplateArgs`, attribute lists. |
-| `openldap_adapter_test.go` | Same for OpenLDAP + parentheses balance checks across all search templates. |
-| `helpers_test.go` | Helpers `newTestConnection`, `newLDAPEntry`, `newLDAPUser`. |
-| `ldap_native_conn_mock.go` | `MockLDAPConn` — a mock for the low-level LDAP connection. |
-| `catalog_adapter_mock.go` | `MockCatalogAdapter` — a mock for the catalog adapter. |
-
-**Test scenarios for `LDAPConnection`:**
-
-- ✅ Successful calls.
-- ❌ `nil` connection → `"connection not initialized"`.
-- ❌ User not found → `"user does not exist"`.
-- ❌ More than one entry → `"too many entries returned"`.
-- ❌ `Search` / `Bind` errors.
-- 🔐 Sensitive data leakage in `Bind` errors — explicitly verified that the original error **does not** appear in the returned error.
-- 🔁 `GetRecursiveOUSearchResult` recursion at the `defaultSearchDepth` boundary and below.
-- 🧹 `GetSubOUs` filtering: self, unrelated DNs, prefix matches (`ou=root2` vs `ou=root`).
+> Tip: `StartTLS` on a zero-value `*ldap.Conn` returned by a mocked
+> `dialURL` blocks on a `nil` channel. When mocking `dialURL`, always set
+> `skipTLS = true` or `useSSL = true` on the `LDAPper` under test (see
+> `newDialableLDAPper` in `helpers_test.go`).
 
 ---
 
-## ⚠️ Limitations and TODO
+## License
 
-### Current Limitations
-
-- **Single host** — `NewConnection` and `NewAuthenticatedConnection` accept a single host. Multi-host (failover) support is in TODO.
-- **Fixed tree depth** — `defaultSearchDepth = 5` is hardcoded. Configurable depth is planned.
-- **`GetRecursiveOUSearchResult`** — with several OUs at the same level, `nextLevel` is overwritten on each iteration, so `Children` may contain only the result of the last call. MAYBE Requires fixing (merging results).
-- **`NewConnection` / `NewAuthenticatedConnection`** — successful scenarios are not covered by tests because they require a real `ldap.DialURL`. Full coverage requires extracting `DialURL` into a package variable for mocking.
-
-### TODO (from code comments)
-
-- `// TODO: add many hosts support` — multi-host support.
-- `// TODO: make controlable depth` — configurable tree depth for recursive search of ou-tree.
-- `// TODO: think about limits` — parameterize search limits.
-- `// TODO: think what else we need in normalized info` — extend `UserNormalizedInfo`.
-
----
-
-## 📄 License
-
-Copyright © 2020-2026 NGR Softlab. See the `LICENSE` file in the repository root.
-
----
-
-## 🤝 Contributing
-
-1. Fork the repository.
-2. Create a branch (`git checkout -b feature/my-feature`).
-3. Make changes and add tests.
-4. Ensure `go test ./...` passes.
-5. Open a Pull Request.
-
-**PR requirements:**
-- All new methods must be covered by unit tests.
-- Public methods and types must have godoc comments.
-- Errors must not contain sensitive data (passwords, service account DNs).
+Copyright © 2020–2026 NGR Softlab. See the `LICENSE` file in the
+repository root for the full license text.

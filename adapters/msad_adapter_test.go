@@ -407,30 +407,6 @@ func TestMSADAdapter_UserAttrs_NoDuplicates(t *testing.T) {
 	}
 }
 
-func TestMSADAdapter_ShortUserAttrs(t *testing.T) {
-	adapter := MSADAdapter{}
-
-	expected := []string{
-		"distinguishedName", "cn", "mail", "userPrincipalName", "title", "department",
-	}
-
-	assert.Equal(t, expected, adapter.ShortUserAttrs())
-}
-
-func TestMSADAdapter_ShortUserAttrs_SubsetOfUserAttrs(t *testing.T) {
-	// Must: ShortUserAttrs ⊆ UserAttrs. Otherwise GetUser and GetOUUsers can return different attrs for the same user
-	adapter := MSADAdapter{}
-	full := make(map[string]struct{}, len(adapter.UserAttrs()))
-	for _, attr := range adapter.UserAttrs() {
-		full[attr] = struct{}{}
-	}
-
-	for _, attr := range adapter.ShortUserAttrs() {
-		_, ok := full[attr]
-		assert.True(t, ok, "attr %q from ShortUserAttrs is not present in UserAttrs", attr)
-	}
-}
-
 func TestMSADAdapter_OUAttrs(t *testing.T) {
 	adapter := MSADAdapter{}
 

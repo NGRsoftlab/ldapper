@@ -19,14 +19,13 @@ type CatalogAdapter interface {
 
 	// search filters
 	SearchUserFilterTemplate() string       // NB: 1 arg
-	SearchUserGroupsFilterTemplate() string // NB: N args, use with arglist unpacking
+	SearchUserGroupsFilterTemplate() string // NB: N args, use with SearchUserGroupsFilterTemplateArgs unpacking
 	SearchUserGroupsFilterTemplateArgs(ldapUser types.LDAPUser) []any
 	SearchOUFilterTemplate() string    // NB: 1 arg
 	SearchGroupFilterTemplate() string // NB: 1 arg
 
 	// attrs
 	UserAttrs() []string
-	ShortUserAttrs() []string
 	OUAttrs() []string
 	GroupAttrs() []string
 }

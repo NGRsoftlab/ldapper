@@ -115,17 +115,6 @@ func (a OPENLDAPAdapter) UserAttrs() []string {
 	}
 }
 
-func (a OPENLDAPAdapter) ShortUserAttrs() []string {
-	return []string{
-		"uid",
-		"cn",
-		"dn",
-		"mail",
-		"title",
-		"departmentNumber",
-	}
-}
-
 func (a OPENLDAPAdapter) OUAttrs() []string {
 	return []string{
 		"ou",

@@ -5,6 +5,10 @@ const (
 	LDAPURITemplate  = "ldap://%s:%d"
 	LDAPSURITemplate = "ldaps://%s:%d"
 
-	DefaultSearchTimeLimit = 60
-	DefaultSearchDepth     = 5
+	DefaultSearchSizeLimit = 0 // 0 — no size limit (server default)
+	DefaultSearchTimeLimit = 30
+
+	DefaultMaxHostsLength = 50
+
+	DefaultCatalogTreePageSize = 1000
 )

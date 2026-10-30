@@ -7,13 +7,12 @@ import (
 
 	"github.com/go-ldap/ldap/v3"
 
-	"github.com/NGRsoftlab/ldapper/constants"
 	"github.com/NGRsoftlab/ldapper/types"
 )
 
 // SEARCH METHODS
 
-func (conn *LDAPConnection) CustomSearch(searchRequest *ldap.SearchRequest) (*ldap.SearchResult, error) {
+func (conn *LDAPper) CustomSearch(searchRequest *ldap.SearchRequest) (*ldap.SearchResult, error) {
 	if conn.connection == nil {
 		return nil, errors.New("connection not initialized")
 	}
@@ -21,7 +20,7 @@ func (conn *LDAPConnection) CustomSearch(searchRequest *ldap.SearchRequest) (*ld
 	return conn.connection.Search(searchRequest)
 }
 
-func (conn *LDAPConnection) GetUser(username, baseDN string) (*types.LDAPUser, error) {
+func (conn *LDAPper) GetUser(username, baseDN string) (*types.LDAPUser, error) {
 	if conn.connection == nil {
 		return nil, errors.New("connection not initialized")
 	}
@@ -29,14 +28,7 @@ func (conn *LDAPConnection) GetUser(username, baseDN string) (*types.LDAPUser, e
 	filter := fmt.Sprintf(conn.catalogAdapter.SearchUserFilterTemplate(), username)
 	attributes := conn.catalogAdapter.UserAttrs()
 
-	// TODO: think about limits (search size and timeout)
-	searchRequest := ldap.NewSearchRequest(
-		baseDN,
-		ldap.ScopeWholeSubtree, ldap.NeverDerefAliases, 0, constants.DefaultSearchTimeLimit, false,
-		filter,
-		attributes,
-		nil,
-	)
+	searchRequest := conn.newSearchRequest(baseDN, ldap.ScopeWholeSubtree, ldap.NeverDerefAliases, false, filter, attributes, nil)
 
 	searchResult, err := conn.connection.Search(searchRequest)
 	if err != nil {
@@ -63,7 +55,7 @@ func (conn *LDAPConnection) GetUser(username, baseDN string) (*types.LDAPUser, e
 	return user, nil
 }
 
-func (conn *LDAPConnection) GetUserGroups(username, baseDN string) ([]string, error) {
+func (conn *LDAPper) GetUserGroups(username, baseDN string) ([]string, error) {
 	if conn.connection == nil {
 		return nil, errors.New("connection not initialized")
 	}
@@ -73,14 +65,12 @@ func (conn *LDAPConnection) GetUserGroups(username, baseDN string) ([]string, er
 		return nil, err
 	}
 
-	// TODO: think about limits (search size and timeout)
-	searchRequest := ldap.NewSearchRequest(
-		baseDN,
-		ldap.ScopeWholeSubtree, ldap.NeverDerefAliases, 0, constants.DefaultSearchTimeLimit, false,
-		fmt.Sprintf(conn.catalogAdapter.SearchUserGroupsFilterTemplate(), conn.catalogAdapter.SearchUserGroupsFilterTemplateArgs(*user)...),
-		[]string{"cn"},
-		nil,
+	filter := fmt.Sprintf(
+		conn.catalogAdapter.SearchUserGroupsFilterTemplate(),
+		conn.catalogAdapter.SearchUserGroupsFilterTemplateArgs(*user)...,
 	)
+
+	searchRequest := conn.newSearchRequest(baseDN, ldap.ScopeWholeSubtree, ldap.NeverDerefAliases, false, filter, []string{"cn"}, nil)
 
 	searchResult, err := conn.connection.Search(searchRequest)
 	if err != nil {
@@ -95,7 +85,7 @@ func (conn *LDAPConnection) GetUserGroups(username, baseDN string) ([]string, er
 	return groups, nil
 }
 
-func (conn *LDAPConnection) GetOUUsers(ou string) ([]*types.LDAPUser, error) {
+func (conn *LDAPper) GetOUUsers(ou string) ([]*types.LDAPUser, error) {
 	if conn.connection == nil {
 		return nil, errors.New("connection not initialized")
 	}
@@ -105,14 +95,7 @@ func (conn *LDAPConnection) GetOUUsers(ou string) ([]*types.LDAPUser, error) {
 	filter := conn.catalogAdapter.UserObjectFilter()
 	attributes := conn.catalogAdapter.UserAttrs()
 
-	// TODO: think about limits (search size and timeout)
-	searchRequest := ldap.NewSearchRequest(
-		ou,
-		ldap.ScopeWholeSubtree, ldap.NeverDerefAliases, 0, constants.DefaultSearchTimeLimit, false,
-		filter,
-		attributes,
-		nil,
-	)
+	searchRequest := conn.newSearchRequest(ou, ldap.ScopeWholeSubtree, ldap.NeverDerefAliases, false, filter, attributes, nil)
 
 	searchResult, err := conn.connection.Search(searchRequest)
 	if err != nil {

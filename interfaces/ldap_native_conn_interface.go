@@ -11,5 +11,6 @@ type LDAPConn interface {
 	StartTLS(config *tls.Config) error
 	Bind(username, password string) error
 	Search(request *ldap.SearchRequest) (*ldap.SearchResult, error)
+	IsClosing() bool
 	Close() error
 }

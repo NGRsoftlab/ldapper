@@ -566,32 +566,6 @@ func TestOPENLDAPAdapter_UserAttrs_NoDuplicates(t *testing.T) {
 	}
 }
 
-func TestOPENLDAPAdapter_ShortUserAttrs(t *testing.T) {
-	adapter := OPENLDAPAdapter{}
-
-	expected := []string{
-		"uid", "cn", "dn", "mail", "title", "departmentNumber",
-	}
-
-	assert.Equal(t, expected, adapter.ShortUserAttrs())
-}
-
-func TestOPENLDAPAdapter_ShortUserAttrs_SubsetOfUserAttrs(t *testing.T) {
-	// Contract: ShortUserAttrs must be a subset of UserAttrs.
-	// Otherwise GetUser and GetOUUsers return different attribute sets
-	// for the same user.
-	adapter := OPENLDAPAdapter{}
-	full := make(map[string]struct{}, len(adapter.UserAttrs()))
-	for _, attr := range adapter.UserAttrs() {
-		full[attr] = struct{}{}
-	}
-
-	for _, attr := range adapter.ShortUserAttrs() {
-		_, ok := full[attr]
-		assert.True(t, ok, "attribute %q from ShortUserAttrs is missing in UserAttrs", attr)
-	}
-}
-
 func TestOPENLDAPAdapter_OUAttrs(t *testing.T) {
 	adapter := OPENLDAPAdapter{}
 

@@ -235,7 +235,7 @@ func TestOPENLDAPAdapter_SearchUserFilterTemplate(t *testing.T) {
 	tmpl := OPENLDAPAdapter{}.SearchUserFilterTemplate()
 
 	assert.Equal(t,
-		"(&(!(objectClass=computer))(|(uid=%[1]s)(cn=%[1]s)))",
+		"(&(!(objectClass=computer))(|(uid=%[1]s)(entryDN=%[1]s)))",
 		tmpl,
 	)
 	// Computer objects must be excluded, otherwise workstations and servers
@@ -245,13 +245,13 @@ func TestOPENLDAPAdapter_SearchUserFilterTemplate(t *testing.T) {
 }
 
 // TestOPENLDAPAdapter_SearchUserFilterTemplate_FormatsIndexedPlaceholder verifies
-// the indexed %[1]s placeholder is substituted into BOTH uid= and cn=.
+// the indexed %[1]s placeholder is substituted into BOTH uid= and entryDN=.
 func TestOPENLDAPAdapter_SearchUserFilterTemplate_FormatsIndexedPlaceholder(t *testing.T) {
 	tmpl := OPENLDAPAdapter{}.SearchUserFilterTemplate()
 	filter := fmt.Sprintf(tmpl, "jdoe")
 
 	assert.Equal(t,
-		"(&(!(objectClass=computer))(|(uid=jdoe)(cn=jdoe)))",
+		"(&(!(objectClass=computer))(|(uid=jdoe)(entryDN=jdoe)))",
 		filter,
 	)
 	assert.NotContains(t, filter, "%", "no unresolved placeholders should remain")
@@ -261,7 +261,7 @@ func TestOPENLDAPAdapter_SearchUserGroupsFilterTemplate(t *testing.T) {
 	tmpl := OPENLDAPAdapter{}.SearchUserGroupsFilterTemplate()
 
 	assert.Equal(t,
-		"(|(&(objectClass=groupOfNames)(member=uid=%s))(&(objectClass=posixGroup)(memberUid=%s)))",
+		"(|(&(objectClass=groupOfNames)(member=%s))(&(objectClass=posixGroup)(memberUid=%s)))",
 		tmpl,
 	)
 	// Two placeholders: one for member (groupOfNames), one for memberUid (posixGroup).
@@ -274,7 +274,7 @@ func TestOPENLDAPAdapter_SearchUserGroupsFilterTemplate(t *testing.T) {
 // producing a well-formed filter with no fmt EXTRA artifacts.
 func TestOPENLDAPAdapter_SearchUserGroupsFilterTemplate_FormatsBothArgs(t *testing.T) {
 	tmpl := OPENLDAPAdapter{}.SearchUserGroupsFilterTemplate()
-	filter := fmt.Sprintf(tmpl, "jdoe,dc=example,dc=com", "jdoe")
+	filter := fmt.Sprintf(tmpl, "uid=jdoe,dc=example,dc=com", "jdoe")
 
 	assert.Equal(t,
 		"(|(&(objectClass=groupOfNames)(member=uid=jdoe,dc=example,dc=com))"+

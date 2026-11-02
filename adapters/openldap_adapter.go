@@ -58,12 +58,11 @@ func (a OPENLDAPAdapter) UserObjectFilter() string {
 // SEARCH
 
 func (a OPENLDAPAdapter) SearchUserFilterTemplate() string {
-	return "(&(!(objectClass=computer))(|(uid=%[1]s)(cn=%[1]s)))"
+	return "(&(!(objectClass=computer))(|(uid=%[1]s)(entryDN=%[1]s)))"
 }
 
-// NB: filter syntax need check
 func (a OPENLDAPAdapter) SearchUserGroupsFilterTemplate() string {
-	return "(|(&(objectClass=groupOfNames)(member=uid=%s))(&(objectClass=posixGroup)(memberUid=%s)))"
+	return "(|(&(objectClass=groupOfNames)(member=%s))(&(objectClass=posixGroup)(memberUid=%s)))"
 }
 
 func (a OPENLDAPAdapter) SearchUserGroupsFilterTemplateArgs(ldapUser types.LDAPUser) []any {

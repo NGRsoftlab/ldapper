@@ -65,13 +65,12 @@ func (a FREEIPAAdapter) SearchUserFilterTemplate() string {
 	return "(&(|(objectClass=posixAccount)(objectClass=inetOrgPerson)(objectClass=person))(uid=%s))"
 }
 
-// NB: filter syntax need check
 func (a FREEIPAAdapter) SearchUserGroupsFilterTemplate() string {
-	return "(&(|(objectClass=groupOfNames)(objectClass=posixGroup)(objectClass=ipausergroup))(member=uid=%s))"
+	return "(&(|(objectClass=groupOfNames)(objectClass=posixGroup)(objectClass=ipausergroup))(member=%s))"
 }
 
 func (a FREEIPAAdapter) SearchUserGroupsFilterTemplateArgs(ldapUser types.LDAPUser) []any {
-	return []any{ldapUser.GetAttributeValue("uid")}
+	return []any{ldapUser.DN}
 }
 
 func (a FREEIPAAdapter) SearchOUFilterTemplate() string {

@@ -13,6 +13,9 @@ A lightweight, adapter-based LDAP client for Go. LDAPper wraps
   `TimeLimit` on every query.
 - **Efficient catalog tree discovery** — a single paged subtree search,
   assembled into an `OU` tree on the client, with optional depth trimming.
+- **End-to-end integration tests** for every shipped adapter, running
+  against real directory servers in Docker (OpenLDAP, Samba 4 AD DC,
+  FreeIPA, and OpenLDAP-with-ALDPro-schema).
 
 ---
 
@@ -45,7 +48,8 @@ go get github.com/NGRsoftlab/ldapper
 ```
 
 Requires Go 1.21+ (module tested against Go 1.26). Depends on
-`github.com/go-ldap/ldap/v3`.
+`github.com/go-ldap/ldap/v3`. Integration tests additionally require
+`github.com/testcontainers/testcontainers-go` and a running Docker daemon.
 
 ---
 
@@ -134,8 +138,8 @@ plain structs and functions.
                │                                   │
    prod: *ldap.Conn                  prod: adapters.{MSAD, OPENLDAP,
    test: mocks.MockLDAPConn                ALDRPO, FREEIPA}Adapter
-                                     test: mocks.MockCatalogAdapter
-                                           or testCatalogAdapter
+                                     test: testCatalogAdapter
+                                           (see test_catalog_adapter_test.go)
 
                                │
 ┌──────────────────────────────▼───────────────────────────────────┐
@@ -161,8 +165,11 @@ LDAPper
 ├── connection      interfaces.LDAPConn         active network connection
 │
 ├── isAuthenticated bool                        set by AuthenticateConn
-├── bindUser        string                      stored for Reconnect re-bind
-├── bindPassword    string
+├── bindUser        string                      stored for re-bind on
+├── bindPassword    string                        Reconnect / AuthenticateUser
+├── bindDN          string                      base DN stored by
+│                                                 AuthenticateConn, used
+│                                                 internally by AuthenticateUser
 │
 ├── hosts           []string                    failover list (≤ 50)
 ├── currentHost     string                      host of the active connection
@@ -178,6 +185,10 @@ LDAPper
 Every search method goes through `newSearchRequest(...)`, which injects
 `searchLimits`. Changing limits at runtime (`SetSearchLimits`) is therefore
 a single assignment with no plumbing.
+
+`bindDN` is a subtle but useful field: `AuthenticateConn` records the
+`baseDN` argument so that later calls to `AuthenticateUser(username, password)`
+can look the user up without the caller having to pass the base DN again.
 
 ### Search flow (`GetUser` as example)
 
@@ -239,37 +250,6 @@ conn.GetCatalogTree(baseDN, maxDepth)
 This is the whole reason `GetCatalogTree` is O(1) round-trips instead of
 O(N): the server streams pages of the subtree, and the parent-child wiring
 is done locally in `O(N)` with a single `map[DN]*OUInfo`.
-
-### Repository layout
-
-```
-ldapper/
-├── ldapper.go                        constructors + connection lifecycle
-├── ldapper_search.go                 CustomSearch / GetUser / GetUserGroups / GetOUUsers
-├── ldapper_search_params.go          SearchLimits + newSearchRequest
-├── ldapper_catalog_tree_discovery.go GetCatalogTree / GetRootOUs / GetSubOUs
-│
-├── interfaces/
-│   ├── catalog_adapter_interface.go  interfaces.CatalogAdapter
-│   └── ldap_native_conn_interface.go interfaces.LDAPConn
-│
-├── adapters/
-│   ├── msad_adapter.go               Microsoft Active Directory
-│   ├── openldap_adapter.go           OpenLDAP / RFC-4519
-│   ├── aldpro_adapter.go             ALD Pro
-│   └── freeipa_adapter.go            FreeIPA
-│
-├── types/
-│   ├── ldap_user_type.go             LDAPUser + attribute helpers
-│   ├── ldap_catalog_structure_type.go OUInfo / CatalogTree
-│   └── normalized_user_type.go       UserNormalizedInfo
-│
-├── constants/constants.go            all defaults in one place
-│
-└── mocks/
-    ├── ldap_native_conn_mock.go      MockLDAPConn (function-field style)
-    └── catalog_adapter_mock.go       MockCatalogAdapter (testify)
-```
 
 ---
 
@@ -369,24 +349,44 @@ conn.SetSearchLimits(old.SizeLimit, old.TimeLimit)
 | Adapter                     | Directory                          | Notes |
 |-----------------------------|------------------------------------|-------|
 | `adapters.MSADAdapter`      | Microsoft Active Directory         | Uses `objectCategory`-based filters; recursive group search via the `LDAP_MATCHING_RULE_IN_CHAIN` OID (`1.2.840.113556.1.4.1941`); prefers `thumbnailPhoto` over `jpegPhoto`. |
-| `adapters.OPENLDAPAdapter`  | OpenLDAP (and most RFC-4519 dialects) | Handles both `groupOfNames` and `posixGroup`; user search keyed by `uid` **or** `cn`; address mapped from `postalAddress`. |
-| `adapters.ALDRPOAdapter`    | ALD Pro                            | Recognizes `rbta-org-unit` alongside `organizationalUnit`; department mapped from `rbtadp`; supports `groupOfNames`, `posixGroup`, `ipausergroup`. |
-| `adapters.FREEIPAAdapter`   | FreeIPA                            | Recognizes `nsContainer` alongside `organizationalUnit`; department intentionally **not** mapped (FreeIPA schemas vary); uses FreeIPA-specific attrs `nsAccountLock` and `ipaUniqueID`. |
+| `adapters.OPENLDAPAdapter`  | OpenLDAP (and most RFC-4519 dialects) | Handles both `groupOfNames` (via `member`) and `posixGroup` (via `memberUid`); user search keyed by `uid` **or** `entryDN` (single indexed placeholder); address mapped from `postalAddress`. |
+| `adapters.ALDRPOAdapter`    | ALD Pro                            | Recognizes `rbta-org-unit` alongside `organizationalUnit`; department mapped from `rbtadp`; two-branch group filter — `member` (DN) for `groupOfNames`/`ipausergroup` **and** `memberUid` (uid) for `posixGroup`. |
+| `adapters.FREEIPAAdapter`   | FreeIPA                            | Recognizes `nsContainer` alongside `organizationalUnit`; department intentionally **not** mapped; group lookup matches DN-valued `member`, which `ipa group-add-member` populates on `ipausergroup`/`posixGroup`; FreeIPA-specific attrs `nsAccountLock` and `ipaUniqueID`. |
 
 ### Adapter-specific gotchas
 
 - **`MSADAdapter`** — the base DN for search must be a valid AD naming
   context. `GetUser` matches on `sAMAccountName`; the bind DN in
   `NewAuthenticatedConnection` can be a UPN (`user@domain`), not necessarily
-  a full DN.
+  a full DN. Group search uses `LDAP_MATCHING_RULE_IN_CHAIN`, which
+  **Samba 4 AD DC** and Microsoft AD both support — OpenLDAP and FreeIPA do
+  **not**.
 - **`OPENLDAPAdapter`** — the user filter uses the indexed format
   placeholder `%[1]s` so the same argument is substituted into both `uid=`
-  and `cn=`. Computer objects are explicitly excluded.
-- **`ALDRPOAdapter`** / **`FREEIPAAdapter`** — the user-groups filter
-  template is `member=uid=%s`, which expects the short `uid` (not a DN).
-  `SearchUserGroupsFilterTemplateArgs` returns exactly one argument to match
-  the single placeholder. If your directory stores full DNs in `member`,
-  override `SearchUserGroupsFilterTemplate` in a custom adapter.
+  and `entryDN=`, allowing lookup by either short name or full DN. Computer
+  objects are explicitly excluded. The user-groups filter is a union of two
+  branches:
+  ```
+  (|(&(objectClass=groupOfNames)(member=%s))
+    (&(objectClass=posixGroup)(memberUid=%s)))
+  ```
+  with args `[user.DN, user.uid]`.
+- **`ALDRPOAdapter`** — the user-groups filter mirrors OpenLDAP but also
+  recognizes `ipausergroup` on the `member` branch:
+  ```
+  (|(&(|(objectClass=groupOfNames)(objectClass=ipausergroup)(objectClass=posixGroup))(member=%s))
+    (&(objectClass=posixGroup)(memberUid=%s)))
+  ```
+  with args `[user.DN, user.uid]`. Both `groupOfNames`-style (DN-valued
+  `member`) and `posixGroup`-style (`memberUid`) memberships are
+  discovered end-to-end.
+- **`FREEIPAAdapter`** — the user-groups filter is
+  ```
+  (&(|(objectClass=groupOfNames)(objectClass=posixGroup)(objectClass=ipausergroup))(member=%s))
+  ```
+  with args `[user.DN]`. FreeIPA's `ipa group-add-member` populates `member`
+  (DN-valued) on `ipausergroup`/`posixGroup` entries, so DN-based matching
+  works.
 
 All four adapters are stateless and safe to reuse across connections.
 
@@ -436,16 +436,20 @@ Key differences to keep in mind when picking an adapter:
 ### Authentication
 
 ```go
-// Bind as `username` and store the credentials for later re-binds.
+// Bind as `username` and store the credentials and base DN for later use.
 user, err := conn.AuthenticateConn(username, password, baseDN)
 
 // Check a user's password against an already-authenticated connection,
 // then rebind back to the service account.
-user, err := conn.AuthenticateUser(username, password, baseDN)
+user, err := conn.AuthenticateUser(username, password)
 ```
 
 Notes:
 
+- `AuthenticateConn` stores `username`, `password` **and** `baseDN` on the
+  connection. The stored `baseDN` (kept in the private `bindDN` field) is
+  what `AuthenticateUser` uses internally to look users up — the caller
+  does **not** repeat the base DN.
 - `AuthenticateUser` requires the connection to have been created via
   `NewAuthenticatedConnection` (or a prior `AuthenticateConn`). The
   connection must have *read* access to look the user up before binding
@@ -471,6 +475,13 @@ users, err := conn.GetOUUsers("OU=Staff,DC=corp,DC=example,DC=com")
 
 `GetUser` returns an error when the filter matches zero or more than one
 entry — user lookups are assumed to be unique.
+
+`GetUserGroups` internally calls `GetUser` first, then applies
+`catalogAdapter.SearchUserGroupsFilterTemplate()` with
+`SearchUserGroupsFilterTemplateArgs(*user)`. Each adapter supplies the right
+combination of values (DN for `member`-based schemas, uid for
+`memberUid`-based schemas, or both) — callers never need to know the
+details.
 
 ### Catalog tree discovery
 
@@ -518,7 +529,8 @@ if err := conn.EnsureAlive(); err != nil {
   intentionally independent of the user-configured search limits.
 - `Reconnect` closes the current connection, dials any host in
   `hosts` again, and — if the connection was authenticated — re-binds with
-  the stored credentials.
+  the stored credentials. `bindDN` is preserved, so `AuthenticateUser`
+  continues to work after a reconnect.
 - `Close` is idempotent and swallows `Close` errors (best-effort).
 
 ---
@@ -552,6 +564,16 @@ func (MyAdapter) UserAttrs() []string      { return []string{"cn", "mail"} }
 // ... remaining methods
 ```
 
+Rule of thumb for `SearchUserGroupsFilterTemplate`:
+
+- If your schema stores membership in `member` as **DN** values, use
+  `(member=%s)` and return `[user.DN]` from
+  `SearchUserGroupsFilterTemplateArgs`.
+- If your schema stores membership in `memberUid` as **short uid** values,
+  use `(memberUid=%s)` and return `[user.GetAttributeValue("uid")]`.
+- If you need to handle both (like `OPENLDAPAdapter` and `ALDRPOAdapter`),
+  use a union filter with two placeholders and return both values in order.
+
 See `adapters/msad_adapter.go`, `adapters/openldap_adapter.go`,
 `adapters/aldpro_adapter.go` and `adapters/freeipa_adapter.go` for
 complete, production-quality examples.
@@ -583,39 +605,91 @@ Options:
 
 ## Testing
 
-The package is designed for testability:
+The package is designed for testability at every layer.
 
-- `dialURL` is a package-level `var` — tests can substitute it with
-  `withMockDialURL(t, fn)` (see `helpers_test.go`).
-- `interfaces.LDAPConn` and `interfaces.CatalogAdapter` can both be mocked.
-  Ready-made fakes live in `mocks/`:
-  - `mocks.MockLDAPConn` — `BindFunc`, `SearchFunc`, `CloseFunc`,
-    `IsClosingFunc`, `StartTLSFunc` fields.
-  - `mocks.MockCatalogAdapter` — testify-based catalog adapter.
-- Integration tests against an in-memory directory are kept behind
-  `//go:build integration` (see `ldapper_integration_test.go`) and can be
-  run with:
+### Unit tests
 
-  ```bash
-  go test -tags=integration ./...
-  ```
+Unit tests run without any network access and cover:
 
-Run the unit tests:
+- `LDAPper` core (`ldapper_test.go`): dial, failover, auth, `IsAlive`,
+  `Reconnect`, `EnsureAlive`, `Close`.
+- Search methods (`ldapper_search_test.go`): `GetUser`,
+  `GetUserGroups`, `GetOUUsers`, `CustomSearch`.
+- Search limits (`ldapper_seach_params_test.go`): normalization,
+  option/`Set`/`Get`, `newSearchRequest` propagation.
+- Catalog tree (`ldapper_catalog_tree_discovery_test.go`): `parentDNOf`,
+  `trimDepth`, `GetCatalogTree`, `GetRootOUs`, `GetSubOUs`, paging,
+  request-shape contract.
+- Each shipped adapter (`adapters/*_adapter_test.go`): user-info mapping,
+  OU mapping, filter templates (parsed by `ldap.CompileFilter`),
+  args ordering, attribute lists, and distinguishing-attribute guards.
 
 ```bash
 go test ./...
-```
-
-Run with the race detector:
-
-```bash
 go test -race ./...
 ```
+
+Helpers:
+
+- `withMockDialURL(t, fn)` swaps the package-level `dialURL` variable for
+  one test.
+- `mocks.MockLDAPConn` (in `mocks/ldap_native_conn_mock.go`) provides
+  function-field substitutes for `Bind`, `Search`, `Close`, `IsClosing`,
+  `StartTLS`.
+- `testCatalogAdapter` (in `test_catalog_adapter_test.go`) is a compact
+  `CatalogAdapter` test double used by core tests.
+- `newLDAPUser` (in `adapters/helpers_test.go`) builds `types.LDAPUser`
+  fixtures for adapter tests.
 
 > Tip: `StartTLS` on a zero-value `*ldap.Conn` returned by a mocked
 > `dialURL` blocks on a `nil` channel. When mocking `dialURL`, always set
 > `skipTLS = true` or `useSSL = true` on the `LDAPper` under test (see
 > `newDialableLDAPper` in `helpers_test.go`).
+
+### Integration tests
+
+End-to-end tests spin up real directories via
+[testcontainers-go](https://golang.testcontainers.org/) and require a
+running Docker daemon. Each suite lives in a separate file behind its own
+build tag, because Go allows **only one `TestMain` per package** — the
+tags keep the suites from compiling together.
+
+| File                              | Build tag                | Container                          |
+|-----------------------------------|--------------------------|------------------------------------|
+| `openldap_integration_test.go`    | `integration_openldap`   | `osixia/openldap:1.5.0`            |
+| `msad_integration_test.go`        | `integration_msad`       | `nowszy/samba-ad-dc` (Samba 4 AD)  |
+| `freeipa_integration_test.go`     | `integration_freeipa`    | `freeipa/freeipa-server:rocky-9`   |
+| `aldpro_integration_test.go`      | `integration_aldpro`     | `osixia/openldap` + ALDPro schema  |
+
+Run one suite at a time:
+
+```bash
+go test -tags=integration_openldap ./...
+go test -tags=integration_msad     ./...
+go test -tags=integration_freeipa  ./...
+go test -tags=integration_aldpro   ./...
+```
+
+What each suite exercises:
+
+- **OpenLDAP** — full end-to-end coverage of `ldapper.go` +
+  `ldapper_search.go` against `OPENLDAPAdapter`; both branches of the
+  `member` / `memberUid` group filter are positively asserted.
+- **MS AD** — real Samba 4 AD DC, exercising the AD-only
+  `LDAP_MATCHING_RULE_IN_CHAIN` group expansion. Gracefully skips if the
+  container cannot be started.
+- **FreeIPA** — real FreeIPA container, verifying that
+  `ipa group-add-member` populates DN-valued `member`, and cross-checking
+  `GetUserGroups` against an independent `CustomSearch` with the same
+  filter.
+- **ALDPro** — stock OpenLDAP augmented with a custom schema mirroring
+  the ALDPro-specific `rbta-org-unit` objectClass and `rbtadp` attribute,
+  exercising both `member` (groupOfNames) and `memberUid` (posixGroup)
+  branches of the dual-branch filter.
+
+FreeIPA and MS AD suites skip gracefully on machines without the
+appropriate container support, so `go test -tags=integration_*` is safe
+to run anywhere Docker is available.
 
 ---
 

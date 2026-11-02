@@ -65,13 +65,12 @@ func (a ALDRPOAdapter) SearchUserFilterTemplate() string {
 	return "(&(|(objectClass=posixAccount)(objectClass=inetOrgPerson)(objectClass=person))(uid=%s))"
 }
 
-// NB: filter syntax need check
 func (a ALDRPOAdapter) SearchUserGroupsFilterTemplate() string {
-	return "(&(|(objectClass=groupOfNames)(objectClass=posixGroup)(objectClass=ipausergroup))(member=uid=%s))"
+	return "(|(&(|(objectClass=groupOfNames)(objectClass=ipausergroup)(objectClass=posixGroup))(member=%s))(&(objectClass=posixGroup)(memberUid=%s)))"
 }
 
 func (a ALDRPOAdapter) SearchUserGroupsFilterTemplateArgs(ldapUser types.LDAPUser) []any {
-	return []any{ldapUser.GetAttributeValue("uid")}
+	return []any{ldapUser.DN, ldapUser.GetAttributeValue("uid")}
 }
 
 func (a ALDRPOAdapter) SearchOUFilterTemplate() string {

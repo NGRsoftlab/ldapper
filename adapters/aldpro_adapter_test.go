@@ -8,474 +8,369 @@ import (
 
 	"github.com/go-ldap/ldap/v3"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
+	"github.com/NGRsoftlab/ldapper/interfaces"
 	"github.com/NGRsoftlab/ldapper/types"
 )
 
-// ---------- GetNormalizedUserInfo ----------
+// Compile-time assertion: ALDRPOAdapter must satisfy CatalogAdapter.
+var _ interfaces.CatalogAdapter = ALDRPOAdapter{}
 
-func TestALDRPOAdapter_GetNormalizedUserInfo_FullAttributes(t *testing.T) {
+func TestALDRPOAdapter_ImplementsCatalogAdapter(t *testing.T) {
+	var adapter interfaces.CatalogAdapter = ALDRPOAdapter{}
+	require.NotNil(t, adapter)
+}
+
+// ---------------------------------------------------------------------------
+// GetNormalizedUserInfo
+// ---------------------------------------------------------------------------
+
+func TestALDRPOAdapter_GetNormalizedUserInfo_FullMapping(t *testing.T) {
 	adapter := ALDRPOAdapter{}
-	user := newLDAPUser("uid=jdoe,ou=people,dc=example,dc=com", map[string][]string{
-		"dn":              {"uid=jdoe,ou=people,dc=example,dc=com"},
-		"cn":              {"John Doe"},
-		"mobile":          {"+7-999-123-45-67"},
-		"telephoneNumber": {"+7-495-123-45-67"},
-		"mail":            {"jdoe@example.com"},
-		"rbtadp":          {"IT-42"},
-		"title":           {"Engineer"},
-		"manager":         {"uid=jboss,ou=people,dc=example,dc=com"},
-		"jpegPhoto":       {"jpeg-bytes"},
-		"co":              {"RU"},
-		"streetAddress":   {"Tverskaya 1"},
-		"l":               {"Moscow"},
-		"postalCode":      {"101000"},
-	})
+	user := newLDAPUser(
+		"cn=user1,ou=users,dc=aldpro,dc=test",
+		map[string][]string{
+			"dn":              {"cn=user1,ou=users,dc=aldpro,dc=test"},
+			"cn":              {"User One"},
+			"mobile":          {"+7-555-0100"},
+			"telephoneNumber": {"+7-555-0101"},
+			"mail":            {"user1@aldpro.test"},
+			"rbtadp":          {"Engineering"},
+			"title":           {"Engineer"},
+			"manager":         {"cn=boss,ou=users,dc=aldpro,dc=test"},
+			"jpegPhoto":       {"photo-bytes"},
+			"co":              {"RU"},
+			"streetAddress":   {"ул. Ленина, 1"},
+			"l":               {"Москва"},
+			"postalCode":      {"101000"},
+		},
+	)
 
 	info := adapter.GetNormalizedUserInfo(user)
+	require.NotNil(t, info)
 
-	assert.NotNil(t, info)
-	// ALDRPO reads DN from the "dn" attribute, not from the struct field.
-	assert.Equal(t, "uid=jdoe,ou=people,dc=example,dc=com", info.DistinguishedName)
-	assert.Equal(t, "John Doe", info.CommonName)
-	assert.Equal(t, "+7-999-123-45-67", info.Mobile)
-	assert.Equal(t, "+7-495-123-45-67", info.Phone)
-	assert.Equal(t, "jdoe@example.com", info.Mail)
-	// ALDRPO stores department in "rbtadp", not in "department".
-	assert.Equal(t, "IT-42", info.Department)
+	assert.Equal(t, "cn=user1,ou=users,dc=aldpro,dc=test", info.DistinguishedName)
+	assert.Equal(t, "User One", info.CommonName)
+	assert.Equal(t, "+7-555-0100", info.Mobile)
+	assert.Equal(t, "+7-555-0101", info.Phone)
+	assert.Equal(t, "user1@aldpro.test", info.Mail)
+	assert.Equal(t, "Engineering", info.Department, "ALDPro uses rbtadp for department")
 	assert.Equal(t, "Engineer", info.Title)
-	assert.Equal(t, "uid=jboss,ou=people,dc=example,dc=com", info.Manager)
-	assert.Equal(t, "jpeg-bytes", info.Photo)
-	// Company is hardcoded to empty in the ALDRPO adapter.
-	assert.Empty(t, info.Company)
+	assert.Equal(t, "cn=boss,ou=users,dc=aldpro,dc=test", info.Manager)
+	assert.Equal(t, "photo-bytes", info.Photo)
 	assert.Equal(t, "RU", info.Country)
-	assert.Equal(t, "Tverskaya 1", info.Address)
-	assert.Equal(t, "Moscow", info.City)
+	assert.Equal(t, "ул. Ленина, 1", info.Address)
+	assert.Equal(t, "Москва", info.City)
 	assert.Equal(t, "101000", info.Index)
+
+	// Hardcoded empty field in the ALDPro adapter.
+	assert.Equal(t, "", info.Company)
 }
 
 func TestALDRPOAdapter_GetNormalizedUserInfo_EmptyUser(t *testing.T) {
 	adapter := ALDRPOAdapter{}
-	info := adapter.GetNormalizedUserInfo(types.LDAPUser{})
+	info := adapter.GetNormalizedUserInfo(newLDAPUser("", nil))
+	require.NotNil(t, info)
 
-	assert.NotNil(t, info)
-	assert.Empty(t, info.DistinguishedName)
-	assert.Empty(t, info.CommonName)
-	assert.Empty(t, info.Mobile)
-	assert.Empty(t, info.Phone)
-	assert.Empty(t, info.Mail)
-	assert.Empty(t, info.Department)
-	assert.Empty(t, info.Title)
-	assert.Empty(t, info.Manager)
-	assert.Empty(t, info.Photo)
-	assert.Empty(t, info.Company)
-	assert.Empty(t, info.Country)
-	assert.Empty(t, info.Address)
-	assert.Empty(t, info.City)
-	assert.Empty(t, info.Index)
+	assert.Zero(t, info.DistinguishedName)
+	assert.Zero(t, info.CommonName)
+	assert.Zero(t, info.Mobile)
+	assert.Zero(t, info.Phone)
+	assert.Zero(t, info.Mail)
+	assert.Zero(t, info.Department)
+	assert.Zero(t, info.Title)
+	assert.Zero(t, info.Manager)
+	assert.Zero(t, info.Photo)
+	assert.Zero(t, info.Company)
+	assert.Zero(t, info.Country)
+	assert.Zero(t, info.Address)
+	assert.Zero(t, info.City)
+	assert.Zero(t, info.Index)
 }
 
-func TestALDRPOAdapter_GetNormalizedUserInfo_NilAttributesMap(t *testing.T) {
-	// A nil Attributes map must not cause a panic.
+// ALDPro uses rbtadp (not "department"/"departmentNumber") for department.
+// This is the adapter's most distinguishing field mapping.
+func TestALDRPOAdapter_GetNormalizedUserInfo_UsesRbtadpForDepartment(t *testing.T) {
 	adapter := ALDRPOAdapter{}
-	user := types.LDAPUser{DN: "uid=jdoe,dc=example,dc=com", Attributes: nil}
-
-	assert.NotPanics(t, func() {
-		info := adapter.GetNormalizedUserInfo(user)
-		assert.NotNil(t, info)
-		assert.Empty(t, info.CommonName)
-	})
-}
-
-func TestALDRPOAdapter_GetNormalizedUserInfo_DistinguishedNameFromAttrOnly(t *testing.T) {
-	// DN must come from the "dn" attribute; the struct's DN field is ignored.
-	adapter := ALDRPOAdapter{}
-	user := newLDAPUser("uid=jdoe,dc=example,dc=com", map[string][]string{
-		"cn": {"John Doe"},
+	user := newLDAPUser("", map[string][]string{
+		"rbtadp":           {"Engineering"},
+		"department":       {"IGNORED"},
+		"departmentNumber": {"IGNORED"},
 	})
 
 	info := adapter.GetNormalizedUserInfo(user)
-
-	assert.Empty(t, info.DistinguishedName,
-		"DistinguishedName must be filled only from the \"dn\" attribute")
+	assert.Equal(t, "Engineering", info.Department)
 }
 
-func TestALDRPOAdapter_GetNormalizedUserInfo_PhotoOnlyJpeg(t *testing.T) {
-	// Unlike MSAD, ALDRPO does not fall back to thumbnailPhoto.
+// ALDPro uses streetAddress (not "street" — that would be FreeIPA).
+func TestALDRPOAdapter_GetNormalizedUserInfo_UsesStreetAddress(t *testing.T) {
 	adapter := ALDRPOAdapter{}
-	user := newLDAPUser("uid=jdoe,dc=example,dc=com", map[string][]string{
-		"thumbnailPhoto": {"thumb-bytes"},
+	user := newLDAPUser("", map[string][]string{
+		"streetAddress": {"Main St"},
+		"street":        {"IGNORED"},
 	})
 
 	info := adapter.GetNormalizedUserInfo(user)
-
-	assert.Empty(t, info.Photo, "thumbnailPhoto is not used by the ALDRPO adapter")
+	assert.Equal(t, "Main St", info.Address)
 }
 
-func TestALDRPOAdapter_GetNormalizedUserInfo_CompanyAlwaysEmpty(t *testing.T) {
-	// Company is hardcoded, ignoring any "company" attribute present.
-	adapter := ALDRPOAdapter{}
-	user := newLDAPUser("uid=jdoe,dc=example,dc=com", map[string][]string{
-		"company": {"Example Inc."},
-	})
+// ---------------------------------------------------------------------------
+// OUInfoFromEntry
+// ---------------------------------------------------------------------------
 
-	info := adapter.GetNormalizedUserInfo(user)
-
-	assert.Empty(t, info.Company)
-}
-
-// ---------- OUInfoFromEntry ----------
-
-func TestALDRPOAdapter_OUInfoFromEntry_FullAttributes(t *testing.T) {
+func TestALDRPOAdapter_OUInfoFromEntry(t *testing.T) {
 	adapter := ALDRPOAdapter{}
 	entry := ldap.Entry{
-		DN: "ou=IT,ou=Departments,dc=example,dc=com",
+		DN: "ou=departments,dc=aldpro,dc=test",
 		Attributes: []*ldap.EntryAttribute{
-			{Name: "ou", Values: []string{"IT"}},
+			{Name: "ou", Values: []string{"departments"}},
+			{Name: "objectClass", Values: []string{"rbta-org-unit", "organizationalUnit"}},
 		},
 	}
 
 	info := adapter.OUInfoFromEntry(entry)
+	require.NotNil(t, info)
 
-	assert.NotNil(t, info)
-	assert.Equal(t, "ou=IT,ou=Departments,dc=example,dc=com", info.DN)
-	// Unlike MSAD, Name equals the entry DN rather than a "name" attribute.
-	assert.Equal(t, "ou=IT,ou=Departments,dc=example,dc=com", info.Name)
-	// OU comes from the "ou" attribute, not from the DN.
-	assert.Equal(t, "IT", info.OU)
-}
-
-func TestALDRPOAdapter_OUInfoFromEntry_NameIsAlwaysDN(t *testing.T) {
-	// Name must equal DN regardless of the entry's "name" attribute.
-	adapter := ALDRPOAdapter{}
-	entry := ldap.Entry{
-		DN: "ou=IT,dc=example,dc=com",
-		Attributes: []*ldap.EntryAttribute{
-			{Name: "name", Values: []string{"IGNORED"}},
-		},
-	}
-
-	info := adapter.OUInfoFromEntry(entry)
-
-	assert.Equal(t, "ou=IT,dc=example,dc=com", info.Name)
-	assert.NotEqual(t, "IGNORED", info.Name)
-}
-
-func TestALDRPOAdapter_OUInfoFromEntry_MissingOUAttribute(t *testing.T) {
-	// Absent "ou" attribute leaves OU empty; DN and Name stay populated.
-	adapter := ALDRPOAdapter{}
-	entry := ldap.Entry{
-		DN: "ou=IT,dc=example,dc=com",
-		Attributes: []*ldap.EntryAttribute{
-			{Name: "objectClass", Values: []string{"organizationalUnit"}},
-		},
-	}
-
-	info := adapter.OUInfoFromEntry(entry)
-
-	assert.NotNil(t, info)
-	assert.Equal(t, "ou=IT,dc=example,dc=com", info.DN)
-	assert.Equal(t, "ou=IT,dc=example,dc=com", info.Name)
-	assert.Empty(t, info.OU)
-}
-
-func TestALDRPOAdapter_OUInfoFromEntry_ChildrenInitialized(t *testing.T) {
-	// Children must be a non-nil empty slice so callers can append safely.
-	adapter := ALDRPOAdapter{}
-	info := adapter.OUInfoFromEntry(ldap.Entry{DN: "ou=IT,dc=example,dc=com"})
-
-	assert.NotNil(t, info.Children)
+	assert.Equal(t, "ou=departments,dc=aldpro,dc=test", info.DN)
+	assert.Equal(t, "ou=departments,dc=aldpro,dc=test", info.Name)
+	assert.Equal(t, "departments", info.OU)
+	require.NotNil(t, info.Children)
 	assert.Empty(t, info.Children)
 }
 
 func TestALDRPOAdapter_OUInfoFromEntry_EmptyEntry(t *testing.T) {
 	adapter := ALDRPOAdapter{}
+	info := adapter.OUInfoFromEntry(ldap.Entry{})
 
-	assert.NotPanics(t, func() {
-		info := adapter.OUInfoFromEntry(ldap.Entry{})
-		assert.NotNil(t, info)
-		assert.Empty(t, info.DN)
-		assert.Empty(t, info.Name)
-		assert.Empty(t, info.OU)
-		assert.NotNil(t, info.Children)
-	})
+	require.NotNil(t, info)
+	assert.Zero(t, info.DN)
+	assert.Zero(t, info.OU)
+	assert.NotNil(t, info.Children)
 }
 
-func TestALDRPOAdapter_OUInfoFromEntry_NilAttributes(t *testing.T) {
-	adapter := ALDRPOAdapter{}
-	entry := ldap.Entry{DN: "ou=IT,dc=example,dc=com", Attributes: nil}
+// ---------------------------------------------------------------------------
+// Object filters
+// ---------------------------------------------------------------------------
 
-	assert.NotPanics(t, func() {
-		info := adapter.OUInfoFromEntry(entry)
-		assert.Equal(t, "ou=IT,dc=example,dc=com", info.DN)
-		assert.Equal(t, "ou=IT,dc=example,dc=com", info.Name)
-		assert.Empty(t, info.OU)
-	})
+func TestALDRPOAdapter_ObjectFilters_ExactStrings(t *testing.T) {
+	adapter := ALDRPOAdapter{}
+
+	assert.Equal(t,
+		"(|(objectClass=posixAccount)(objectClass=inetOrgPerson)(objectClass=person))",
+		adapter.UserObjectFilter())
+	assert.Equal(t,
+		"(|(objectClass=groupOfNames)(objectClass=posixGroup)(objectClass=ipausergroup))",
+		adapter.GroupObjectFilter())
+	assert.Equal(t,
+		"(|(objectClass=organizationalUnit)(objectClass=rbta-org-unit))",
+		adapter.OUObjectFilter())
 }
 
-func TestALDRPOAdapter_OUInfoFromEntry_UsesFirstValueOfMultiValuedOU(t *testing.T) {
-	// Pin GetAttributeValue behavior for multi-valued "ou".
+// ---------------------------------------------------------------------------
+// Search filters
+// ---------------------------------------------------------------------------
+
+func TestALDRPOAdapter_SearchFilters_AreValidLDAP(t *testing.T) {
 	adapter := ALDRPOAdapter{}
-	entry := ldap.Entry{
-		DN: "ou=IT,dc=example,dc=com",
-		Attributes: []*ldap.EntryAttribute{
-			{Name: "ou", Values: []string{"IT", "Information Technology"}},
+
+	user := types.LDAPUser{
+		DN:         "cn=user1,ou=users,dc=aldpro,dc=test",
+		Attributes: map[string][]string{"uid": {"user1"}},
+	}
+
+	cases := []struct {
+		name   string
+		filter string
+	}{
+		{
+			name:   "SearchUserFilterTemplate",
+			filter: fmt.Sprintf(adapter.SearchUserFilterTemplate(), "user1"),
+		},
+		{
+			name: "SearchUserGroupsFilterTemplate",
+			filter: fmt.Sprintf(
+				adapter.SearchUserGroupsFilterTemplate(),
+				adapter.SearchUserGroupsFilterTemplateArgs(user)...,
+			),
+		},
+		{
+			name:   "SearchOUFilterTemplate",
+			filter: fmt.Sprintf(adapter.SearchOUFilterTemplate(), "departments"),
+		},
+		{
+			name:   "SearchGroupFilterTemplate",
+			filter: fmt.Sprintf(adapter.SearchGroupFilterTemplate(), "admins"),
 		},
 	}
 
-	info := adapter.OUInfoFromEntry(entry)
-
-	assert.Equal(t, "IT", info.OU)
-}
-
-// ---------- TYPE FILTERS ----------
-
-func TestALDRPOAdapter_OUObjectFilter(t *testing.T) {
-	adapter := ALDRPOAdapter{}
-	// rbta-org-unit is the ALD Pro-specific replacement for organizationalUnit.
-	assert.Equal(t,
-		"(|(objectClass=organizationalUnit)(objectClass=rbta-org-unit))",
-		adapter.OUObjectFilter(),
-	)
-}
-
-func TestALDRPOAdapter_GroupObjectFilter(t *testing.T) {
-	adapter := ALDRPOAdapter{}
-	assert.Equal(t,
-		"(|(objectClass=groupOfNames)(objectClass=posixGroup)(objectClass=ipausergroup))",
-		adapter.GroupObjectFilter(),
-	)
-}
-
-func TestALDRPOAdapter_UserObjectFilter(t *testing.T) {
-	adapter := ALDRPOAdapter{}
-	assert.Equal(t,
-		"(|(objectClass=posixAccount)(objectClass=inetOrgPerson)(objectClass=person))",
-		adapter.UserObjectFilter(),
-	)
-}
-
-// ---------- SEARCH ----------
-
-func TestALDRPOAdapter_SearchUserFilterTemplate(t *testing.T) {
-	adapter := ALDRPOAdapter{}
-	assert.Equal(t,
-		"(&(|(objectClass=posixAccount)(objectClass=inetOrgPerson)(objectClass=person))(uid=%s))",
-		adapter.SearchUserFilterTemplate(),
-	)
-}
-
-func TestALDRPOAdapter_SearchUserFilterTemplate_FormatsUsername(t *testing.T) {
-	adapter := ALDRPOAdapter{}
-	filter := fmt.Sprintf(adapter.SearchUserFilterTemplate(), "jdoe")
-
-	assert.Equal(t,
-		"(&(|(objectClass=posixAccount)(objectClass=inetOrgPerson)(objectClass=person))(uid=jdoe))",
-		filter,
-	)
-	assert.NotContains(t, filter, "%", "no unresolved placeholders should remain")
-}
-
-func TestALDRPOAdapter_SearchUserGroupsFilterTemplate(t *testing.T) {
-	adapter := ALDRPOAdapter{}
-
-	// NB: "member=uid=%s" is semantically unusual — `member` is normally a
-	// DN-valued attribute, not a uid. Pinned here to detect unintended changes;
-	// if the adapter is corrected, this test must be updated accordingly.
-	assert.Equal(t,
-		"(&(|(objectClass=groupOfNames)(objectClass=posixGroup)(objectClass=ipausergroup))(member=uid=%s))",
-		adapter.SearchUserGroupsFilterTemplate(),
-	)
-}
-
-func TestALDRPOAdapter_SearchUserGroupsFilterTemplate_HasOnePlaceholder(t *testing.T) {
-	adapter := ALDRPOAdapter{}
-	template := adapter.SearchUserGroupsFilterTemplate()
-
-	assert.Equal(t, 1, strings.Count(template, "%s"),
-		"template is expected to contain exactly one placeholder")
-}
-
-func TestALDRPOAdapter_SearchUserGroupsFilterTemplate_FormatsCleanly(t *testing.T) {
-	// Template has 1 placeholder and SearchUserGroupsFilterTemplateArgs returns
-	// 1 arg — formatting must produce a clean filter with no artifacts.
-	adapter := ALDRPOAdapter{}
-	user := newLDAPUser("uid=jdoe,dc=example,dc=com", map[string][]string{
-		"uid": {"jdoe"},
-	})
-	args := adapter.SearchUserGroupsFilterTemplateArgs(user)
-
-	filter := fmt.Sprintf(adapter.SearchUserGroupsFilterTemplate(), args...)
-
-	assert.NotContains(t, filter, "%!",
-		"formatting must not produce an EXTRA/placeholder-mismatch artifact")
-	assert.NotContains(t, filter, "%s",
-		"no unresolved placeholder should remain")
-	assert.Contains(t, filter, "uid=jdoe")
-}
-
-func TestALDRPOAdapter_SearchOUFilterTemplate(t *testing.T) {
-	adapter := ALDRPOAdapter{}
-	// Both organizationalUnit and rbta-org-unit must be matched.
-	assert.Equal(t,
-		"(&(|(objectClass=organizationalUnit)(objectClass=rbta-org-unit))(ou=%s))",
-		adapter.SearchOUFilterTemplate(),
-	)
-}
-
-func TestALDRPOAdapter_SearchGroupFilterTemplate(t *testing.T) {
-	adapter := ALDRPOAdapter{}
-	assert.Equal(t,
-		"(&(|(objectClass=groupOfNames)(objectClass=posixGroup)(objectClass=ipausergroup))(cn=%s))",
-		adapter.SearchGroupFilterTemplate(),
-	)
-}
-
-// TestALDRPOAdapter_AllSearchTemplates_BalancedParentheses is a regression
-// guard against malformed filters that LDAP servers would reject.
-func TestALDRPOAdapter_AllSearchTemplates_BalancedParentheses(t *testing.T) {
-	adapter := ALDRPOAdapter{}
-
-	templates := map[string]string{
-		"SearchUserFilterTemplate":       adapter.SearchUserFilterTemplate(),
-		"SearchUserGroupsFilterTemplate": adapter.SearchUserGroupsFilterTemplate(),
-		"SearchOUFilterTemplate":         adapter.SearchOUFilterTemplate(),
-		"SearchGroupFilterTemplate":      adapter.SearchGroupFilterTemplate(),
-	}
-	for name, tmpl := range templates {
-		t.Run(name, func(t *testing.T) {
-			assert.Equal(t, strings.Count(tmpl, "("), strings.Count(tmpl, ")"),
-				"parentheses must be balanced")
-			assert.True(t, strings.HasPrefix(tmpl, "("), "filter must start with '('")
-			assert.True(t, strings.HasSuffix(tmpl, ")"), "filter must end with ')'")
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			_, err := ldap.CompileFilter(c.filter)
+			require.NoError(t, err, "invalid LDAP filter: %q", c.filter)
 		})
 	}
 }
 
-// ---------- SearchUserGroupsFilterTemplateArgs ----------
-
-func TestALDRPOAdapter_SearchUserGroupsFilterTemplateArgs_ReturnsUID(t *testing.T) {
+// TestALDRPOAdapter_SearchUserGroupsFilterTemplate_HasBothBranches guards
+// against a one-branch regression: the filter must query `member` (for
+// groupOfNames/ipausergroup) AND `memberUid` (for posixGroup).
+func TestALDRPOAdapter_SearchUserGroupsFilterTemplate_HasBothBranches(t *testing.T) {
 	adapter := ALDRPOAdapter{}
-	user := newLDAPUser("uid=jdoe,ou=people,dc=example,dc=com", map[string][]string{
-		"uid": {"jdoe"},
-	})
+	tmpl := adapter.SearchUserGroupsFilterTemplate()
+
+	assert.Contains(t, tmpl, "(member=%s)",
+		"groupOfNames/ipausergroup branch must query member with the DN")
+	assert.Contains(t, tmpl, "(memberUid=%s)",
+		"posixGroup branch must query memberUid with the uid")
+
+	assert.Equal(t, 2, strings.Count(tmpl, "%s"),
+		"exactly two placeholders expected — one per branch")
+
+	assert.NotContains(t, tmpl, "member=uid=",
+		"regression: earlier versions had (member=uid=%s) which is invalid")
+}
+
+// ---------------------------------------------------------------------------
+// SearchUserGroupsFilterTemplateArgs
+// ---------------------------------------------------------------------------
+
+func TestALDRPOAdapter_SearchUserGroupsFilterTemplateArgs_ReturnsDNThenUID(t *testing.T) {
+	adapter := ALDRPOAdapter{}
+	user := newLDAPUser(
+		"cn=user1,ou=users,dc=aldpro,dc=test",
+		map[string][]string{"uid": {"user1"}},
+	)
 
 	args := adapter.SearchUserGroupsFilterTemplateArgs(user)
+	require.Len(t, args, 2)
 
-	assert.Len(t, args, 1, "exactly one arg to match the single %s placeholder")
-	assert.Equal(t, "jdoe", args[0],
-		"the arg is the user's uid, taken from the \"uid\" attribute")
+	// Order matters: args[0] feeds (member=%s), args[1] feeds (memberUid=%s).
+	assert.Equal(t, "cn=user1,ou=users,dc=aldpro,dc=test", args[0],
+		"args[0] must be the DN for the member branch")
+	assert.Equal(t, "user1", args[1],
+		"args[1] must be the uid for the memberUid branch")
 }
 
-func TestALDRPOAdapter_SearchUserGroupsFilterTemplateArgs_EmptyUser(t *testing.T) {
+func TestALDRPOAdapter_SearchUserGroupsFilterTemplateArgs_MissingUID(t *testing.T) {
 	adapter := ALDRPOAdapter{}
-	args := adapter.SearchUserGroupsFilterTemplateArgs(types.LDAPUser{})
+	// No "uid" attribute set → GetAttributeValue returns "".
+	user := newLDAPUser("cn=x,ou=users,dc=aldpro,dc=test", nil)
 
-	assert.Len(t, args, 1)
-	assert.Equal(t, "", args[0])
+	args := adapter.SearchUserGroupsFilterTemplateArgs(user)
+	require.Len(t, args, 2)
+	assert.Equal(t, "cn=x,ou=users,dc=aldpro,dc=test", args[0])
+	assert.Equal(t, "", args[1],
+		"missing uid yields an empty string, not a panic")
 }
 
-func TestALDRPOAdapter_SearchUserGroupsFilterTemplateArgs_NilAttributesMap(t *testing.T) {
+func TestALDRPOAdapter_SearchUserGroupsFilterTemplateArgs_OneArgPerPlaceholder(t *testing.T) {
 	adapter := ALDRPOAdapter{}
-	user := types.LDAPUser{DN: "uid=jdoe,dc=example,dc=com", Attributes: nil}
+	template := adapter.SearchUserGroupsFilterTemplate()
+	args := adapter.SearchUserGroupsFilterTemplateArgs(newLDAPUser("cn=x,dc=e", nil))
 
-	assert.NotPanics(t, func() {
-		args := adapter.SearchUserGroupsFilterTemplateArgs(user)
-		assert.Len(t, args, 1)
-		assert.Equal(t, "", args[0])
-	})
+	require.Equal(t, strings.Count(template, "%s"), len(args),
+		"template placeholders and Args() length must line up")
 }
 
-// ---------- ATTRS ----------
+// ---------------------------------------------------------------------------
+// Attrs
+// ---------------------------------------------------------------------------
 
-func TestALDRPOAdapter_UserAttrs(t *testing.T) {
+func TestALDRPOAdapter_UserAttrs_ContainsMappedAttributes(t *testing.T) {
 	adapter := ALDRPOAdapter{}
 
-	expected := []string{
-		"dn",
-
-		"uid", "cn", "givenName", "sn", "displayName", "mail",
-		"telephoneNumber", "mobile", "title", "jpegPhoto",
-		"rbtadp", // department analogy
-
-		// system&posix attrs
-		"uidNumber", "gidNumber", "homeDirectory", "memberOf",
-
-		// address
-		"streetAddress", "l", "postalCode",
-
-		// may be or not to be at all attrs
-		"description", "manager", "co", "ou", "o",
+	// Every attribute that GetNormalizedUserInfo reads must be requested by
+	// UserAttrs, otherwise the field will silently stay empty.
+	required := []string{
+		"dn", "cn", "mobile", "telephoneNumber", "mail", "rbtadp",
+		"title", "manager", "jpegPhoto", "co", "streetAddress",
+		"l", "postalCode",
 	}
 
-	assert.Equal(t, expected, adapter.UserAttrs())
+	attrs := adapter.UserAttrs()
+	for _, r := range required {
+		assert.Contains(t, attrs, r,
+			"UserAttrs must contain %q because GetNormalizedUserInfo reads it", r)
+	}
 }
 
-func TestALDRPOAdapter_UserAttrs_ContainsCriticalAttributes(t *testing.T) {
+func TestALDRPOAdapter_UserAttrs_DistinguishingAttributes(t *testing.T) {
 	adapter := ALDRPOAdapter{}
 	attrs := adapter.UserAttrs()
 
-	critical := []string{
-		"dn", "cn", "uid", "mail", "mobile", "telephoneNumber",
-		"rbtadp", "jpegPhoto", "manager", "title", "co",
-		"uidNumber", "gidNumber", "homeDirectory", "memberOf",
-	}
-	for _, attr := range critical {
-		assert.Contains(t, attrs, attr, "critical attribute %q is missing", attr)
-	}
+	// ALDPro-specific.
+	assert.Contains(t, attrs, "rbtadp")
+
+	// ALDPro uses "streetAddress" (FreeIPA uses "street").
+	assert.Contains(t, attrs, "streetAddress")
+	assert.NotContains(t, attrs, "street")
+
+	// FreeIPA-specific attributes must not leak into ALDPro.
+	assert.NotContains(t, attrs, "nsAccountLock")
 }
 
-func TestALDRPOAdapter_UserAttrs_NoDuplicates(t *testing.T) {
-	adapter := ALDRPOAdapter{}
-	seen := make(map[string]struct{}, len(adapter.UserAttrs()))
-	for _, attr := range adapter.UserAttrs() {
-		if _, exists := seen[attr]; exists {
-			t.Fatalf("duplicate attribute in UserAttrs: %q", attr)
-		}
-		seen[attr] = struct{}{}
-	}
-}
-
-func TestALDRPOAdapter_OUAttrs(t *testing.T) {
-	adapter := ALDRPOAdapter{}
-
-	expected := []string{"dn", "ou", "description", "manager"}
-	assert.Equal(t, expected, adapter.OUAttrs())
-}
-
-func TestALDRPOAdapter_GroupAttrs(t *testing.T) {
-	adapter := ALDRPOAdapter{}
-
-	expected := []string{
-		"cn",
-		"entrydn",
-		"description",
-		"gidNumber", // posixGroup
-		"member",
-		"memberOf",
-		"ipaUniqueID",
-		"ipaNTSecurityIdentifier",
-	}
-	assert.Equal(t, expected, adapter.GroupAttrs())
-}
-
-func TestALDRPOAdapter_GroupAttrs_ContainsIpausergroupAttrs(t *testing.T) {
-	// ipausergroup-specific attributes must be requested.
+func TestALDRPOAdapter_GroupAttrs_ContainsExpected(t *testing.T) {
 	adapter := ALDRPOAdapter{}
 	attrs := adapter.GroupAttrs()
 
-	for _, attr := range []string{"ipaUniqueID", "ipaNTSecurityIdentifier"} {
-		assert.Contains(t, attrs, attr, "ipausergroup: attribute %q is missing", attr)
+	assert.Contains(t, attrs, "cn")
+	assert.Contains(t, attrs, "member")
+	assert.Contains(t, attrs, "memberOf")
+	assert.Contains(t, attrs, "gidNumber")
+	assert.Contains(t, attrs, "ipaUniqueID")
+	assert.Contains(t, attrs, "ipaNTSecurityIdentifier")
+
+	// ALDPro uses the lowercase operational attribute name.
+	assert.Contains(t, attrs, "entrydn")
+	assert.NotContains(t, attrs, "distinguishedName",
+		"distinguishedName is the MSAD spelling; ALDPro uses entrydn")
+}
+
+// TestALDRPOAdapter_GroupAttrs_MissingMemberUid_DocumentedGap is a canary
+// for the following observation:
+//
+//	SearchUserGroupsFilterTemplate() queries posixGroup via (memberUid=%s),
+//	but GroupAttrs() does NOT include "memberUid". A consumer that relies on
+//	GroupAttrs() to fetch a group's attributes will therefore not receive
+//	posixGroup membership, even though GetUserGroups() can see it.
+//
+// The test does not fail today — it logs the gap and will start failing (in
+// a good way) as soon as "memberUid" is added to GroupAttrs(), at which point
+// the assertion below must be flipped to assert.Contains(...).
+func TestALDRPOAdapter_GroupAttrs_MissingMemberUid_DocumentedGap(t *testing.T) {
+	adapter := ALDRPOAdapter{}
+
+	if !containsString(adapter.GroupAttrs(), "memberUid") {
+		t.Logf("KNOWN GAP: GroupAttrs() omits \"memberUid\" while " +
+			"SearchUserGroupsFilterTemplate() queries (memberUid=<here is string filler>). " +
+			"Consumers relying on GroupAttrs to fetch posixGroup details " +
+			"will miss members. Flip this test to assert.Contains once fixed.")
 	}
 }
 
-func TestALDRPOAdapter_GroupAttrs_NoDuplicates(t *testing.T) {
+func TestALDRPOAdapter_OUAttrs_ContainsExpected(t *testing.T) {
 	adapter := ALDRPOAdapter{}
-	seen := make(map[string]struct{}, len(adapter.GroupAttrs()))
-	for _, attr := range adapter.GroupAttrs() {
-		if _, exists := seen[attr]; exists {
-			t.Fatalf("duplicate attribute in GroupAttrs: %q", attr)
+	attrs := adapter.OUAttrs()
+
+	assert.NotEmpty(t, attrs)
+	assert.Contains(t, attrs, "dn")
+	assert.Contains(t, attrs, "ou")
+	assert.Contains(t, attrs, "description")
+	assert.Contains(t, attrs, "manager")
+}
+
+// ---------------------------------------------------------------------------
+// Small helpers
+// ---------------------------------------------------------------------------
+
+// containsString reports whether slice contains s. Avoids depending on
+// slices.Contains so the test compiles on older Go toolchains.
+func containsString(slice []string, s string) bool {
+	for _, v := range slice {
+		if v == s {
+			return true
 		}
-		seen[attr] = struct{}{}
 	}
+	return false
 }

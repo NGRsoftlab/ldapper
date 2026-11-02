@@ -260,7 +260,7 @@ func TestAuthenticateConn_Success(t *testing.T) {
 // ---------- AuthenticateUser ----------
 
 func TestAuthenticateUser_NilConnection(t *testing.T) {
-	_, err := (&LDAPper{}).AuthenticateUser("u", "p", "dc=x")
+	_, err := (&LDAPper{}).AuthenticateUser("u", "p")
 	if err == nil || !strings.Contains(err.Error(), "connection not initialized") {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -268,7 +268,7 @@ func TestAuthenticateUser_NilConnection(t *testing.T) {
 
 func TestAuthenticateUser_NotAuthenticated(t *testing.T) {
 	conn := newTestConnection(&testCatalogAdapter{}, &mocks.MockLDAPConn{})
-	_, err := conn.AuthenticateUser("u", "p", "dc=x")
+	_, err := conn.AuthenticateUser("u", "p")
 	if err == nil || !strings.Contains(err.Error(), "connection not authenticated") {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -282,7 +282,7 @@ func TestAuthenticateUser_GetUserError(t *testing.T) {
 		}},
 	)
 	conn.isAuthenticated = true
-	_, err := conn.AuthenticateUser("u", "p", "dc=x")
+	_, err := conn.AuthenticateUser("u", "p")
 	if err == nil || !strings.Contains(err.Error(), "unsuccessful user search") {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -322,7 +322,7 @@ func TestAuthenticateUser_BindErrors(t *testing.T) {
 			conn.bindUser = "svc"
 			conn.bindPassword = "svcpass"
 
-			user, err := conn.AuthenticateUser("user", "pass", "dc=x")
+			user, err := conn.AuthenticateUser("user", "pass")
 			if err == nil || !strings.Contains(err.Error(), tc.errPart) {
 				t.Fatalf("expected %q, got: %v", tc.errPart, err)
 			}
@@ -354,7 +354,7 @@ func TestAuthenticateUser_Success_BindSequence(t *testing.T) {
 	conn.bindUser = "svc"
 	conn.bindPassword = "svcpass"
 
-	if _, err := conn.AuthenticateUser("user", "pass", "dc=x"); err != nil {
+	if _, err := conn.AuthenticateUser("user", "pass"); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	// Contract: first the target user, then the service (bind-config) user.

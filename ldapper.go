@@ -34,6 +34,7 @@ type LDAPper struct {
 
 	bindUser     string
 	bindPassword string
+	bindDN       string
 
 	hosts       []string
 	currentHost string
@@ -207,12 +208,13 @@ func (conn *LDAPper) AuthenticateConn(username, password, baseDN string) (*types
 	conn.isAuthenticated = true
 	conn.bindUser = username
 	conn.bindPassword = password
+	conn.bindDN = baseDN
 
 	return user, nil
 }
 
 // NB: can not be used with non-authenticated conn or with non-read-access-granted bindUser in conn cfg
-func (conn *LDAPper) AuthenticateUser(username, password, baseDN string) (*types.LDAPUser, error) {
+func (conn *LDAPper) AuthenticateUser(username, password string) (*types.LDAPUser, error) {
 	if conn.connection == nil {
 		return nil, errors.New("connection not initialized")
 	}
@@ -226,7 +228,7 @@ func (conn *LDAPper) AuthenticateUser(username, password, baseDN string) (*types
 	}
 
 	// user is ok check
-	user, err := conn.GetUser(username, baseDN)
+	user, err := conn.GetUser(username, conn.bindDN)
 	if err != nil {
 		return nil, err
 	}

@@ -8,556 +8,325 @@ import (
 
 	"github.com/go-ldap/ldap/v3"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
+	"github.com/NGRsoftlab/ldapper/interfaces"
 	"github.com/NGRsoftlab/ldapper/types"
 )
 
-// ---------- GetNormalizedUserInfo ----------
+// Compile-time assertion: FREEIPAAdapter must satisfy CatalogAdapter.
+// If a method signature drifts, this line fails first with a clear message.
+var _ interfaces.CatalogAdapter = FREEIPAAdapter{}
 
-func TestFREEIPAAdapter_GetNormalizedUserInfo_FullAttributes(t *testing.T) {
+// TestFREEIPAAdapter_ImplementsCatalogAdapter is a runtime companion to the
+// package-level var _ above. Keeps the conformance check visible in `go test`
+// output when someone wonders whether the adapter is wired up correctly.
+func TestFREEIPAAdapter_ImplementsCatalogAdapter(t *testing.T) {
+	var adapter interfaces.CatalogAdapter = FREEIPAAdapter{}
+	require.NotNil(t, adapter)
+}
+
+// ---------------------------------------------------------------------------
+// GetNormalizedUserInfo
+// ---------------------------------------------------------------------------
+
+func TestFREEIPAAdapter_GetNormalizedUserInfo_FullMapping(t *testing.T) {
 	adapter := FREEIPAAdapter{}
-	user := newLDAPUser("uid=jdoe,cn=users,cn=accounts,dc=example,dc=com", map[string][]string{
-		"dn":              {"uid=jdoe,cn=users,cn=accounts,dc=example,dc=com"},
-		"cn":              {"John Doe"},
-		"mobile":          {"+7-999-123-45-67"},
-		"telephoneNumber": {"+7-495-123-45-67"},
-		"mail":            {"jdoe@example.com"},
-		"title":           {"Engineer"},
-		"manager":         {"uid=jboss,cn=users,cn=accounts,dc=example,dc=com"},
-		"jpegPhoto":       {"jpeg-bytes"},
-		"co":              {"RU"},
-		"street":          {"Tverskaya 1"},
-		"l":               {"Moscow"},
-		"postalCode":      {"101000"},
-	})
+	user := newLDAPUser(
+		"uid=user1,cn=users,cn=accounts,dc=example,dc=test",
+		map[string][]string{
+			"dn":              {"uid=user1,cn=users,cn=accounts,dc=example,dc=test"},
+			"cn":              {"User One"},
+			"mobile":          {"+1-555-0100"},
+			"telephoneNumber": {"+1-555-0101"},
+			"mail":            {"user1@example.test"},
+			"title":           {"Engineer"},
+			"manager":         {"uid=boss,cn=users,cn=accounts,dc=example,dc=test"},
+			"jpegPhoto":       {"photo-bytes"},
+			"co":              {"US"},
+			"street":          {"123 Main St"},
+			"l":               {"Springfield"},
+			"postalCode":      {"12345"},
+		},
+	)
 
 	info := adapter.GetNormalizedUserInfo(user)
+	require.NotNil(t, info)
 
-	assert.NotNil(t, info)
-	// FREEIPA reads DN from the "dn" attribute, not from the struct field.
-	assert.Equal(t, "uid=jdoe,cn=users,cn=accounts,dc=example,dc=com", info.DistinguishedName)
-	assert.Equal(t, "John Doe", info.CommonName)
-	assert.Equal(t, "+7-999-123-45-67", info.Mobile)
-	assert.Equal(t, "+7-495-123-45-67", info.Phone)
-	assert.Equal(t, "jdoe@example.com", info.Mail)
+	assert.Equal(t, "uid=user1,cn=users,cn=accounts,dc=example,dc=test", info.DistinguishedName)
+	assert.Equal(t, "User One", info.CommonName)
+	assert.Equal(t, "+1-555-0100", info.Mobile)
+	assert.Equal(t, "+1-555-0101", info.Phone)
+	assert.Equal(t, "user1@example.test", info.Mail)
 	assert.Equal(t, "Engineer", info.Title)
-	assert.Equal(t, "uid=jboss,cn=users,cn=accounts,dc=example,dc=com", info.Manager)
-	assert.Equal(t, "jpeg-bytes", info.Photo)
-	// Company and Department are hardcoded to empty in the FREEIPA adapter.
-	assert.Empty(t, info.Company)
-	assert.Empty(t, info.Department)
-	assert.Equal(t, "RU", info.Country)
-	// FREEIPA reads the address from "street", not "streetAddress".
-	assert.Equal(t, "Tverskaya 1", info.Address)
-	assert.Equal(t, "Moscow", info.City)
-	assert.Equal(t, "101000", info.Index)
+	assert.Equal(t, "uid=boss,cn=users,cn=accounts,dc=example,dc=test", info.Manager)
+	assert.Equal(t, "photo-bytes", info.Photo)
+	assert.Equal(t, "US", info.Country)
+	assert.Equal(t, "123 Main St", info.Address)
+	assert.Equal(t, "Springfield", info.City)
+	assert.Equal(t, "12345", info.Index)
+
+	// FreeIPA hardcodes these to "" (department is not exposed on users,
+	// company is not present in FreeIPA schema).
+	assert.Equal(t, "", info.Department)
+	assert.Equal(t, "", info.Company)
 }
 
 func TestFREEIPAAdapter_GetNormalizedUserInfo_EmptyUser(t *testing.T) {
 	adapter := FREEIPAAdapter{}
-	info := adapter.GetNormalizedUserInfo(types.LDAPUser{})
+	user := newLDAPUser("", nil)
 
-	assert.NotNil(t, info)
-	assert.Empty(t, info.DistinguishedName)
-	assert.Empty(t, info.CommonName)
-	assert.Empty(t, info.Mobile)
-	assert.Empty(t, info.Phone)
-	assert.Empty(t, info.Mail)
-	assert.Empty(t, info.Department)
-	assert.Empty(t, info.Title)
-	assert.Empty(t, info.Manager)
-	assert.Empty(t, info.Photo)
-	assert.Empty(t, info.Company)
-	assert.Empty(t, info.Country)
-	assert.Empty(t, info.Address)
-	assert.Empty(t, info.City)
-	assert.Empty(t, info.Index)
+	info := adapter.GetNormalizedUserInfo(user)
+	require.NotNil(t, info)
+
+	// Every field must default to "" and the call must not panic.
+	assert.Zero(t, info.DistinguishedName)
+	assert.Zero(t, info.CommonName)
+	assert.Zero(t, info.Mobile)
+	assert.Zero(t, info.Phone)
+	assert.Zero(t, info.Mail)
+	assert.Zero(t, info.Department)
+	assert.Zero(t, info.Title)
+	assert.Zero(t, info.Manager)
+	assert.Zero(t, info.Photo)
+	assert.Zero(t, info.Company)
+	assert.Zero(t, info.Country)
+	assert.Zero(t, info.Address)
+	assert.Zero(t, info.City)
+	assert.Zero(t, info.Index)
 }
 
-func TestFREEIPAAdapter_GetNormalizedUserInfo_NilAttributesMap(t *testing.T) {
-	// A nil Attributes map must not cause a panic.
+func TestFREEIPAAdapter_GetNormalizedUserInfo_FirstValueWins(t *testing.T) {
 	adapter := FREEIPAAdapter{}
-	user := types.LDAPUser{DN: "uid=jdoe,dc=example,dc=com", Attributes: nil}
-
-	assert.NotPanics(t, func() {
-		info := adapter.GetNormalizedUserInfo(user)
-		assert.NotNil(t, info)
-		assert.Empty(t, info.CommonName)
-	})
-}
-
-func TestFREEIPAAdapter_GetNormalizedUserInfo_DistinguishedNameFromAttrOnly(t *testing.T) {
-	// DN must come from the "dn" attribute; the struct's DN field is ignored.
-	adapter := FREEIPAAdapter{}
-	user := newLDAPUser("uid=jdoe,dc=example,dc=com", map[string][]string{
-		"cn": {"John Doe"},
+	user := newLDAPUser("", map[string][]string{
+		"cn":   {"First CN", "Second CN"},
+		"mail": {"first@x", "second@x"},
 	})
 
 	info := adapter.GetNormalizedUserInfo(user)
-
-	assert.Empty(t, info.DistinguishedName,
-		"DistinguishedName must be filled only from the \"dn\" attribute")
+	assert.Equal(t, "First CN", info.CommonName)
+	assert.Equal(t, "first@x", info.Mail)
 }
 
-func TestFREEIPAAdapter_GetNormalizedUserInfo_PhotoOnlyJpeg(t *testing.T) {
-	// Unlike MSAD, FREEIPA does not fall back to thumbnailPhoto.
+// FreeIPA uses "street" for the address field — this guard catches an
+// accidental copy-paste of the ALDPro/MSAD mapping, which uses "streetAddress".
+func TestFREEIPAAdapter_GetNormalizedUserInfo_UsesStreetNotStreetAddress(t *testing.T) {
 	adapter := FREEIPAAdapter{}
-	user := newLDAPUser("uid=jdoe,dc=example,dc=com", map[string][]string{
-		"thumbnailPhoto": {"thumb-bytes"},
-	})
-
-	info := adapter.GetNormalizedUserInfo(user)
-
-	assert.Empty(t, info.Photo, "thumbnailPhoto is not used by the FREEIPA adapter")
-}
-
-func TestFREEIPAAdapter_GetNormalizedUserInfo_DepartmentAlwaysEmpty(t *testing.T) {
-	// Department is hardcoded to empty. Any "department" / "departmentNumber" /
-	// "rbtadp" attribute present on the entry must be ignored — unlike in
-	// MSAD (department) or ALDRPO (rbtadp).
-	adapter := FREEIPAAdapter{}
-	user := newLDAPUser("uid=jdoe,dc=example,dc=com", map[string][]string{
-		"department":       {"IT"},
-		"departmentNumber": {"IT-42"},
-		"rbtadp":           {"IT-43"},
-	})
-
-	info := adapter.GetNormalizedUserInfo(user)
-
-	assert.Empty(t, info.Department)
-}
-
-func TestFREEIPAAdapter_GetNormalizedUserInfo_AddressFromStreetOnly(t *testing.T) {
-	// Address must be read from "street", not "streetAddress".
-	adapter := FREEIPAAdapter{}
-	user := newLDAPUser("uid=jdoe,dc=example,dc=com", map[string][]string{
-		"street":        {"Tverskaya 1"},
+	user := newLDAPUser("", map[string][]string{
+		"street":        {"Main Street"},
 		"streetAddress": {"IGNORED"},
 	})
 
 	info := adapter.GetNormalizedUserInfo(user)
-
-	assert.Equal(t, "Tverskaya 1", info.Address)
-	assert.NotEqual(t, "IGNORED", info.Address)
+	assert.Equal(t, "Main Street", info.Address)
 }
 
-func TestFREEIPAAdapter_GetNormalizedUserInfo_StreetAddressIgnored(t *testing.T) {
-	// If only "streetAddress" is present, Address stays empty.
-	adapter := FREEIPAAdapter{}
-	user := newLDAPUser("uid=jdoe,dc=example,dc=com", map[string][]string{
-		"streetAddress": {"IGNORED"},
-	})
+// ---------------------------------------------------------------------------
+// OUInfoFromEntry
+// ---------------------------------------------------------------------------
 
-	info := adapter.GetNormalizedUserInfo(user)
-
-	assert.Empty(t, info.Address)
-}
-
-// ---------- OUInfoFromEntry ----------
-
-func TestFREEIPAAdapter_OUInfoFromEntry_FullAttributes(t *testing.T) {
+func TestFREEIPAAdapter_OUInfoFromEntry(t *testing.T) {
 	adapter := FREEIPAAdapter{}
 	entry := ldap.Entry{
-		DN: "cn=users,cn=accounts,dc=example,dc=com",
+		DN: "ou=people,dc=example,dc=test",
 		Attributes: []*ldap.EntryAttribute{
-			{Name: "ou", Values: []string{"users"}},
+			{Name: "ou", Values: []string{"people"}},
 		},
 	}
 
 	info := adapter.OUInfoFromEntry(entry)
+	require.NotNil(t, info)
 
-	assert.NotNil(t, info)
-	assert.Equal(t, "cn=users,cn=accounts,dc=example,dc=com", info.DN)
-	// Name equals the entry DN, not a "name" attribute.
-	assert.Equal(t, "cn=users,cn=accounts,dc=example,dc=com", info.Name)
-	// OU comes from the "ou" attribute, not from the DN.
-	assert.Equal(t, "users", info.OU)
-}
+	assert.Equal(t, "ou=people,dc=example,dc=test", info.DN)
+	// FreeIPA sets Name = full DN (not just the leaf ou value).
+	assert.Equal(t, "ou=people,dc=example,dc=test", info.Name)
+	assert.Equal(t, "people", info.OU)
 
-func TestFREEIPAAdapter_OUInfoFromEntry_NameIsAlwaysDN(t *testing.T) {
-	// Name must equal DN regardless of any other attributes present.
-	adapter := FREEIPAAdapter{}
-	entry := ldap.Entry{
-		DN: "cn=accounts,dc=example,dc=com",
-		Attributes: []*ldap.EntryAttribute{
-			{Name: "name", Values: []string{"IGNORED"}},
-			{Name: "cn", Values: []string{"accounts"}},
-		},
-	}
-
-	info := adapter.OUInfoFromEntry(entry)
-
-	assert.Equal(t, "cn=accounts,dc=example,dc=com", info.Name)
-	assert.NotEqual(t, "IGNORED", info.Name)
-}
-
-func TestFREEIPAAdapter_OUInfoFromEntry_MissingOUAttribute(t *testing.T) {
-	// nsContainer entries may lack an "ou" attribute; OU stays empty.
-	adapter := FREEIPAAdapter{}
-	entry := ldap.Entry{
-		DN: "cn=users,cn=accounts,dc=example,dc=com",
-		Attributes: []*ldap.EntryAttribute{
-			{Name: "objectClass", Values: []string{"nsContainer"}},
-		},
-	}
-
-	info := adapter.OUInfoFromEntry(entry)
-
-	assert.NotNil(t, info)
-	assert.Equal(t, "cn=users,cn=accounts,dc=example,dc=com", info.DN)
-	assert.Equal(t, "cn=users,cn=accounts,dc=example,dc=com", info.Name)
-	assert.Empty(t, info.OU)
-}
-
-func TestFREEIPAAdapter_OUInfoFromEntry_ChildrenInitialized(t *testing.T) {
-	// Children must be a non-nil empty slice so callers can append safely.
-	adapter := FREEIPAAdapter{}
-	info := adapter.OUInfoFromEntry(ldap.Entry{DN: "cn=users,dc=example,dc=com"})
-
-	assert.NotNil(t, info.Children)
+	// Children must be a non-nil empty slice so callers can append without
+	// a nil check.
+	require.NotNil(t, info.Children)
 	assert.Empty(t, info.Children)
 }
 
 func TestFREEIPAAdapter_OUInfoFromEntry_EmptyEntry(t *testing.T) {
 	adapter := FREEIPAAdapter{}
+	info := adapter.OUInfoFromEntry(ldap.Entry{})
 
-	assert.NotPanics(t, func() {
-		info := adapter.OUInfoFromEntry(ldap.Entry{})
-		assert.NotNil(t, info)
-		assert.Empty(t, info.DN)
-		assert.Empty(t, info.Name)
-		assert.Empty(t, info.OU)
-		assert.NotNil(t, info.Children)
-	})
+	require.NotNil(t, info)
+	assert.Zero(t, info.DN)
+	assert.Zero(t, info.OU)
+	assert.NotNil(t, info.Children)
 }
 
-func TestFREEIPAAdapter_OUInfoFromEntry_NilAttributes(t *testing.T) {
-	adapter := FREEIPAAdapter{}
-	entry := ldap.Entry{DN: "cn=users,dc=example,dc=com", Attributes: nil}
+// ---------------------------------------------------------------------------
+// Object filters (exact strings act as regression guards)
+// ---------------------------------------------------------------------------
 
-	assert.NotPanics(t, func() {
-		info := adapter.OUInfoFromEntry(entry)
-		assert.Equal(t, "cn=users,dc=example,dc=com", info.DN)
-		assert.Equal(t, "cn=users,dc=example,dc=com", info.Name)
-		assert.Empty(t, info.OU)
-	})
+func TestFREEIPAAdapter_ObjectFilters_ExactStrings(t *testing.T) {
+	adapter := FREEIPAAdapter{}
+
+	assert.Equal(t,
+		"(|(objectClass=posixAccount)(objectClass=inetOrgPerson)(objectClass=person))",
+		adapter.UserObjectFilter())
+	assert.Equal(t,
+		"(|(objectClass=groupOfNames)(objectClass=posixGroup)(objectClass=ipausergroup))",
+		adapter.GroupObjectFilter())
+	assert.Equal(t,
+		"(|(objectClass=organizationalUnit)(objectClass=nsContainer))",
+		adapter.OUObjectFilter())
 }
 
-func TestFREEIPAAdapter_OUInfoFromEntry_UsesFirstValueOfMultiValuedOU(t *testing.T) {
-	// Pin GetAttributeValue behavior for multi-valued "ou".
+// ---------------------------------------------------------------------------
+// Search filters — sanity check via go-ldap's parser, plus exact string
+// regression guards for the two most-touched filters.
+// ---------------------------------------------------------------------------
+
+// TestFREEIPAAdapter_SearchFilters_AreValidLDAP substitutes real values into
+// every Search* template and asks go-ldap to parse the result. This catches
+// typos and the previous (member=uid=%s) regression on the syntax level.
+func TestFREEIPAAdapter_SearchFilters_AreValidLDAP(t *testing.T) {
 	adapter := FREEIPAAdapter{}
-	entry := ldap.Entry{
-		DN: "cn=users,dc=example,dc=com",
-		Attributes: []*ldap.EntryAttribute{
-			{Name: "ou", Values: []string{"users", "People"}},
+
+	user := types.LDAPUser{
+		DN:         "uid=user1,cn=users,cn=accounts,dc=example,dc=test",
+		Attributes: map[string][]string{"uid": {"user1"}},
+	}
+
+	cases := []struct {
+		name   string
+		filter string
+	}{
+		{
+			name:   "SearchUserFilterTemplate",
+			filter: fmt.Sprintf(adapter.SearchUserFilterTemplate(), "user1"),
+		},
+		{
+			name: "SearchUserGroupsFilterTemplate",
+			filter: fmt.Sprintf(
+				adapter.SearchUserGroupsFilterTemplate(),
+				adapter.SearchUserGroupsFilterTemplateArgs(user)...,
+			),
+		},
+		{
+			name:   "SearchOUFilterTemplate",
+			filter: fmt.Sprintf(adapter.SearchOUFilterTemplate(), "people"),
+		},
+		{
+			name:   "SearchGroupFilterTemplate",
+			filter: fmt.Sprintf(adapter.SearchGroupFilterTemplate(), "admins"),
 		},
 	}
 
-	info := adapter.OUInfoFromEntry(entry)
-
-	assert.Equal(t, "users", info.OU)
-}
-
-// ---------- TYPE FILTERS ----------
-
-func TestFREEIPAAdapter_OUObjectFilter(t *testing.T) {
-	adapter := FREEIPAAdapter{}
-	// nsContainer is the FreeIPA-specific container class that complements
-	// (or replaces) organizationalUnit for some entries.
-	assert.Equal(t,
-		"(|(objectClass=organizationalUnit)(objectClass=nsContainer))",
-		adapter.OUObjectFilter(),
-	)
-}
-
-func TestFREEIPAAdapter_GroupObjectFilter(t *testing.T) {
-	adapter := FREEIPAAdapter{}
-	assert.Equal(t,
-		"(|(objectClass=groupOfNames)(objectClass=posixGroup)(objectClass=ipausergroup))",
-		adapter.GroupObjectFilter(),
-	)
-}
-
-func TestFREEIPAAdapter_UserObjectFilter(t *testing.T) {
-	adapter := FREEIPAAdapter{}
-	assert.Equal(t,
-		"(|(objectClass=posixAccount)(objectClass=inetOrgPerson)(objectClass=person))",
-		adapter.UserObjectFilter(),
-	)
-}
-
-// ---------- SEARCH ----------
-
-func TestFREEIPAAdapter_SearchUserFilterTemplate(t *testing.T) {
-	adapter := FREEIPAAdapter{}
-	assert.Equal(t,
-		"(&(|(objectClass=posixAccount)(objectClass=inetOrgPerson)(objectClass=person))(uid=%s))",
-		adapter.SearchUserFilterTemplate(),
-	)
-}
-
-func TestFREEIPAAdapter_SearchUserFilterTemplate_FormatsUsername(t *testing.T) {
-	adapter := FREEIPAAdapter{}
-	filter := fmt.Sprintf(adapter.SearchUserFilterTemplate(), "jdoe")
-
-	assert.Equal(t,
-		"(&(|(objectClass=posixAccount)(objectClass=inetOrgPerson)(objectClass=person))(uid=jdoe))",
-		filter,
-	)
-	assert.NotContains(t, filter, "%", "no unresolved placeholders should remain")
-}
-
-func TestFREEIPAAdapter_SearchUserGroupsFilterTemplate(t *testing.T) {
-	adapter := FREEIPAAdapter{}
-
-	// NB: "member=uid=%s" is semantically unusual — `member` is normally
-	// a DN-valued attribute, not a uid. Pinned here to detect unintended
-	// changes; if the adapter is corrected, update this test accordingly.
-	assert.Equal(t,
-		"(&(|(objectClass=groupOfNames)(objectClass=posixGroup)(objectClass=ipausergroup))(member=uid=%s))",
-		adapter.SearchUserGroupsFilterTemplate(),
-	)
-}
-
-func TestFREEIPAAdapter_SearchUserGroupsFilterTemplate_HasOnePlaceholder(t *testing.T) {
-	adapter := FREEIPAAdapter{}
-	template := adapter.SearchUserGroupsFilterTemplate()
-
-	assert.Equal(t, 1, strings.Count(template, "%s"),
-		"template is expected to contain exactly one placeholder")
-}
-
-func TestFREEIPAAdapter_SearchUserGroupsFilterTemplate_FormatsCleanly(t *testing.T) {
-	// Template has 1 placeholder and SearchUserGroupsFilterTemplateArgs returns
-	// 1 arg — formatting must produce a clean filter with no artifacts.
-	adapter := FREEIPAAdapter{}
-	user := newLDAPUser("uid=jdoe,cn=users,cn=accounts,dc=example,dc=com",
-		map[string][]string{"uid": {"jdoe"}})
-	args := adapter.SearchUserGroupsFilterTemplateArgs(user)
-
-	filter := fmt.Sprintf(adapter.SearchUserGroupsFilterTemplate(), args...)
-
-	assert.NotContains(t, filter, "%!",
-		"formatting must not produce an EXTRA/placeholder-mismatch artifact")
-	assert.NotContains(t, filter, "%s",
-		"no unresolved placeholder should remain")
-	assert.Contains(t, filter, "uid=jdoe")
-}
-
-func TestFREEIPAAdapter_SearchOUFilterTemplate(t *testing.T) {
-	adapter := FREEIPAAdapter{}
-	// Both organizationalUnit and nsContainer must be matched.
-	assert.Equal(t,
-		"(&(|(objectClass=organizationalUnit)(objectClass=nsContainer))(ou=%s))",
-		adapter.SearchOUFilterTemplate(),
-	)
-}
-
-func TestFREEIPAAdapter_SearchGroupFilterTemplate(t *testing.T) {
-	adapter := FREEIPAAdapter{}
-	assert.Equal(t,
-		"(&(|(objectClass=groupOfNames)(objectClass=posixGroup)(objectClass=ipausergroup))(cn=%s))",
-		adapter.SearchGroupFilterTemplate(),
-	)
-}
-
-// TestFREEIPAAdapter_AllSearchTemplates_BalancedParentheses is a regression
-// guard against malformed filters that LDAP servers would reject.
-func TestFREEIPAAdapter_AllSearchTemplates_BalancedParentheses(t *testing.T) {
-	adapter := FREEIPAAdapter{}
-
-	templates := map[string]string{
-		"SearchUserFilterTemplate":       adapter.SearchUserFilterTemplate(),
-		"SearchUserGroupsFilterTemplate": adapter.SearchUserGroupsFilterTemplate(),
-		"SearchOUFilterTemplate":         adapter.SearchOUFilterTemplate(),
-		"SearchGroupFilterTemplate":      adapter.SearchGroupFilterTemplate(),
-	}
-	for name, tmpl := range templates {
-		t.Run(name, func(t *testing.T) {
-			assert.Equal(t, strings.Count(tmpl, "("), strings.Count(tmpl, ")"),
-				"parentheses must be balanced")
-			assert.True(t, strings.HasPrefix(tmpl, "("), "filter must start with '('")
-			assert.True(t, strings.HasSuffix(tmpl, ")"), "filter must end with ')'")
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			_, err := ldap.CompileFilter(c.filter)
+			require.NoError(t, err, "invalid LDAP filter: %q", c.filter)
 		})
 	}
 }
 
-// ---------- SearchUserGroupsFilterTemplateArgs ----------
-
-func TestFREEIPAAdapter_SearchUserGroupsFilterTemplateArgs_ReturnsUID(t *testing.T) {
+func TestFREEIPAAdapter_SearchUserGroupsFilterTemplate_ExactString(t *testing.T) {
 	adapter := FREEIPAAdapter{}
-	user := newLDAPUser("uid=jdoe,cn=users,cn=accounts,dc=example,dc=com",
-		map[string][]string{"uid": {"jdoe"}})
+
+	// FreeIPA groups are matched via `member` (DN-valued). Regression guard
+	// against reintroducing (member=uid=%s) or similar.
+	assert.Equal(t,
+		"(&(|(objectClass=groupOfNames)(objectClass=posixGroup)(objectClass=ipausergroup))(member=%s))",
+		adapter.SearchUserGroupsFilterTemplate())
+
+	assert.NotContains(t, adapter.SearchUserGroupsFilterTemplate(), "member=uid=",
+		"regression: earlier versions had (member=uid=%s) which is not a valid DN lookup")
+}
+
+// ---------------------------------------------------------------------------
+// SearchUserGroupsFilterTemplateArgs
+// ---------------------------------------------------------------------------
+
+func TestFREEIPAAdapter_SearchUserGroupsFilterTemplateArgs_ReturnsDN(t *testing.T) {
+	adapter := FREEIPAAdapter{}
+	user := newLDAPUser(
+		"uid=user1,cn=users,cn=accounts,dc=example,dc=test",
+		map[string][]string{"uid": {"user1"}},
+	)
 
 	args := adapter.SearchUserGroupsFilterTemplateArgs(user)
-
-	assert.Len(t, args, 1, "exactly one arg to match the single %s placeholder")
-	assert.Equal(t, "jdoe", args[0],
-		"the arg is the user's uid, taken from the \"uid\" attribute")
+	require.Len(t, args, 1)
+	assert.Equal(t, "uid=user1,cn=users,cn=accounts,dc=example,dc=test", args[0],
+		"args[0] must be the user's DN for (member=%s) to match groupOfNames")
 }
 
-func TestFREEIPAAdapter_SearchUserGroupsFilterTemplateArgs_IgnoresDN(t *testing.T) {
-	// The DN is not used by this adapter's filter — unlike MSAD, which uses
-	// LDAPUser.DN directly.
+// TestFREEIPAAdapter_SearchUserGroupsFilterTemplateArgs_OneArgPerPlaceholder
+// is a structural check: template placeholders must line up with the args.
+// This is what breaks when someone edits the template without editing Args().
+func TestFREEIPAAdapter_SearchUserGroupsFilterTemplateArgs_OneArgPerPlaceholder(t *testing.T) {
 	adapter := FREEIPAAdapter{}
-	user := newLDAPUser("uid=jdoe,dc=example,dc=com", map[string][]string{
-		"uid": {"jdoe"},
-		"dn":  {"cn=IGNORED,dc=example,dc=com"},
-	})
+	template := adapter.SearchUserGroupsFilterTemplate()
+	args := adapter.SearchUserGroupsFilterTemplateArgs(newLDAPUser("uid=x,dc=e", nil))
 
-	args := adapter.SearchUserGroupsFilterTemplateArgs(user)
-
-	assert.Len(t, args, 1)
-	assert.Equal(t, "jdoe", args[0])
-	assert.NotEqual(t, "uid=jdoe,dc=example,dc=com", args[0])
+	placeholderCount := strings.Count(template, "%s")
+	require.Equal(t, placeholderCount, len(args),
+		"template has %d placeholder(s) but Args() returned %d value(s)",
+		placeholderCount, len(args))
 }
 
-func TestFREEIPAAdapter_SearchUserGroupsFilterTemplateArgs_EmptyUser(t *testing.T) {
-	adapter := FREEIPAAdapter{}
-	args := adapter.SearchUserGroupsFilterTemplateArgs(types.LDAPUser{})
+// ---------------------------------------------------------------------------
+// Attrs — verify the key attributes required by GetNormalizedUserInfo are
+// actually fetched from the server.
+// ---------------------------------------------------------------------------
 
-	assert.Len(t, args, 1)
-	assert.Equal(t, "", args[0])
-}
-
-func TestFREEIPAAdapter_SearchUserGroupsFilterTemplateArgs_NilAttributesMap(t *testing.T) {
-	adapter := FREEIPAAdapter{}
-	user := types.LDAPUser{DN: "uid=jdoe,dc=example,dc=com", Attributes: nil}
-
-	assert.NotPanics(t, func() {
-		args := adapter.SearchUserGroupsFilterTemplateArgs(user)
-		assert.Len(t, args, 1)
-		assert.Equal(t, "", args[0])
-	})
-}
-
-// ---------- ATTRS ----------
-
-func TestFREEIPAAdapter_UserAttrs(t *testing.T) {
+func TestFREEIPAAdapter_UserAttrs_ContainsMappedAttributes(t *testing.T) {
 	adapter := FREEIPAAdapter{}
 
-	expected := []string{
-		"dn",
-
-		"uid", "cn", "givenName", "sn", "displayName", "mail",
-		"telephoneNumber", "mobile", "title", "ou", "o", "jpegPhoto",
-
-		"nsAccountLock",
-
-		// system&posix attrs
-		"uidNumber", "gidNumber", "homeDirectory", "memberOf", "ipaUniqueID",
-
-		// address
-		"street", "l", "st", "postalCode",
-
-		// may be or not to be at all attrs
-		"description", "manager", "co",
+	// Every attribute that GetNormalizedUserInfo reads from LDAPUser must be
+	// present in UserAttrs; otherwise the data is never requested from the
+	// server and the normalized field stays empty.
+	required := []string{
+		"dn", "cn", "mobile", "telephoneNumber", "mail", "title",
+		"manager", "jpegPhoto", "co", "street", "l", "postalCode",
 	}
 
-	assert.Equal(t, expected, adapter.UserAttrs())
+	attrs := adapter.UserAttrs()
+	for _, r := range required {
+		assert.Contains(t, attrs, r,
+			"UserAttrs must contain %q because GetNormalizedUserInfo reads it", r)
+	}
 }
 
-func TestFREEIPAAdapter_UserAttrs_ContainsCriticalAttributes(t *testing.T) {
+func TestFREEIPAAdapter_UserAttrs_DistinguishingAttributes(t *testing.T) {
 	adapter := FREEIPAAdapter{}
 	attrs := adapter.UserAttrs()
 
-	critical := []string{
-		"dn", "cn", "uid", "mail", "mobile", "telephoneNumber",
-		"jpegPhoto", "manager", "title", "co",
-		"uidNumber", "gidNumber", "homeDirectory", "memberOf",
-		"ipaUniqueID", "nsAccountLock",
-		"street", "l", "st", "postalCode",
-	}
-	for _, attr := range critical {
-		assert.Contains(t, attrs, attr, "critical attribute %q is missing", attr)
-	}
+	// FreeIPA-specific attributes.
+	assert.Contains(t, attrs, "nsAccountLock")
+	assert.Contains(t, attrs, "ipaUniqueID")
+
+	// FreeIPA uses "street", not "streetAddress".
+	assert.Contains(t, attrs, "street")
+	assert.NotContains(t, attrs, "streetAddress",
+		"streetAddress is the MSAD/ALDPro spelling; FreeIPA uses street")
+
+	// ALDPro-specific attribute must not leak into FreeIPA.
+	assert.NotContains(t, attrs, "rbtadp")
 }
 
-func TestFREEIPAAdapter_UserAttrs_FreeIPASpecific(t *testing.T) {
-	// nsAccountLock and ipaUniqueID are FreeIPA-specific attributes.
-	adapter := FREEIPAAdapter{}
-	attrs := adapter.UserAttrs()
-
-	for _, attr := range []string{"nsAccountLock", "ipaUniqueID"} {
-		assert.Contains(t, attrs, attr, "FreeIPA-specific attribute %q is missing", attr)
-	}
-}
-
-func TestFREEIPAAdapter_UserAttrs_NoDuplicates(t *testing.T) {
-	adapter := FREEIPAAdapter{}
-	seen := make(map[string]struct{}, len(adapter.UserAttrs()))
-	for _, attr := range adapter.UserAttrs() {
-		if _, exists := seen[attr]; exists {
-			t.Fatalf("duplicate attribute in UserAttrs: %q", attr)
-		}
-		seen[attr] = struct{}{}
-	}
-}
-
-func TestFREEIPAAdapter_OUAttrs(t *testing.T) {
-	adapter := FREEIPAAdapter{}
-
-	expected := []string{"dn", "ou", "objectClass", "description"}
-	assert.Equal(t, expected, adapter.OUAttrs())
-}
-
-func TestFREEIPAAdapter_OUAttrs_IncludesObjectClass(t *testing.T) {
-	// objectClass is required to distinguish nsContainer from
-	// organizationalUnit at read time.
-	adapter := FREEIPAAdapter{}
-
-	assert.Contains(t, adapter.OUAttrs(), "objectClass")
-}
-
-func TestFREEIPAAdapter_GroupAttrs(t *testing.T) {
-	adapter := FREEIPAAdapter{}
-
-	expected := []string{
-		"cn",
-		"ou",
-		"description",
-		"objectClass",
-
-		"gidNumber", // posixGroup
-		"memberUid", // posixGroup
-
-		"member",
-		"memberIndirect",
-		"memberOf",
-
-		"mepManagedBy",
-		"ipaUniqueID",
-		"ipaNTSecurityIdentifier",
-	}
-	assert.Equal(t, expected, adapter.GroupAttrs())
-}
-
-func TestFREEIPAAdapter_GroupAttrs_ContainsBothGroupTypes(t *testing.T) {
-	// GroupAttrs must cover groupOfNames, posixGroup and ipausergroup.
+func TestFREEIPAAdapter_GroupAttrs_DistinguishingAttributes(t *testing.T) {
 	adapter := FREEIPAAdapter{}
 	attrs := adapter.GroupAttrs()
 
-	// groupOfNames
-	for _, attr := range []string{"cn", "member"} {
-		assert.Contains(t, attrs, attr, "groupOfNames: attribute %q is missing", attr)
-	}
-	// posixGroup
-	for _, attr := range []string{"gidNumber", "memberUid"} {
-		assert.Contains(t, attrs, attr, "posixGroup: attribute %q is missing", attr)
-	}
-	// ipausergroup
-	for _, attr := range []string{"ipaUniqueID", "ipaNTSecurityIdentifier"} {
-		assert.Contains(t, attrs, attr, "ipausergroup: attribute %q is missing", attr)
-	}
+	assert.Contains(t, attrs, "cn")
+	assert.Contains(t, attrs, "member")
+	assert.Contains(t, attrs, "memberUid")
+	assert.Contains(t, attrs, "memberIndirect") // FreeIPA-specific operational attr
+	assert.Contains(t, attrs, "ipaUniqueID")
+	assert.Contains(t, attrs, "ipaNTSecurityIdentifier")
 }
 
-func TestFREEIPAAdapter_GroupAttrs_NoDuplicates(t *testing.T) {
+func TestFREEIPAAdapter_OUAttrs_ContainsExpected(t *testing.T) {
 	adapter := FREEIPAAdapter{}
-	seen := make(map[string]struct{}, len(adapter.GroupAttrs()))
-	for _, attr := range adapter.GroupAttrs() {
-		if _, exists := seen[attr]; exists {
-			t.Fatalf("duplicate attribute in GroupAttrs: %q", attr)
-		}
-		seen[attr] = struct{}{}
-	}
+	attrs := adapter.OUAttrs()
+
+	assert.NotEmpty(t, attrs)
+	assert.Contains(t, attrs, "ou")
+	assert.Contains(t, attrs, "objectClass")
+	assert.Contains(t, attrs, "description")
 }

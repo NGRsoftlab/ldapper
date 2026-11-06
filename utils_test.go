@@ -12,6 +12,9 @@ import (
 // ---------- helpers for tests ----------
 
 // newLDAPEntry is a helper to build *ldap.Entry with attributes.
+// NB: deliberately returns *ldap.Entry (not ldap.Entry) — callers in this
+// package pass it to CatalogAdapter.GetNormalizedUserInfo, which expects
+// the pointer form.
 func newLDAPEntry(dn string, attrs map[string][]string) *ldap.Entry {
 	entry := &ldap.Entry{DN: dn}
 	for name, values := range attrs {

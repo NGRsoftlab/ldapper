@@ -53,7 +53,7 @@ func (ldapper *LDAPper) searchSingleEntryLocked(
 		return ldapper.connection.Search(req)
 	})
 	if err != nil {
-		return nil, fmt.Errorf("unsuccessful %s search: %w", kind, classifyLDAPError(err))
+		return nil, fmt.Errorf("%s search: %w", kind, classifyLDAPError(err))
 	}
 
 	switch {
@@ -174,7 +174,15 @@ func (ldapper *LDAPper) searchPaged(
 
 		ctrl := ldap.FindControl(result.Controls, ldap.ControlTypePaging)
 		if ctrl == nil {
-			break // server did not honor paging: single page, done
+			// Server did not honor paging. If the caller requires paging, the
+			// result may be truncated by the server's own size limit — signal it
+			// rather than silently returning a potentially incomplete slice.
+			if ldapper.searchLimits.RequirePaging {
+				return allEntries, fmt.Errorf(
+					"%w: server did not honor paging; result may be incomplete",
+					ErrPartialResult)
+			}
+			break
 		}
 
 		next, ok := ctrl.(*ldap.ControlPaging)

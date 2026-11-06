@@ -2,6 +2,8 @@
 package adapters
 
 import (
+	"fmt"
+
 	"github.com/go-ldap/ldap/v3"
 
 	"github.com/NGRsoftlab/ldapper/types"
@@ -43,6 +45,18 @@ func (a ALDPROAdapter) GetNormalizedOUInfoFromEntry(entry ldap.Entry) *types.OUN
 	}
 }
 
+// BIND
+
+// BindIdentity passes the login through: ALDPro accepts UPN/DN as Simple
+// Bind principals. Short-form bind is not supported — callers must supply
+// a UPN or a full DN.
+func (a ALDPROAdapter) BindIdentity(login, _ string) (string, error) {
+	if login == "" {
+		return "", fmt.Errorf("empty login")
+	}
+	return login, nil
+}
+
 // TYPE FILTERS
 
 func (a ALDPROAdapter) OUObjectFilter() string {
@@ -60,7 +74,9 @@ func (a ALDPROAdapter) UserObjectFilter() string {
 // SEARCH
 
 func (a ALDPROAdapter) SearchUserFilterTemplate() string {
-	return "(&(|(objectClass=posixAccount)(objectClass=inetOrgPerson)(objectClass=person))(uid=%s))"
+	// Match by uid OR entryDN so that both a short uid and a full-DN
+	// bind principal resolve correctly.
+	return "(&(|(objectClass=posixAccount)(objectClass=inetOrgPerson)(objectClass=person))(|(uid=%[1]s)(entryDN=%[1]s)))"
 }
 
 func (a ALDPROAdapter) SearchUserGroupsFilterTemplate() string {

@@ -33,4 +33,23 @@ type CatalogAdapter interface {
 	UserAttrs() []string
 	OUAttrs() []string
 	GroupAttrs() []string
+
+	// BindIdentity converts a caller-supplied login into the principal that
+	// is passed verbatim to LDAPConn.Bind. The adapter decides the form:
+	//
+	//   - MSAD / ALDPro: accept UPN, sAMAccountName or DN → the login is
+	//                    passed through; the server performs the mapping.
+	//   - OpenLDAP:      requires a DN → "uid=<login>,<baseDN>" when
+	//                    <login> is not already a DN.
+	//   - FreeIPA:       requires a DN → "uid=<login>,cn=users,cn=accounts,
+	//                    <baseDN>" when <login> is not already a DN.
+	//
+	// The lookup uses the ORIGINAL login (not the value returned by
+	// BindIdentity), so SearchUserFilterTemplate must accept every form
+	// that BindIdentity accepts — typically by unioning the schema
+	// attribute with an entryDN alternative (see the shipped adapters).
+	//
+	// Returning an error lets the adapter reject inputs it cannot map to
+	// a bind principal (e.g. a short-form login with an empty baseDN).
+	BindIdentity(login, baseDN string) (string, error)
 }

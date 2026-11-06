@@ -2,6 +2,8 @@
 package adapters
 
 import (
+	"fmt"
+
 	"github.com/go-ldap/ldap/v3"
 
 	"github.com/NGRsoftlab/ldapper/types"
@@ -43,6 +45,32 @@ func (a FREEIPAAdapter) GetNormalizedOUInfoFromEntry(entry ldap.Entry) *types.OU
 	}
 }
 
+// BIND
+
+// BindIdentity accepts either a full DN (passed through) or a short uid,
+// which is expanded to uid=<login>,cn=users,cn=accounts,<baseDN> — the
+// standard FreeIPA user container.
+func (a FREEIPAAdapter) BindIdentity(login, baseDN string) (string, error) {
+	if login == "" {
+		return "", fmt.Errorf("empty login")
+	}
+	if _, err := ldap.ParseDN(login); err == nil {
+		return login, nil
+	}
+	if baseDN == "" {
+		return "", fmt.Errorf("baseDN required for short-form bind")
+	}
+	users, err := appendRDN("cn", "users", baseDN)
+	if err != nil {
+		return "", err
+	}
+	accounts, err := appendRDN("cn", "accounts", users)
+	if err != nil {
+		return "", err
+	}
+	return appendRDN("uid", login, accounts)
+}
+
 // TYPE FILTERS
 
 func (a FREEIPAAdapter) OUObjectFilter() string {
@@ -60,7 +88,9 @@ func (a FREEIPAAdapter) UserObjectFilter() string {
 // SEARCH
 
 func (a FREEIPAAdapter) SearchUserFilterTemplate() string {
-	return "(&(|(objectClass=posixAccount)(objectClass=inetOrgPerson)(objectClass=person))(uid=%s))"
+	// Match by uid OR entryDN so that both the short-form login and the
+	// full-DN bind principal resolve to the same user entry.
+	return "(&(|(objectClass=posixAccount)(objectClass=inetOrgPerson)(objectClass=person))(|(uid=%[1]s)(entryDN=%[1]s)))"
 }
 
 func (a FREEIPAAdapter) SearchUserGroupsFilterTemplate() string {

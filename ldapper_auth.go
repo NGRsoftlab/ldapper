@@ -27,6 +27,23 @@ func (ldapper *LDAPper) invalidateAuthLocked() {
 	ldapper.bindPassword = ""
 }
 
+// restoreServiceBindLocked re-binds as the cached service principal. On
+// failure it closes the connection and invalidates auth state so that no
+// subsequent operation runs under an unverified identity. Returns nil on
+// success.
+func (ldapper *LDAPper) restoreServiceBindLocked() error {
+	err := ldapper.withTimeout(ldapper.opTimeouts.Bind, func() error {
+		return ldapper.connection.Bind(ldapper.bindUser, ldapper.bindPassword)
+	})
+	if err == nil {
+		return nil
+	}
+	_ = ldapper.connection.Close()
+	ldapper.connection = nil
+	ldapper.invalidateAuthLocked()
+	return classifySensitiveBindError(err)
+}
+
 // AuthenticateConn binds as the service user and caches its credentials for
 // later reconnect and per-user checks. See CheckUserCredentials for verifying
 // an arbitrary user without disturbing the service session.
@@ -50,26 +67,28 @@ func (ldapper *LDAPper) authenticateConnLocked(username, password, baseDN string
 		return nil, err
 	}
 
-	// Bind check. On any failure the live LDAP session is no longer
-	// trustworthy — RFC 4513 transitions the connection to anonymous
-	// on a failed Bind. Invalidate cached auth state so requireAuthLocked()
-	// protects subsequent operations instead of letting them run anonymously.
+	// Ask the adapter how to present the login as a bind principal. The
+	// returned string is a DN or an accepted AD-style principal — it is
+	// NOT filter-escaped (that is only for filter values).
+	bindUsername, err := ldapper.catalogAdapter.BindIdentity(username, baseDN)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrInvalidArgument, err)
+	}
+
+	// Bind with the adapter-supplied principal. A failed Bind invalidates
+	// cached state; a failed post-bind lookup closes the connection.
 	if err := ldapper.withTimeout(ldapper.opTimeouts.Bind, func() error {
-		return ldapper.connection.Bind(username, password)
+		return ldapper.connection.Bind(bindUsername, password)
 	}); err != nil {
 		ldapper.invalidateAuthLocked()
 		return nil, classifySensitiveBindError(err)
 	}
 
+	// Verify the bind principal by applying the adapter's user filter to
+	// the ORIGINAL login. The adapter's SearchUserFilterTemplate must
+	// accept every form it accepts in BindIdentity (see shipped adapters).
 	user, err := ldapper.getUserLocked(username, baseDN)
 	if err != nil {
-		// Bind succeeded, so the live LDAP session is now identified as
-		// `username`. The verification lookup failed, which means we cannot
-		// establish the invariants of a service session. Close the connection
-		// to force explicit recovery: leaving it open would let subsequent
-		// operations (GetUser, CustomSearch, ...) run under an unverified
-		// identity, while invalidateAuthLocked() alone does not protect them
-		// because requireConnLocked() would still pass.
 		_ = ldapper.connection.Close()
 		ldapper.connection = nil
 		ldapper.invalidateAuthLocked()
@@ -77,7 +96,9 @@ func (ldapper *LDAPper) authenticateConnLocked(username, password, baseDN string
 	}
 
 	ldapper.isAuthenticated = true
-	ldapper.bindUser = username
+	// Cache the *bind* principal — it is what Reconnect and the deferred
+	// rebind inside CheckUserCredentials must replay.
+	ldapper.bindUser = bindUsername
 	ldapper.bindPassword = password
 	ldapper.bindDN = baseDN
 
@@ -88,56 +109,43 @@ func (ldapper *LDAPper) authenticateConnLocked(username, password, baseDN string
 // then restoring the service bind. Can only be used on an authenticated
 // connection whose bind user has read access to the directory.
 // NB: can not be used with non-authenticated conn or with non-read-access-granted bindUser in conn cfg
-func (ldapper *LDAPper) CheckUserCredentials(username, password string) (user *types.LDAPUser, err error) {
+func (ldapper *LDAPper) CheckUserCredentials(username, password string) (*types.LDAPUser, error) {
 	ldapper.opMu.Lock()
 	defer ldapper.opMu.Unlock()
 
 	if err := ldapper.requireAuthLocked(); err != nil {
 		return nil, err
 	}
-
 	if username == "" || password == "" {
 		return nil, fmt.Errorf("%w: empty username/password", ErrInvalidArgument)
 	}
 
-	user, err = ldapper.getUserLocked(username, ldapper.bindDN)
+	user, err := ldapper.getUserLocked(username, ldapper.bindDN)
 	if err != nil {
-		// NB: hide user existence — a missing user must be indistinguishable
-		// from a wrong password for the caller.
 		if errors.Is(err, ErrNotFound) {
+			// Hide user existence.
 			return nil, ErrInvalidCredentials
 		}
 		return nil, err
 	}
 
-	defer func() {
-		errRebind := ldapper.withTimeout(ldapper.opTimeouts.Bind, func() error {
-			return ldapper.connection.Bind(ldapper.bindUser, ldapper.bindPassword)
-		})
-		if errRebind == nil {
-			return
-		}
-
-		// Rebind failed — the session is no longer the verified service one.
-		// Close it so subsequent operations cannot run under an unverified
-		// identity (mirrors the A13 fix in AuthenticateConn).
-		_ = ldapper.connection.Close()
-		ldapper.connection = nil
-		ldapper.invalidateAuthLocked()
-
-		if err == nil {
-			user = nil
-			err = fmt.Errorf("%w: failed to restore service bind", ErrNotAuthenticated)
-			return
-		}
-		err = fmt.Errorf("%w (additionally: failed to restore service bind: %v)",
-			err, classifySensitiveBindError(errRebind))
-	}()
-
-	if err = ldapper.withTimeout(ldapper.opTimeouts.Bind, func() error {
+	bindErr := ldapper.withTimeout(ldapper.opTimeouts.Bind, func() error {
 		return ldapper.connection.Bind(user.DN, password)
-	}); err != nil {
-		return nil, classifySensitiveBindError(err)
+	})
+
+	// Restore service session regardless of the user-bind outcome.
+	restoreErr := ldapper.restoreServiceBindLocked()
+
+	switch {
+	case bindErr != nil && restoreErr != nil:
+		// Both failed. Preserve the credential failure as primary (masking),
+		// note the rebind failure for diagnostics.
+		return nil, fmt.Errorf("%w (additionally: %v)",
+			classifySensitiveBindError(bindErr), restoreErr)
+	case bindErr != nil:
+		return nil, classifySensitiveBindError(bindErr)
+	case restoreErr != nil:
+		return nil, fmt.Errorf("%w: failed to restore service bind", ErrNotAuthenticated)
 	}
 
 	return user, nil

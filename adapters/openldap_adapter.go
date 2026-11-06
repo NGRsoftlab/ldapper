@@ -2,6 +2,8 @@
 package adapters
 
 import (
+	"fmt"
+
 	"github.com/go-ldap/ldap/v3"
 
 	"github.com/NGRsoftlab/ldapper/types"
@@ -37,6 +39,24 @@ func (a OPENLDAPAdapter) GetNormalizedOUInfoFromEntry(entry ldap.Entry) *types.O
 		OU:       entry.GetAttributeValue("ou"),
 		Children: make([]*types.OUNormalizedInfo, 0),
 	}
+}
+
+// BIND
+
+// BindIdentity accepts either a full DN (passed through) or a short uid
+// (prepended as uid=<login> to baseDN). The lookup key remains the original
+// login — SearchUserFilterTemplate already matches both uid and entryDN.
+func (a OPENLDAPAdapter) BindIdentity(login, baseDN string) (string, error) {
+	if login == "" {
+		return "", fmt.Errorf("empty login")
+	}
+	if _, err := ldap.ParseDN(login); err == nil {
+		return login, nil
+	}
+	if baseDN == "" {
+		return "", fmt.Errorf("baseDN required for short-form bind")
+	}
+	return appendRDN("uid", login, baseDN)
 }
 
 // TYPE FILTERS

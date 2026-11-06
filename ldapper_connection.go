@@ -24,12 +24,8 @@ func (ldapper *LDAPper) withTimeout(timeout time.Duration, fn func() error) erro
 	if timeout <= 0 {
 		return fn()
 	}
-	st, ok := ldapper.connection.(interface{ SetTimeout(time.Duration) })
-	if !ok {
-		return fn()
-	}
-	st.SetTimeout(timeout)
-	defer st.SetTimeout(0)
+	ldapper.connection.SetTimeout(timeout)
+	defer ldapper.connection.SetTimeout(0)
 	return fn()
 }
 
@@ -37,12 +33,8 @@ func (ldapper *LDAPper) withTimeoutResult(timeout time.Duration, fn func() (*lda
 	if timeout <= 0 {
 		return fn()
 	}
-	st, ok := ldapper.connection.(interface{ SetTimeout(time.Duration) })
-	if !ok {
-		return fn()
-	}
-	st.SetTimeout(timeout)
-	defer st.SetTimeout(0)
+	ldapper.connection.SetTimeout(timeout)
+	defer ldapper.connection.SetTimeout(0)
 	return fn()
 }
 
@@ -99,23 +91,24 @@ func dialHost(host string, port uint, useSSL, skipTLS bool, tlsCfg *tls.Config, 
 
 	connection, err := dialURL(uri, dialOpts...)
 	if err != nil {
-		return nil, fmt.Errorf("unsuccessful dial: %w", classifyLDAPError(err))
+		return nil, fmt.Errorf("dial: %w", classifyLDAPError(err))
 	}
 
 	if !useSSL && !skipTLS {
-		// NB: StartTLS performs the handshake on the already-open socket,
-		// so the dial timeout must be reapplied here, then reset afterwards
-		// to avoid capping regular operations.
-		if dialTimeout > 0 {
-			connection.SetTimeout(dialTimeout)
+		tlsTimeout := dialTimeout
+
+		if tlsTimeout <= 0 {
+			tlsTimeout = constants.DefaultStartTLSTimeout
 		}
+
+		connection.SetTimeout(tlsTimeout)
+
 		if err = connection.StartTLS(tlsCfg); err != nil {
 			_ = connection.Close()
-			return nil, fmt.Errorf("unsuccessful start tls: %w", classifyLDAPError(err))
+			return nil, fmt.Errorf("start tls: %w", classifyLDAPError(err))
 		}
-		if dialTimeout > 0 {
-			connection.SetTimeout(0)
-		}
+
+		connection.SetTimeout(0)
 	}
 
 	return connection, nil
@@ -140,6 +133,9 @@ func (ldapper *LDAPper) isAliveLocked() bool {
 		return false
 	}
 
+	// NB: size/time limits are hardcoded to 1 — the probe is intentionally
+	// independent of connection-level searchLimits so that a user-configured
+	// large TimeLimit does not make EnsureAlive block on a slow server.
 	req := ldap.NewSearchRequest(
 		"", // root DSE
 		ldap.ScopeBaseObject,
@@ -172,6 +168,10 @@ func (ldapper *LDAPper) Reconnect() error {
 }
 
 func (ldapper *LDAPper) reconnectLocked() error {
+	if ldapper.closed {
+		return fmt.Errorf("%w: client is closed", ErrClosed)
+	}
+
 	if ldapper.connection != nil {
 		_ = ldapper.connection.Close()
 		ldapper.connection = nil
@@ -204,6 +204,9 @@ func (ldapper *LDAPper) EnsureAlive() error {
 	ldapper.opMu.Lock()
 	defer ldapper.opMu.Unlock()
 
+	if ldapper.closed {
+		return fmt.Errorf("%w: client is closed", ErrClosed)
+	}
 	if ldapper.isAliveLocked() {
 		return nil
 	}
@@ -214,12 +217,16 @@ func (ldapper *LDAPper) Close() {
 	ldapper.opMu.Lock()
 	defer ldapper.opMu.Unlock()
 
-	if ldapper.connection == nil {
-		return
+	if ldapper.closed {
+		return // idempotent: Close after Close is a no-op
 	}
-	_ = ldapper.connection.Close()
-	ldapper.connection = nil
+	ldapper.closed = true
+
+	if ldapper.connection != nil {
+		_ = ldapper.connection.Close()
+		ldapper.connection = nil
+	}
 	ldapper.invalidateAuthLocked()
 }
 
-// TODO: add ForceClose for emergency operation stops
+// TODO: add ForceClose for emergency operation stops instead of ctx realisations?

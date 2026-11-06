@@ -39,7 +39,7 @@ func (ldapper *LDAPper) getCatalogTreeLocked(baseDN string, maxDepth int) (types
 		ldapper.catalogAdapter.OUObjectFilter(),
 		ldapper.catalogAdapter.OUAttrs(), nil)
 	if err != nil {
-		return res, fmt.Errorf("unsuccessful ou search: %w", classifyLDAPError(err))
+		return res, fmt.Errorf("ou search: %w", classifyLDAPError(err))
 	}
 
 	// NB: keys are canonicalized via canonicalDN so that equivalent DNs
@@ -47,29 +47,33 @@ func (ldapper *LDAPper) getCatalogTreeLocked(baseDN string, maxDepth int) (types
 	// order within a multi-valued RDN, insignificant whitespace) map to the
 	// same tree node. See helpers.go:canonicalDN for the equality model.
 	byDN := make(map[string]*types.OUNormalizedInfo, len(allEntries))
-	order := make([]string, 0, len(allEntries)) // preserves server order
-	seen := make(map[string]struct{}, len(allEntries))
+	order := make([]string, 0, len(allEntries))
 
 	for _, e := range allEntries {
 		info := ldapper.catalogAdapter.GetNormalizedOUInfoFromEntry(*e)
 		if info == nil || info.DN == "" {
 			continue
 		}
+
 		parsed, err := ldap.ParseDN(info.DN)
 		if err != nil {
 			continue // malformed DN from server: skip rather than crash
 		}
-		if !dn.AncestorOf(parsed) {
+
+		// AncestorOfFold compares RDN types and values case-insensitively,
+		// matching LDAP's default caseIgnoreMatch for naming attributes
+		// (dc, ou, cn, ...). AncestorOf would silently drop valid entries
+		// when the server returns DNs in a different case.
+		if !dn.AncestorOfFold(parsed) {
 			// Skips both the base DN itself and any entries outside baseDN.
 			continue
 		}
+
 		key := canonicalDN(info.DN)
-		if _, dup := seen[key]; dup {
-			// Two entries whose DNs are equivalent under canonicalDN.
-			// The tree can only hold one — keep the first, drop the rest.
+		if _, dup := byDN[key]; dup {
 			continue
 		}
-		seen[key] = struct{}{}
+
 		byDN[key] = info
 		order = append(order, key)
 	}
@@ -118,7 +122,7 @@ func (ldapper *LDAPper) getSubOUsLocked(parentDN string, scope int) ([]*types.OU
 	if err != nil {
 		return nil, fmt.Errorf("%w: invalid DN %q: %v", ErrInvalidArgument, parentDN, err)
 	}
-	parentKey := canonicalDN(parentParsed.String())
+	parentKey := canonicalDN(parentDN) // canonicalDN parses internally
 
 	entries, err := ldapper.searchPaged(
 		parentParsed.String(), scope, ldap.NeverDerefAliases, false,
@@ -126,7 +130,7 @@ func (ldapper *LDAPper) getSubOUsLocked(parentDN string, scope int) ([]*types.OU
 		ldapper.catalogAdapter.OUAttrs(), nil,
 	)
 	if err != nil {
-		return nil, fmt.Errorf("unsuccessful sub ou search: %w", classifyLDAPError(err))
+		return nil, fmt.Errorf("sub ou search: %w", classifyLDAPError(err))
 	}
 
 	res := make([]*types.OUNormalizedInfo, 0, len(entries))

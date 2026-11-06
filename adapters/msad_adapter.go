@@ -2,6 +2,8 @@
 package adapters
 
 import (
+	"fmt"
+
 	"github.com/go-ldap/ldap/v3"
 
 	"github.com/NGRsoftlab/ldapper/types"
@@ -39,6 +41,20 @@ func (a MSADAdapter) GetNormalizedOUInfoFromEntry(entry ldap.Entry) *types.OUNor
 	}
 }
 
+// BIND
+
+// BindIdentity passes the login through unchanged: AD accepts UPN,
+// sAMAccountName and DN as Simple Bind principals, so no transformation is
+// needed. SearchUserFilterTemplate unions sAMAccountName, userPrincipalName
+// and distinguishedName so that all three forms are matched during the
+// post-bind lookup.
+func (a MSADAdapter) BindIdentity(login, _ string) (string, error) {
+	if login == "" {
+		return "", fmt.Errorf("empty login")
+	}
+	return login, nil
+}
+
 // TYPE FILTERS
 
 func (a MSADAdapter) OUObjectFilter() string {
@@ -56,7 +72,10 @@ func (a MSADAdapter) UserObjectFilter() string {
 // SEARCH
 
 func (a MSADAdapter) SearchUserFilterTemplate() string {
-	return "(&(objectCategory=person)(objectClass=user)(sAMAccountName=%s))"
+	// Match by sAMAccountName OR userPrincipalName OR distinguishedName so
+	// that any principal accepted by BindIdentity can be resolved back to
+	// the user entry.
+	return "(&(objectCategory=person)(objectClass=user)(|(sAMAccountName=%[1]s)(userPrincipalName=%[1]s)(distinguishedName=%[1]s)))"
 }
 
 func (a MSADAdapter) SearchUserGroupsFilterTemplate() string {

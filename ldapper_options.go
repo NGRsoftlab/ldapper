@@ -1,7 +1,11 @@
 // Copyright 2020-2026 NGR Softlab
 package ldapper
 
-import "time"
+import (
+	"time"
+
+	"github.com/NGRsoftlab/ldapper/constants"
+)
 
 // Option configures optional LDAPper parameters.
 type Option func(*LDAPper)
@@ -18,8 +22,9 @@ type Option func(*LDAPper)
 //
 // MaxPages == 0 means "no page limit"; otherwise paged searches stop after
 // MaxPages successful pages and return ErrPartialResult together with the
-// entries collected so far. Guards against servers that never send an
-// empty paging cookie.
+// entries collected so far. Complements the seenCookies check: MaxPages
+// bounds the total work regardless of cookie behavior, while seenCookies
+// catches the specific A→B→A cycle that MaxPages would only stop late.
 //
 // MaxEntries == 0 means "no entry limit"; otherwise paged searches stop
 // after MaxEntries entries have been accumulated and return ErrPartialResult
@@ -34,24 +39,58 @@ type SearchLimits struct {
 	TimeLimit  int
 	MaxPages   int
 	MaxEntries int
+
+	// RequirePaging makes paged searches fail with ErrPartialResult when
+	// the server does not return a paging control. Without this flag the
+	// result is returned as-is, because a server that ignored paging may
+	// still have returned the complete set — the caller cannot tell.
+	//
+	// Enable this when completeness of the result is part of the contract
+	// (e.g., security decisions based on "user belongs to ALL groups").
+	RequirePaging bool
 }
 
-// WithSearchLimits overrides default search size/time limits applied to
-// every search request built by the connection. Negative values are clamped
-// to 0 ("no limit").
+// DefaultSearchLimits returns SearchLimits populated with the library
+// defaults: SizeLimit=0 (server default), TimeLimit=30, MaxPages=0,
+// MaxEntries=0 (no client-side budget).
 //
-// NB: SizeLimit is applied per request, so when combined with the
-// automatic paging (GetCatalogTree, GetOUUsers, ...), the total number of
-// returned entries will be SizeLimit * <number of pages>. Set to 0 to let
-// paging return the full result set.
-func WithSearchLimits(sizeLimit, timeLimit int) Option {
-	return func(conn *LDAPper) {
-		// NB: applied by NewLDAPper before the LDAPper is returned to caller;
-		// no concurrent access is possible at this point.
-		conn.searchLimits = normalizeSearchLimits(SearchLimits{
-			SizeLimit: sizeLimit,
-			TimeLimit: timeLimit,
-		})
+// Useful for building a SearchLimits value incrementally before passing it
+// to WithSearchLimits or SetSearchLimits:
+//
+//	limits := ldapper.DefaultSearchLimits()
+//	limits.SizeLimit = 500
+//	limits.MaxPages = 100
+//	conn, _ := ldapper.NewLDAPper(..., ldapper.WithSearchLimits(limits))
+//
+// The same pattern works after construction via GetSearchLimits /
+// SetSearchLimits.
+func DefaultSearchLimits() SearchLimits {
+	return SearchLimits{
+		SizeLimit:     constants.DefaultSearchSizeLimit,
+		TimeLimit:     constants.DefaultSearchTimeLimit,
+		MaxPages:      0,
+		MaxEntries:    0,
+		RequirePaging: false,
+	}
+}
+
+// WithSearchLimits replaces the entire connection-level search limits
+// structure. Negative fields are clamped to zero.
+//
+// NB: WithSearchLimits replaces the whole struct. Fields omitted in
+// `limits` get Go zero values, NOT the values from DefaultSearchLimits().
+// In particular, a zero TimeLimit means "no server-side time limit" —
+// pass DefaultSearchLimits() as the base if you want to keep the default
+// 30s limit:
+//
+//	limits := ldapper.DefaultSearchLimits()
+//	limits.SizeLimit = 100
+//	conn, _ := ldapper.NewLDAPper(..., ldapper.WithSearchLimits(limits))
+func WithSearchLimits(limits SearchLimits) Option {
+	return func(l *LDAPper) {
+		// NB: applied by NewLDAPper before the LDAPper is returned to
+		// caller; no concurrent access is possible at this point.
+		l.searchLimits = normalizeSearchLimits(limits)
 	}
 }
 
@@ -71,70 +110,21 @@ func normalizeSearchLimits(l SearchLimits) SearchLimits {
 	return l
 }
 
-// WithPagingLimits overrides the page-count and entry-count budgets applied
-// to every paged search (GetCatalogTree, GetOUUsers, GetUserGroups,
-// GetSubOUs, ListSingleLevelOUs, CustomSearchPaged). Zero values disable
-// the corresponding budget; negative values are clamped to zero.
-//
-// When a budget is exceeded, the search returns ErrPartialResult together
-// with the entries/pages collected so far. The error wraps the underlying
-// sentinel so errors.Is(err, ErrPartialResult) keeps working.
-func WithPagingLimits(maxPages, maxEntries int) Option {
-	return func(l *LDAPper) {
-		if maxPages < 0 {
-			maxPages = 0
-		}
-		if maxEntries < 0 {
-			maxEntries = 0
-		}
-		l.searchLimits.MaxPages = maxPages
-		l.searchLimits.MaxEntries = maxEntries
-	}
-}
-
-// SetSearchLimits overrides connection-level search limits at runtime.
-// Negative values are clamped to 0 ("no limit").
-func (ldapper *LDAPper) SetSearchLimits(sizeLimit, timeLimit int) {
-	ldapper.opMu.Lock()
-	defer ldapper.opMu.Unlock()
-
-	normalized := normalizeSearchLimits(SearchLimits{
-		SizeLimit: sizeLimit,
-		TimeLimit: timeLimit,
-	})
-
-	// Preserve paging budgets — they were set via WithPagingLimits or
-	// SetPagingLimits and are orthogonal to size/time limits.
-	ldapper.searchLimits.SizeLimit = normalized.SizeLimit
-	ldapper.searchLimits.TimeLimit = normalized.TimeLimit
-}
-
-// SetPagingLimits overrides the connection-level paging budgets at runtime.
-// Negative values are clamped to zero. Takes opMu, so safe to call
+// SetSearchLimits replaces the entire connection-level search limits at
+// runtime. Negative fields are clamped to zero. Takes opMu, so safe to call
 // concurrently with searches; the new values apply to the next request.
-func (ldapper *LDAPper) SetPagingLimits(maxPages, maxEntries int) {
+//
+// NB: this is a wholesale replacement — see WithSearchLimits for the
+// read-modify-write pattern when only a subset of fields should change.
+func (ldapper *LDAPper) SetSearchLimits(limits SearchLimits) {
 	ldapper.opMu.Lock()
 	defer ldapper.opMu.Unlock()
 
-	if maxPages < 0 {
-		maxPages = 0
-	}
-	if maxEntries < 0 {
-		maxEntries = 0
-	}
-
-	ldapper.searchLimits.MaxPages = maxPages
-	ldapper.searchLimits.MaxEntries = maxEntries
+	ldapper.searchLimits = normalizeSearchLimits(limits)
 }
 
-// GetPagingLimits returns the current connection-level paging budgets.
-func (ldapper *LDAPper) GetPagingLimits() (maxPages, maxEntries int) {
-	ldapper.opMu.Lock()
-	defer ldapper.opMu.Unlock()
-	return ldapper.searchLimits.MaxPages, ldapper.searchLimits.MaxEntries
-}
-
-// GetSearchLimits returns current connection-level search limits.
+// GetSearchLimits returns a copy of the current connection-level search
+// limits. Use together with SetSearchLimits for read-modify-write.
 func (ldapper *LDAPper) GetSearchLimits() SearchLimits {
 	ldapper.opMu.Lock()
 	defer ldapper.opMu.Unlock()
@@ -151,10 +141,7 @@ func WithDialTimeout(d time.Duration) Option {
 		// NB: negative is normalized to zero — same convention as search limits.
 		// NB: applied by NewLDAPper before the LDAPper is returned to caller;
 		// no concurrent access is possible at this point.
-		if d < 0 {
-			d = 0
-		}
-		l.dialTimeout = d
+		l.dialTimeout = normalizeDialTimeout(d)
 	}
 }
 
@@ -195,22 +182,27 @@ type OperationTimeouts struct {
 	Search time.Duration
 }
 
+func normalizeOperationTimeouts(t OperationTimeouts) OperationTimeouts {
+	if t.Bind < 0 {
+		t.Bind = 0
+	}
+	if t.Search < 0 {
+		t.Search = 0
+	}
+
+	return t
+}
+
 // WithOperationTimeout overrides connection-level client-side timeouts.
 // Negative durations are clamped to zero.
 //
-// The timeout is applied via LDAPConn.SetTimeout if the underlying
-// implementation supports it (production *ldap.Conn does; test mocks may
-// not). After the operation, the timeout is reset to zero so it does not
-// cap subsequent operations.
+// The timeout is applied via LDAPConn.SetTimeout, which is part of the
+// interface contract — every implementation, including mocks, must
+// support it. After the operation, the timeout is reset to zero so it
+// does not cap subsequent operations.
 func WithOperationTimeout(t OperationTimeouts) Option {
 	return func(l *LDAPper) {
-		if t.Bind < 0 {
-			t.Bind = 0
-		}
-		if t.Search < 0 {
-			t.Search = 0
-		}
-		l.opTimeouts = t
+		l.opTimeouts = normalizeOperationTimeouts(t)
 	}
 }
 
@@ -219,18 +211,14 @@ func WithOperationTimeout(t OperationTimeouts) Option {
 func (ldapper *LDAPper) SetOperationTimeout(t OperationTimeouts) {
 	ldapper.opMu.Lock()
 	defer ldapper.opMu.Unlock()
-	if t.Bind < 0 {
-		t.Bind = 0
-	}
-	if t.Search < 0 {
-		t.Search = 0
-	}
-	ldapper.opTimeouts = t
+
+	ldapper.opTimeouts = normalizeOperationTimeouts(t)
 }
 
 // GetOperationTimeout returns current connection-level client-side timeouts.
 func (ldapper *LDAPper) GetOperationTimeout() OperationTimeouts {
 	ldapper.opMu.Lock()
 	defer ldapper.opMu.Unlock()
+
 	return ldapper.opTimeouts
 }

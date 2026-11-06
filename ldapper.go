@@ -27,6 +27,7 @@ type LDAPper struct {
 	// mutable (guarded by opMu)
 	connection      interfaces.LDAPConn
 	isAuthenticated bool
+	closed          bool // set by Close; terminal — no reconnect allowed
 	bindUser        string
 	bindPassword    string
 	bindDN          string
@@ -44,12 +45,16 @@ type LDAPper struct {
 	tlsCfg         *tls.Config
 }
 
-// NB: supports many host alternatives, max hosts length = constants.DefaultMaxHostsLength (need it for 1mln same hosts protection, etc.)
+// NB: supports many host alternatives. Max hosts length is capped at
+// constants.DefaultMaxHostsLength to reject pathological inputs (e.g.
+// a caller programmatically generating a huge host list) before we
+// attempt sequential dialing against each.
 // NB: use WithSearchLimits(...) to override default size/time limits for all search requests.
 // NB: use WithDialTimeout(...) to override default dial timeout for connect/reconnect.
 // NB: skipTLS only affects plain LDAP connections: when false, StartTLS is
 // performed after Dial; when true, the connection stays in cleartext.
 // For LDAPS (useSSL=true) the flag has no effect.
+// NB: use useSSL=false with skipTLS=true only for dev/test purposes, not production
 func NewLDAPper(
 	hosts []string,
 	port uint,
@@ -91,24 +96,27 @@ func NewLDAPper(
 		return nil, fmt.Errorf("%w: nil catalog adapter", ErrInvalidArgument)
 	}
 
+	var clonedTLSCfg *tls.Config
+	if tlsCfg != nil {
+		clonedTLSCfg = tlsCfg.Clone()
+	}
+
 	ldapper := &LDAPper{
 		catalogAdapter: catalogAdapter,
-		hosts:          hosts,
+		hosts:          append([]string(nil), hosts...), // defensive copy
 		port:           port,
 		useSSL:         useSSL,
 		skipTLS:        skipTLS,
-		tlsCfg:         tlsCfg,
-		searchLimits: SearchLimits{
-			SizeLimit:  constants.DefaultSearchSizeLimit,
-			TimeLimit:  constants.DefaultSearchTimeLimit,
-			MaxPages:   0, // opt-in
-			MaxEntries: 0, // opt-in
-		},
-		dialTimeout: constants.DefaultDialTimeout,
-		opTimeouts:  OperationTimeouts{}, // 0/0 = disabled (backwards compatible)
+		tlsCfg:         clonedTLSCfg,
+		searchLimits:   DefaultSearchLimits(),
+		dialTimeout:    constants.DefaultDialTimeout,
+		opTimeouts:     OperationTimeouts{}, // 0/0 = disabled (backwards compatible)
 	}
 
 	for _, opt := range opts {
+		if opt == nil {
+			return nil, fmt.Errorf("%w: nil option", ErrInvalidArgument)
+		}
 		opt(ldapper)
 	}
 
@@ -121,9 +129,11 @@ func NewLDAPper(
 }
 
 // NB: if you need connection for futher catalog reading - pass read access granted user credentials here
-// NB: supports many host alternatives, max hosts length = constants.DefaultMaxHostsLength (need it for 1mln same hosts protection, etc.)
+// NB: hosts and TLS config are validated and copied by NewLDAPper; see its
+// doc comment for the host count limit and TLS mode semantics.
 // NB: use WithSearchLimits(...) to override default size/time limits for all search requests.
 // NB: use WithDialTimeout(...) to override default dial timeout for connect/reconnect.
+// NB: use useSSL=false with skipTLS=true only for dev/test purposes, not production
 func NewAuthenticatedLDAPper(
 	username, password, baseDN string,
 	hosts []string,

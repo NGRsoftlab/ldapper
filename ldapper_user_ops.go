@@ -58,7 +58,7 @@ func (ldapper *LDAPper) getUserGroupsLocked(username, baseDN string) ([]string, 
 		filter, []string{"1.1"}, nil,
 	)
 	if err != nil {
-		return nil, fmt.Errorf("unsuccessful user groups search: %w", classifyLDAPError(err))
+		return nil, fmt.Errorf("user groups search: %w", classifyLDAPError(err))
 	}
 
 	groups := make([]string, 0, len(entries))
@@ -92,19 +92,15 @@ func (ldapper *LDAPper) getOUUsersLocked(ouDN string) ([]*types.LDAPUser, error)
 		filter, attributes, nil,
 	)
 	if err != nil {
-		return nil, fmt.Errorf("unsuccessful ou users search: %w", classifyLDAPError(err))
+		return nil, fmt.Errorf("ou users search: %w", classifyLDAPError(err))
 	}
 
 	res := make([]*types.LDAPUser, 0, len(entries))
 	for _, entry := range entries {
-		user := &types.LDAPUser{
+		res = append(res, &types.LDAPUser{
 			DN:         entry.DN,
-			Attributes: map[string][]string{},
-		}
-		for _, attr := range attributes {
-			user.Attributes[attr] = entry.GetAttributeValues(attr)
-		}
-		res = append(res, user)
+			Attributes: attrsToMap(entry, attributes),
+		})
 	}
 
 	return res, nil

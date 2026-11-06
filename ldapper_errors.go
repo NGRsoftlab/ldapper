@@ -45,7 +45,8 @@ func isTimeoutError(err error) bool {
 		errors.Is(err, os.ErrDeadlineExceeded) {
 		return true
 	}
-	if netErr, ok := errors.AsType[net.Error](err); ok && netErr.Timeout() {
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
 		return true
 	}
 	return false
@@ -60,21 +61,21 @@ func isTransportError(err error) bool {
 	if err == nil {
 		return false
 	}
-	if isTimeoutError(err) {
-		return true
-	}
 	switch {
 	case errors.Is(err, io.EOF),
 		errors.Is(err, io.ErrUnexpectedEOF),
-		errors.Is(err, net.ErrClosed):
+		errors.Is(err, net.ErrClosed),
+		errors.Is(err, context.DeadlineExceeded),
+		errors.Is(err, os.ErrDeadlineExceeded):
 		return true
 	}
-	// Any net.Error (including *net.OpError): Dial/Read/Write failures.
-	if _, ok := errors.AsType[net.Error](err); ok {
+	// Any net.Error (including *net.OpError and timeout wrappers).
+	var netErr net.Error
+	if errors.As(err, &netErr) {
 		return true
 	}
-	// Underlying syscall errors from read/write: ECONNRESET, EPIPE, etc.
-	if _, ok := errors.AsType[*os.SyscallError](err); ok {
+	var syscallErr *os.SyscallError
+	if errors.As(err, &syscallErr) {
 		return true
 	}
 	return false
@@ -143,9 +144,13 @@ func classifySensitiveBindError(err error) error {
 		return ErrInsufficientAccess
 	}
 
+	// Handle net.ErrClosed before the general transport check so callers can
+	// distinguish "connection was closed" from "connection failed".
 	if errors.Is(err, net.ErrClosed) {
 		return ErrClosed
 	}
+
+	// Network-layer failures are safe to expose: they don't echo credentials.
 	if isTransportError(err) {
 		if isTimeoutError(err) {
 			return ErrTimeout
@@ -153,7 +158,6 @@ func classifySensitiveBindError(err error) error {
 		return ErrUnavailable
 	}
 
-	// Unknown bind failure — treat as credential rejection without leaking
-	// server-side details.
+	// LDAPResultOther and unknown codes: mask as credential rejection.
 	return ErrInvalidCredentials
 }

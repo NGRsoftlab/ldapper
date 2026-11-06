@@ -12,6 +12,9 @@ import (
 // requireConnLocked returns ErrClosed if no live connection object exists.
 // Caller must hold opMu.
 func (ldapper *LDAPper) requireConnLocked() error {
+	if ldapper.closed {
+		return fmt.Errorf("%w: client is closed", ErrClosed)
+	}
 	if ldapper.connection == nil {
 		return fmt.Errorf("%w: connection not initialized", ErrClosed)
 	}

@@ -33,6 +33,7 @@ type LDAPper struct {
 	currentHost     string
 	searchLimits    SearchLimits
 	dialTimeout     time.Duration // 0 = no explicit timeout (Go default)
+	opTimeouts      OperationTimeouts
 
 	// immutable after construction
 	catalogAdapter interfaces.CatalogAdapter
@@ -98,10 +99,13 @@ func NewLDAPper(
 		skipTLS:        skipTLS,
 		tlsCfg:         tlsCfg,
 		searchLimits: SearchLimits{
-			SizeLimit: constants.DefaultSearchSizeLimit,
-			TimeLimit: constants.DefaultSearchTimeLimit,
+			SizeLimit:  constants.DefaultSearchSizeLimit,
+			TimeLimit:  constants.DefaultSearchTimeLimit,
+			MaxPages:   0, // opt-in
+			MaxEntries: 0, // opt-in
 		},
 		dialTimeout: constants.DefaultDialTimeout,
+		opTimeouts:  OperationTimeouts{}, // 0/0 = disabled (backwards compatible)
 	}
 
 	for _, opt := range opts {

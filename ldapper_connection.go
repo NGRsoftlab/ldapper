@@ -13,6 +13,39 @@ import (
 	"github.com/NGRsoftlab/ldapper/interfaces"
 )
 
+// withTimeout runs fn with the given client-side timeout applied to the
+// LDAP connection. The timeout is set before the call and reset to zero
+// afterwards regardless of the result, so it cannot silently cap subsequent
+// operations. If timeout <= 0, fn is called without touching the socket.
+//
+// Caller must hold opMu (or be inside a path where the connection is
+// exclusively owned, e.g. constructor).
+func (ldapper *LDAPper) withTimeout(timeout time.Duration, fn func() error) error {
+	if timeout <= 0 {
+		return fn()
+	}
+	st, ok := ldapper.connection.(interface{ SetTimeout(time.Duration) })
+	if !ok {
+		return fn()
+	}
+	st.SetTimeout(timeout)
+	defer st.SetTimeout(0)
+	return fn()
+}
+
+func (ldapper *LDAPper) withTimeoutResult(timeout time.Duration, fn func() (*ldap.SearchResult, error)) (*ldap.SearchResult, error) {
+	if timeout <= 0 {
+		return fn()
+	}
+	st, ok := ldapper.connection.(interface{ SetTimeout(time.Duration) })
+	if !ok {
+		return fn()
+	}
+	st.SetTimeout(timeout)
+	defer st.SetTimeout(0)
+	return fn()
+}
+
 // connectLocked tries every configured host and stores the first successful
 // connection. Caller must hold opMu (or be inside the constructor, before
 // the object is published).
@@ -119,11 +152,11 @@ func (ldapper *LDAPper) isAliveLocked() bool {
 		nil,
 	)
 
-	if _, err := ldapper.connection.Search(req); err != nil {
-		return false
-	}
+	_, err := ldapper.withTimeoutResult(ldapper.opTimeouts.Search, func() (*ldap.SearchResult, error) {
+		return ldapper.connection.Search(req)
+	})
 
-	return true
+	return err == nil
 }
 
 // Reconnect closes the current connection and tries to establish a new one
@@ -188,3 +221,5 @@ func (ldapper *LDAPper) Close() {
 	ldapper.connection = nil
 	ldapper.invalidateAuthLocked()
 }
+
+// TODO: add ForceClose for emergency operation stops

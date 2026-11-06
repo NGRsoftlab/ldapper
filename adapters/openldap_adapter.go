@@ -56,7 +56,7 @@ func (a OPENLDAPAdapter) UserObjectFilter() string {
 // SEARCH
 
 func (a OPENLDAPAdapter) SearchUserFilterTemplate() string {
-	return "(&(!(objectClass=computer))(|(uid=%[1]s)(entryDN=%[1]s)))"
+	return "(&(objectClass=person)(|(uid=%[1]s)(entryDN=%[1]s)))"
 }
 
 func (a OPENLDAPAdapter) SearchUserGroupsFilterTemplate() string {

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/go-ldap/ldap/v3"
 
@@ -315,6 +316,25 @@ func TestAuthenticateConn(t *testing.T) {
 		if ac.searchCalls != 0 || ac.bindCalls != 0 {
 			t.Fatalf("no I/O must be issued after post-bind lookup failure: search=%d bind=%d",
 				ac.searchCalls, ac.bindCalls)
+		}
+	})
+
+	t.Run("Bind applies configured timeout", func(t *testing.T) {
+		var observed []time.Duration
+		ac := newAuthConn(nil, func(_ int, _, _ string) error { return nil })
+		// Wrap MockLDAPConn to observe SetTimeout calls.
+		ac.mock.SetTimeoutFunc = func(d time.Duration) { observed = append(observed, d) }
+
+		l := &LDAPper{
+			connection:     ac.mock,
+			catalogAdapter: simpleUserAdapter(),
+			opTimeouts:     OperationTimeouts{Bind: 7 * time.Second},
+		}
+		_, _ = l.AuthenticateConn(user, pass, baseDN)
+
+		// Expect: set 7s before Bind, reset to 0 after.
+		if len(observed) != 2 || observed[0] != 7*time.Second || observed[1] != 0 {
+			t.Fatalf("SetTimeout calls = %v, want [7s 0]", observed)
 		}
 	})
 }

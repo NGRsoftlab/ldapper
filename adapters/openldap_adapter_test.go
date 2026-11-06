@@ -246,12 +246,12 @@ func TestOPENLDAPAdapter_SearchUserFilterTemplate(t *testing.T) {
 	tmpl := OPENLDAPAdapter{}.SearchUserFilterTemplate()
 
 	assert.Equal(t,
-		"(&(!(objectClass=computer))(|(uid=%[1]s)(entryDN=%[1]s)))",
+		"(&(objectClass=person)(|(uid=%[1]s)(entryDN=%[1]s)))",
 		tmpl,
 	)
 	// Computer objects must be excluded, otherwise workstations and servers
 	// could be returned as users.
-	assert.Contains(t, tmpl, "(!(objectClass=computer))",
+	assert.Contains(t, tmpl, "(objectClass=person)",
 		"computers must be excluded from the user search")
 }
 
@@ -262,7 +262,7 @@ func TestOPENLDAPAdapter_SearchUserFilterTemplate_FormatsIndexedPlaceholder(t *t
 	filter := fmt.Sprintf(tmpl, "jdoe")
 
 	assert.Equal(t,
-		"(&(!(objectClass=computer))(|(uid=jdoe)(entryDN=jdoe)))",
+		"(&(objectClass=person)(|(uid=jdoe)(entryDN=jdoe)))",
 		filter,
 	)
 	assert.NotContains(t, filter, "%", "no unresolved placeholders should remain")

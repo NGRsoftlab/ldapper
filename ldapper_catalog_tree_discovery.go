@@ -3,7 +3,6 @@ package ldapper
 
 import (
 	"fmt"
-	"strings"
 
 	"github.com/go-ldap/ldap/v3"
 
@@ -43,10 +42,13 @@ func (ldapper *LDAPper) getCatalogTreeLocked(baseDN string, maxDepth int) (types
 		return res, fmt.Errorf("unsuccessful ou search: %w", classifyLDAPError(err))
 	}
 
-	// NB: keys are lowercased so that DN comparisons are case-insensitive,
-	// matching ldap.DN.AncestorOf behavior.
+	// NB: keys are canonicalized via canonicalDN so that equivalent DNs
+	// (different case, different escape sequences, different attribute
+	// order within a multi-valued RDN, insignificant whitespace) map to the
+	// same tree node. See helpers.go:canonicalDN for the equality model.
 	byDN := make(map[string]*types.OUNormalizedInfo, len(allEntries))
 	order := make([]string, 0, len(allEntries)) // preserves server order
+	seen := make(map[string]struct{}, len(allEntries))
 
 	for _, e := range allEntries {
 		info := ldapper.catalogAdapter.GetNormalizedOUInfoFromEntry(*e)
@@ -61,13 +63,20 @@ func (ldapper *LDAPper) getCatalogTreeLocked(baseDN string, maxDepth int) (types
 			// Skips both the base DN itself and any entries outside baseDN.
 			continue
 		}
-		byDN[strings.ToLower(info.DN)] = info
-		order = append(order, info.DN)
+		key := canonicalDN(info.DN)
+		if _, dup := seen[key]; dup {
+			// Two entries whose DNs are equivalent under canonicalDN.
+			// The tree can only hold one — keep the first, drop the rest.
+			continue
+		}
+		seen[key] = struct{}{}
+		byDN[key] = info
+		order = append(order, key)
 	}
 
-	for _, dnItem := range order {
-		info := byDN[strings.ToLower(dnItem)]
-		parentKey := strings.ToLower(parentDNOf(info.DN))
+	for _, key := range order {
+		info := byDN[key]
+		parentKey := canonicalDN(parentDNOf(info.DN))
 		if parent, ok := byDN[parentKey]; ok {
 			parent.Children = append(parent.Children, info)
 		} else {
@@ -100,8 +109,6 @@ func (ldapper *LDAPper) getSubOUsLocked(parentDN string, scope int) ([]*types.OU
 	switch scope {
 	case ldap.ScopeSingleLevel, ldap.ScopeWholeSubtree:
 	case ldap.ScopeBaseObject:
-		// NB: GetSubOUs returns descendants only, so ScopeBaseObject would
-		// always yield an empty list. Reject it explicitly.
 		return nil, fmt.Errorf("%w: ScopeBaseObject is not supported by GetSubOUs", ErrInvalidArgument)
 	default:
 		return nil, fmt.Errorf("%w: invalid scope %d", ErrInvalidArgument, scope)
@@ -111,6 +118,7 @@ func (ldapper *LDAPper) getSubOUsLocked(parentDN string, scope int) ([]*types.OU
 	if err != nil {
 		return nil, fmt.Errorf("%w: invalid DN %q: %v", ErrInvalidArgument, parentDN, err)
 	}
+	parentKey := canonicalDN(parentParsed.String())
 
 	entries, err := ldapper.searchPaged(
 		parentParsed.String(), scope, ldap.NeverDerefAliases, false,
@@ -122,12 +130,23 @@ func (ldapper *LDAPper) getSubOUsLocked(parentDN string, scope int) ([]*types.OU
 	}
 
 	res := make([]*types.OUNormalizedInfo, 0, len(entries))
+	seen := make(map[string]struct{}, len(entries))
 	for _, entry := range entries {
 		info := ldapper.catalogAdapter.GetNormalizedOUInfoFromEntry(*entry)
-		if info == nil || info.DN == parentParsed.String() {
-			// Base DN itself is excluded: "sub" means descendants only.
+		if info == nil {
 			continue
 		}
+		key := canonicalDN(info.DN)
+		if key == parentKey {
+			// Base DN itself is excluded: "sub" means descendants only.
+			// Canonical comparison handles case/escaping differences between
+			// the caller-supplied parentDN and the server-returned DN.
+			continue
+		}
+		if _, dup := seen[key]; dup {
+			continue
+		}
+		seen[key] = struct{}{}
 		res = append(res, info)
 	}
 

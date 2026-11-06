@@ -48,7 +48,10 @@ func (ldapper *LDAPper) searchSingleEntryLocked(
 		2, ldapper.searchLimits.TimeLimit, false, filter, attributes, nil,
 	)
 
-	res, err := ldapper.connection.Search(req)
+	// searchSingleEntryLocked — around the Search call:
+	res, err := ldapper.withTimeoutResult(ldapper.opTimeouts.Search, func() (*ldap.SearchResult, error) {
+		return ldapper.connection.Search(req)
+	})
 	if err != nil {
 		return nil, fmt.Errorf("unsuccessful %s search: %w", kind, classifyLDAPError(err))
 	}
@@ -87,12 +90,20 @@ func (ldapper *LDAPper) newSearchRequest(
 }
 
 // searchPaged executes a search and follows the paging control until all
-// pages have been retrieved. If the server does not honor paging, it silently
-// falls back to a single search result.
+// pages have been retrieved. If the server does not honor paging, it
+// silently falls back to a single search result.
 //
-// Caller must hold opMu. The lock is held across all pages because the paging
-// cookie is bound to the current connection and interleaving with other
-// operations would corrupt the protocol stream.
+// Caller must hold opMu. The lock is held across all pages because the
+// paging cookie is bound to the current connection and interleaving with
+// other operations would corrupt the protocol stream.
+//
+// Budgets:
+//   - MaxPages   bounds the number of successful Search calls. When exceeded,
+//     returns ErrPartialResult + entries collected so far.
+//   - MaxEntries bounds the total accumulated entries. When exceeded,
+//     returns ErrPartialResult + the truncated slice.
+//   - Repeated non-empty cookies are treated as a runaway server and cause
+//     an early return with ErrPartialResult.
 func (ldapper *LDAPper) searchPaged(
 	baseDN string,
 	scope int,
@@ -118,25 +129,49 @@ func (ldapper *LDAPper) searchPaged(
 	pageControls = append(pageControls, controls...)
 	pageControls = append(pageControls, pagingControl)
 
-	var allEntries []*ldap.Entry
+	var (
+		allEntries  []*ldap.Entry
+		pageCount   int
+		seenCookies = make(map[string]struct{})
+	)
 
 	for {
-		req := ldapper.newSearchRequest(baseDN, scope, derefAliases, typesOnly, filter, attributes, pageControls)
+		pageCount++
+		if maximum := ldapper.searchLimits.MaxPages; maximum > 0 && pageCount > maximum {
+			return allEntries, fmt.Errorf("%w: page budget exceeded (%d pages)",
+				ErrPartialResult, pageCount-1)
+		}
 
-		result, err := ldapper.connection.Search(req)
+		req := ldapper.newSearchRequest(baseDN, scope, derefAliases, typesOnly,
+			filter, attributes, pageControls)
+
+		result, err := ldapper.withTimeoutResult(ldapper.opTimeouts.Search, func() (*ldap.SearchResult, error) {
+			return ldapper.connection.Search(req)
+		})
 		if err != nil {
-			// NB: paging is honored by most servers; when it is not and the server
-			// returns a size-limit error, preserve what we already fetched so callers
-			// can decide how to proceed.
-			if ldap.IsErrorWithCode(err, ldap.LDAPResultSizeLimitExceeded) && len(allEntries) > 0 {
-				return allEntries, fmt.Errorf("%w: %w", ErrPartialResult, err)
+			// NB: paging is honored by most servers; when it is not and the
+			// server returns a size-limit error, preserve what we already
+			// fetched so callers can decide how to proceed.
+			if ldap.IsErrorWithCode(err, ldap.LDAPResultSizeLimitExceeded) {
+				if len(allEntries) > 0 {
+					return allEntries, fmt.Errorf("%w: %w", ErrPartialResult, err)
+				}
+				return nil, fmt.Errorf("%w: %w", ErrPartialResult, err)
 			}
 			return nil, err
 		}
 
 		allEntries = append(allEntries, result.Entries...)
 
-		// The server echoes the paging control back; extract the next cookie.
+		if maximum := ldapper.searchLimits.MaxEntries; maximum > 0 && len(allEntries) > maximum {
+			// Truncate to the budget and signal the loss. The caller can
+			// still inspect the partial slice; the server-side cursor is
+			// abandoned with the connection (no rollback required).
+			return allEntries[:maximum], fmt.Errorf(
+				"%w: entry budget exceeded (%d > %d)",
+				ErrPartialResult, len(allEntries), maximum)
+		}
+
 		ctrl := ldap.FindControl(result.Controls, ldap.ControlTypePaging)
 		if ctrl == nil {
 			break // server did not honor paging: single page, done
@@ -147,10 +182,20 @@ func (ldapper *LDAPper) searchPaged(
 			break // unexpected control type: stop rather than loop forever
 		}
 
-		pagingControl.SetCookie(next.Cookie)
 		if len(next.Cookie) == 0 {
 			break // empty cookie = last page
 		}
+
+		// NB: a repeated non-empty cookie means the server is not making
+		// progress. Treat it as a runaway response and return what we have.
+		key := string(next.Cookie)
+		if _, dup := seenCookies[key]; dup {
+			return allEntries, fmt.Errorf(
+				"%w: paging server returned a repeated cookie", ErrPartialResult)
+		}
+		seenCookies[key] = struct{}{}
+
+		pagingControl.SetCookie(next.Cookie)
 	}
 
 	return allEntries, nil
@@ -194,7 +239,9 @@ func (ldapper *LDAPper) CustomSearch(searchRequest *ldap.SearchRequest) (*ldap.S
 		return nil, fmt.Errorf("%w: nil search request", ErrInvalidArgument)
 	}
 
-	res, err := ldapper.connection.Search(searchRequest)
+	res, err := ldapper.withTimeoutResult(ldapper.opTimeouts.Search, func() (*ldap.SearchResult, error) {
+		return ldapper.connection.Search(searchRequest)
+	})
 	if err != nil {
 		return nil, fmt.Errorf("custom search: %w", classifyLDAPError(err))
 	}

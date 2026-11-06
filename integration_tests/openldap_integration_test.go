@@ -814,3 +814,28 @@ func TestIntegrationOpenLDAP_Reconnect_RebindFailure_ClosesConnection(t *testing
 	require.Error(t, err)
 	assert.True(t, errors.Is(err, ldapper.ErrNotAuthenticated))
 }
+
+func TestIntegrationOpenLDAP_GetOUUsers_MaxPagesBudget(t *testing.T) {
+	// 4 users, page size 1000 -> one page normally; but MaxPages=1 with
+	// multiple pages can be forced by lowering DefaultCatalogSearchPageSize
+	// (not currently configurable) or by having many entries. Instead, we
+	// verify the limit does not break normal operation and that setting
+	// MaxPages to 0 keeps the previous behaviour.
+	conn := newOpenLDAPAuthConn(t, ldapper.WithPagingLimits(0, 0))
+	_, err := conn.GetOUUsers("ou=users," + openldapBaseDN)
+	require.NoError(t, err)
+}
+
+func TestIntegrationOpenLDAP_OperationTimeout_Search(t *testing.T) {
+	// Bind a very aggressive timeout; on a healthy local container, normal
+	// operations should still succeed. This test's purpose is to prove that
+	// applying SetTimeout does not break normal operations.
+	conn := newOpenLDAPAuthConn(t,
+		ldapper.WithOperationTimeout(ldapper.OperationTimeouts{
+			Bind:   5 * time.Second,
+			Search: 5 * time.Second,
+		}))
+
+	_, err := conn.GetUser(openldapUser1UID, openldapBaseDN)
+	require.NoError(t, err)
+}

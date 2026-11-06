@@ -260,6 +260,55 @@ func TestGetCatalogTree(t *testing.T) {
 			t.Fatalf("errors.Is(%v, ErrUnavailable) = false", err)
 		}
 	})
+
+	t.Run("parent-child linked across escape differences", func(t *testing.T) {
+		// Server may return the parent and child with different escape forms
+		// for the same underlying value. Both must end up as one node with the
+		// child attached, not as two roots.
+		parent := newLDAPEntry(`ou=Sales\, Inc,dc=example,dc=com`, nil)
+		child := newLDAPEntry(`ou=EMEA,ou=Sales\2c Inc,dc=example,dc=com`, nil)
+		l := &LDAPper{connection: mockOUs(parent, child), catalogAdapter: ouTreeAdapter()}
+		tree, err := l.GetCatalogTree(baseDN, 0)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(tree.Tree) != 1 {
+			t.Fatalf("expected 1 root, got %d: %+v", len(tree.Tree), tree.Tree)
+		}
+		if len(tree.Tree[0].Children) != 1 {
+			t.Fatalf("child not linked to parent: %+v", tree.Tree[0].Children)
+		}
+	})
+
+	t.Run("multi-valued RDN order does not break linkage", func(t *testing.T) {
+		// The server can return multi-valued RDNs in any order; the two
+		// representations must canonicalize to the same key.
+		parent := newLDAPEntry("cn=Alice+sn=Smith,dc=example,dc=com", nil)
+		child := newLDAPEntry("ou=EMEA,sn=Smith+cn=Alice,dc=example,dc=com", nil)
+		l := &LDAPper{connection: mockOUs(parent, child), catalogAdapter: ouTreeAdapter()}
+		tree, err := l.GetCatalogTree(baseDN, 0)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(tree.Tree) != 1 || len(tree.Tree[0].Children) != 1 {
+			t.Fatalf("hierarchy broken: %+v", tree.Tree)
+		}
+	})
+
+	t.Run("duplicate canonical DN yields a single node", func(t *testing.T) {
+		// Two server entries whose DNs differ only in case/escape. Only one
+		// should appear in the tree.
+		e1 := newLDAPEntry("ou=Sales,dc=example,dc=com", nil)
+		e2 := newLDAPEntry("OU=Sales,DC=example,DC=com", nil)
+		l := &LDAPper{connection: mockOUs(e1, e2), catalogAdapter: ouTreeAdapter()}
+		tree, err := l.GetCatalogTree(baseDN, 0)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(tree.Tree) != 1 {
+			t.Fatalf("expected 1 root (duplicates merged), got %d: %+v", len(tree.Tree), tree.Tree)
+		}
+	})
 }
 
 // ---------- GetSubOUs / ListSingleLevelOUs ----------
@@ -348,6 +397,28 @@ func TestGetSubOUs(t *testing.T) {
 		_, err := l.GetSubOUs(baseDN, ldap.ScopeSingleLevel)
 		if !errors.Is(err, ErrUnavailable) {
 			t.Fatalf("errors.Is(%v, ErrUnavailable) = false", err)
+		}
+	})
+
+	t.Run("base DN excluded with case and escape differences", func(t *testing.T) {
+		base := newLDAPEntry("OU=Sales,DC=example,DC=com", nil) // case-different
+		child := newLDAPEntry(`ou=EMEA,OU=Sales\2c Inc,dc=x`, nil)
+		_ = base
+		_ = child
+
+		// Craft a scenario where the server returns the base DN in a different
+		// case than the caller supplied.
+		serverBase := newLDAPEntry("OU=Sales,dc=example,dc=com", nil)
+		l := &LDAPper{
+			connection:     mockOUs(serverBase),
+			catalogAdapter: ouTreeAdapter(),
+		}
+		ous, err := l.GetSubOUs("ou=sales,dc=example,dc=com", ldap.ScopeWholeSubtree)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(ous) != 0 {
+			t.Fatalf("base DN must be excluded despite case difference, got %+v", ous)
 		}
 	})
 }

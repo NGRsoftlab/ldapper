@@ -329,3 +329,103 @@ func TestTrimDepth_DoesNotMutateSource(t *testing.T) {
 		t.Fatalf("original grandchild mutated: len = %d, want 1", len(src[0].Children[0].Children))
 	}
 }
+
+// --------- TestCanonicalDN ---------- //
+
+func TestCanonicalDN(t *testing.T) {
+	tests := []struct {
+		name string
+		a, b string
+		want bool // true = same canonical key
+	}{
+		{
+			name: "case-insensitive types and values",
+			a:    "OU=Sales,DC=Example,DC=com",
+			b:    "ou=sales,dc=example,dc=com",
+			want: true,
+		},
+		{
+			name: "different escape sequences for the same value",
+			a:    `ou=Sales\, Inc,dc=x`,
+			b:    `ou=Sales\2c Inc,dc=x`,
+			want: true,
+		},
+		{
+			name: "multi-valued RDN reordered",
+			a:    "cn=Alice+sn=Smith,dc=x",
+			b:    "sn=Smith+cn=Alice,dc=x",
+			want: true,
+		},
+		{
+			name: "insignificant trailing whitespace in value",
+			a:    "ou=Sales ,dc=x",
+			b:    "ou=Sales,dc=x",
+			want: true,
+		},
+		{
+			name: "different value",
+			a:    "ou=Sales,dc=x",
+			b:    "ou=Marketing,dc=x",
+			want: false,
+		},
+		{
+			name: "different RDN depth",
+			a:    "ou=Sales,dc=x",
+			b:    "ou=EMEA,ou=Sales,dc=x",
+			want: false,
+		},
+		{
+			name: "different base",
+			a:    "ou=Sales,dc=x",
+			b:    "ou=Sales,dc=y",
+			want: false,
+		},
+		{
+			name: "empty DNs both empty",
+			a:    "",
+			b:    "",
+			want: true,
+		},
+		{
+			name: "empty vs non-empty",
+			a:    "",
+			b:    "dc=x",
+			want: false,
+		},
+		{
+			name: "malformed falls back to lowercased raw",
+			a:    "not a dn",
+			b:    "NOT A DN",
+			want: true, // both malformed -> strings.ToLower fallback
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ka := canonicalDN(tc.a)
+			kb := canonicalDN(tc.b)
+			if (ka == kb) != tc.want {
+				t.Fatalf("canonicalDN(%q)=%q, canonicalDN(%q)=%q, want equal=%v",
+					tc.a, ka, tc.b, kb, tc.want)
+			}
+		})
+	}
+}
+
+// TestCanonicalDN_StableAcrossInvocations guards against non-determinism
+// (map iteration, sort instability).
+func TestCanonicalDN_Stable(t *testing.T) {
+	inputs := []string{
+		"OU=Sales,DC=Example,DC=com",
+		`ou=Sales\, Inc,ou=EMEA,dc=x`,
+		"cn=Alice+sn=Smith+ou=People,dc=x",
+	}
+	for _, in := range inputs {
+		first := canonicalDN(in)
+		for i := 0; i < 100; i++ {
+			if got := canonicalDN(in); got != first {
+				t.Fatalf("canonicalDN(%q) unstable: %q vs %q", in, first, got)
+			}
+		}
+	}
+}

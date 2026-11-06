@@ -207,3 +207,72 @@ func TestDialTimeout_ConcurrentSetGet(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+func TestWithPagingLimits(t *testing.T) {
+	t.Run("positive applied", func(t *testing.T) {
+		l := &LDAPper{}
+		WithPagingLimits(100, 50000)(l)
+		if l.searchLimits.MaxPages != 100 || l.searchLimits.MaxEntries != 50000 {
+			t.Fatalf("limits = %+v", l.searchLimits)
+		}
+	})
+	t.Run("negative clamped", func(t *testing.T) {
+		l := &LDAPper{}
+		WithPagingLimits(-1, -1)(l)
+		if l.searchLimits.MaxPages != 0 || l.searchLimits.MaxEntries != 0 {
+			t.Fatalf("limits = %+v", l.searchLimits)
+		}
+	})
+}
+
+func TestSetGetPagingLimits(t *testing.T) {
+	l := &LDAPper{}
+	l.SetPagingLimits(50, 10000)
+	maxPages, maxEntries := l.GetPagingLimits()
+	if maxPages != 50 || maxEntries != 10000 {
+		t.Fatalf("got %d/%d", maxPages, maxEntries)
+	}
+	l.SetPagingLimits(-1, -1)
+	maxPages, maxEntries = l.GetPagingLimits()
+	if maxPages != 0 || maxEntries != 0 {
+		t.Fatalf("negative not clamped: %d/%d", maxPages, maxEntries)
+	}
+}
+
+func TestPagingLimits_ConcurrentSetGet(t *testing.T) {
+	l := &LDAPper{}
+	var wg sync.WaitGroup
+	for i := 0; i < 200; i++ {
+		n := i
+		wg.Add(2)
+		go func() { defer wg.Done(); l.SetPagingLimits(n, n*100) }()
+		go func() { defer wg.Done(); _, _ = l.GetPagingLimits() }()
+	}
+	wg.Wait()
+}
+
+func TestWithOperationTimeout(t *testing.T) {
+	t.Run("positive applied", func(t *testing.T) {
+		l := &LDAPper{}
+		WithOperationTimeout(OperationTimeouts{Bind: 5 * time.Second, Search: 30 * time.Second})(l)
+		if l.opTimeouts.Bind != 5*time.Second || l.opTimeouts.Search != 30*time.Second {
+			t.Fatalf("opTimeouts = %+v", l.opTimeouts)
+		}
+	})
+	t.Run("negative clamped", func(t *testing.T) {
+		l := &LDAPper{}
+		WithOperationTimeout(OperationTimeouts{Bind: -1, Search: -1})(l)
+		if l.opTimeouts.Bind != 0 || l.opTimeouts.Search != 0 {
+			t.Fatalf("opTimeouts = %+v", l.opTimeouts)
+		}
+	})
+}
+
+func TestSetGetOperationTimeout(t *testing.T) {
+	l := &LDAPper{}
+	l.SetOperationTimeout(OperationTimeouts{Bind: 2 * time.Second, Search: 10 * time.Second})
+	got := l.GetOperationTimeout()
+	if got.Bind != 2*time.Second || got.Search != 10*time.Second {
+		t.Fatalf("got %+v", got)
+	}
+}

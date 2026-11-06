@@ -3,17 +3,25 @@ package mocks
 
 import (
 	"crypto/tls"
+	"time"
 
 	"github.com/go-ldap/ldap/v3"
 )
 
 // NB: update this mock if the interface gains new methods.
 type MockLDAPConn struct {
-	BindFunc      func(username, password string) error
-	SearchFunc    func(req *ldap.SearchRequest) (*ldap.SearchResult, error)
-	CloseFunc     func() error
-	IsClosingFunc func() bool
-	StartTLSFunc  func(config *tls.Config) error
+	BindFunc       func(username, password string) error
+	SearchFunc     func(req *ldap.SearchRequest) (*ldap.SearchResult, error)
+	SetTimeoutFunc func(d time.Duration)
+	CloseFunc      func() error
+	IsClosingFunc  func() bool
+	StartTLSFunc   func(config *tls.Config) error
+}
+
+func (m *MockLDAPConn) SetTimeout(d time.Duration) {
+	if m.SetTimeoutFunc != nil {
+		m.SetTimeoutFunc(d)
+	}
 }
 
 func (m *MockLDAPConn) Bind(u, p string) error {

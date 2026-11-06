@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/go-ldap/ldap/v3"
 
@@ -285,6 +286,25 @@ func TestSearchSingleEntryLocked(t *testing.T) {
 			t.Fatalf("time limit = %d, want 15 (from searchLimits)", cm.calls[0].timeLimit)
 		}
 	})
+
+	t.Run("Search applies configured timeout per call", func(t *testing.T) {
+		var observed []time.Duration
+		cm := newCaptureMock(t, pagedPage{})
+		// Wrap mock: capture SetTimeout.
+		// NB: captureMock wraps MockLDAPConn, so add a SetTimeoutFunc hook to it.
+		cm.mock.SetTimeoutFunc = func(d time.Duration) { observed = append(observed, d) }
+
+		l := newLDAPperWithCapture(cm)
+		l.catalogAdapter = &fakeAdapter{
+			userFilterTemplate: "(uid=%s)",
+			userAttrs:          []string{"uid"},
+		}
+		l.opTimeouts = OperationTimeouts{Search: 5 * time.Second}
+		_, _ = l.searchSingleEntryLocked(kindUser, "alice", "dc=x", "(uid=%s)", []string{"uid"})
+		if len(observed) != 2 || observed[0] != 5*time.Second || observed[1] != 0 {
+			t.Fatalf("SetTimeout calls = %v", observed)
+		}
+	})
 }
 
 // ---------- searchPaged ----------
@@ -484,30 +504,101 @@ func TestSearchPaged(t *testing.T) {
 		}
 	})
 
-	t.Run("size-limit exceeded on first page: nil entries, raw error", func(t *testing.T) {
-		raw := &ldap.Error{ResultCode: ldap.LDAPResultSizeLimitExceeded, Err: errors.New("size limit")}
-		cm := newCaptureMock(t, pagedPage{err: raw})
-		l := newLDAPperWithCapture(cm)
-		entries, err := l.searchPaged("dc=x", ldap.ScopeWholeSubtree, ldap.NeverDerefAliases, false, "(cn=*)", nil, nil)
-		if len(entries) != 0 {
-			t.Fatalf("expected nil entries, got %d", len(entries))
-		}
-		if !errors.Is(err, raw) {
-			t.Fatalf("errors.Is(err, raw) = false; got %v", err)
-		}
-		// Without a partial result there is nothing to mark partial —
-		// ErrPartialResult must not appear.
-		if errors.Is(err, ErrPartialResult) {
-			t.Fatalf("did not expect ErrPartialResult when zero entries collected")
-		}
-	})
-
 	t.Run("empty page without paging terminates cleanly", func(t *testing.T) {
 		cm := newCaptureMock(t, pagedPage{})
 		l := newLDAPperWithCapture(cm)
 		entries, err := l.searchPaged("dc=x", ldap.ScopeWholeSubtree, ldap.NeverDerefAliases, false, "(cn=*)", nil, nil)
 		if err != nil || len(entries) != 0 {
 			t.Fatalf("expected empty result, got entries=%d err=%v", len(entries), err)
+		}
+	})
+
+	t.Run("repeated cookie: ErrPartialResult with entries so far", func(t *testing.T) {
+		e1 := newLDAPEntry("cn=A,dc=x", nil)
+		e2 := newLDAPEntry("cn=B,dc=x", nil)
+		cm := newCaptureMock(t,
+			pagedPage{entries: []*ldap.Entry{e1}, nextCookie: []byte("same")},
+			pagedPage{entries: []*ldap.Entry{e2}, nextCookie: []byte("same")},
+		)
+		l := newLDAPperWithCapture(cm)
+		entries, err := l.searchPaged("dc=x", ldap.ScopeWholeSubtree,
+			ldap.NeverDerefAliases, false, "(cn=*)", nil, nil)
+		if !errors.Is(err, ErrPartialResult) {
+			t.Fatalf("errors.Is(%v, ErrPartialResult) = false", err)
+		}
+		if len(entries) != 2 {
+			t.Fatalf("got %d entries, want 2", len(entries))
+		}
+	})
+
+	t.Run("MaxPages exceeded: ErrPartialResult", func(t *testing.T) {
+		cm := newCaptureMock(t,
+			pagedPage{entries: []*ldap.Entry{newLDAPEntry("cn=A,dc=x", nil)}, nextCookie: []byte("p2")},
+			pagedPage{entries: []*ldap.Entry{newLDAPEntry("cn=B,dc=x", nil)}, nextCookie: []byte("p3")},
+		)
+		l := newLDAPperWithCapture(cm)
+		l.searchLimits.MaxPages = 2
+		entries, err := l.searchPaged("dc=x", ldap.ScopeWholeSubtree,
+			ldap.NeverDerefAliases, false, "(cn=*)", nil, nil)
+		if !errors.Is(err, ErrPartialResult) {
+			t.Fatalf("errors.Is(%v, ErrPartialResult) = false", err)
+		}
+		if len(entries) != 2 {
+			t.Fatalf("got %d entries, want 2", len(entries))
+		}
+		// Search must have been called exactly MaxPages times.
+		if len(cm.calls) != 2 {
+			t.Fatalf("calls = %d, want 2", len(cm.calls))
+		}
+	})
+
+	t.Run("MaxEntries exceeded: truncated with ErrPartialResult", func(t *testing.T) {
+		e1 := newLDAPEntry("cn=A,dc=x", nil)
+		e2 := newLDAPEntry("cn=B,dc=x", nil)
+		e3 := newLDAPEntry("cn=C,dc=x", nil)
+		cm := newCaptureMock(t,
+			pagedPage{entries: []*ldap.Entry{e1, e2, e3}, nextCookie: []byte{}},
+		)
+		l := newLDAPperWithCapture(cm)
+		l.searchLimits.MaxEntries = 2
+		entries, err := l.searchPaged("dc=x", ldap.ScopeWholeSubtree,
+			ldap.NeverDerefAliases, false, "(cn=*)", nil, nil)
+		if !errors.Is(err, ErrPartialResult) {
+			t.Fatalf("errors.Is(%v, ErrPartialResult) = false", err)
+		}
+		if len(entries) != 2 {
+			t.Fatalf("got %d entries, want 2 (truncated)", len(entries))
+		}
+	})
+
+	t.Run("zero budgets preserve previous behaviour", func(t *testing.T) {
+		cm := newCaptureMock(t,
+			pagedPage{entries: []*ldap.Entry{newLDAPEntry("cn=A,dc=x", nil)}, nextCookie: []byte("p2")},
+			pagedPage{entries: []*ldap.Entry{newLDAPEntry("cn=B,dc=x", nil)}, nextCookie: []byte{}},
+		)
+		l := newLDAPperWithCapture(cm) // MaxPages = MaxEntries = 0
+		entries, err := l.searchPaged("dc=x", ldap.ScopeWholeSubtree,
+			ldap.NeverDerefAliases, false, "(cn=*)", nil, nil)
+		if err != nil || len(entries) != 2 {
+			t.Fatalf("entries=%d err=%v", len(entries), err)
+		}
+	})
+
+	t.Run("SizeLimitExceeded on first page: ErrPartialResult with nil entries", func(t *testing.T) {
+		raw := &ldap.Error{ResultCode: ldap.LDAPResultSizeLimitExceeded, Err: errors.New("size")}
+		cm := newCaptureMock(t, pagedPage{err: raw})
+		l := newLDAPperWithCapture(cm)
+		entries, err := l.searchPaged("dc=x", ldap.ScopeWholeSubtree,
+			ldap.NeverDerefAliases, false, "(cn=*)", nil, nil)
+		if !errors.Is(err, ErrPartialResult) {
+			t.Fatalf("errors.Is(%v, ErrPartialResult) = false", err)
+		}
+		if len(entries) != 0 {
+			t.Fatalf("entries = %v, want nil", entries)
+		}
+		var ldapErr *ldap.Error
+		if !errors.As(err, &ldapErr) {
+			t.Fatalf("errors.As did not recover *ldap.Error")
 		}
 	})
 }

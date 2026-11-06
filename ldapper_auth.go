@@ -54,8 +54,9 @@ func (ldapper *LDAPper) authenticateConnLocked(username, password, baseDN string
 	// trustworthy — RFC 4513 transitions the connection to anonymous
 	// on a failed Bind. Invalidate cached auth state so requireAuthLocked()
 	// protects subsequent operations instead of letting them run anonymously.
-	if err := ldapper.connection.Bind(username, password); err != nil {
-		// NB: do not wrap the raw error — it may contain credentials.
+	if err := ldapper.withTimeout(ldapper.opTimeouts.Bind, func() error {
+		return ldapper.connection.Bind(username, password)
+	}); err != nil {
 		ldapper.invalidateAuthLocked()
 		return nil, classifySensitiveBindError(err)
 	}
@@ -110,10 +111,13 @@ func (ldapper *LDAPper) CheckUserCredentials(username, password string) (user *t
 	}
 
 	defer func() {
-		errRebind := ldapper.connection.Bind(ldapper.bindUser, ldapper.bindPassword)
+		errRebind := ldapper.withTimeout(ldapper.opTimeouts.Bind, func() error {
+			return ldapper.connection.Bind(ldapper.bindUser, ldapper.bindPassword)
+		})
 		if errRebind == nil {
 			return
 		}
+
 		// Rebind failed — the session is no longer the verified service one.
 		// Close it so subsequent operations cannot run under an unverified
 		// identity (mirrors the A13 fix in AuthenticateConn).
@@ -130,8 +134,9 @@ func (ldapper *LDAPper) CheckUserCredentials(username, password string) (user *t
 			err, classifySensitiveBindError(errRebind))
 	}()
 
-	if err = ldapper.connection.Bind(user.DN, password); err != nil {
-		// NB: do not wrap the raw error — it may contain credentials.
+	if err = ldapper.withTimeout(ldapper.opTimeouts.Bind, func() error {
+		return ldapper.connection.Bind(user.DN, password)
+	}); err != nil {
 		return nil, classifySensitiveBindError(err)
 	}
 

@@ -53,3 +53,11 @@ type CatalogAdapter interface {
 	// a bind principal (e.g. a short-form login with an empty baseDN).
 	BindIdentity(login, baseDN string) (string, error)
 }
+
+// PrimaryGroupResolver is implemented by adapters that need custom logic
+// to resolve a user's primary group (e.g., Active Directory).
+type PrimaryGroupResolver interface {
+	// ResolvePrimaryGroupDN takes a user entry and returns the DN of the user's
+	// primary group. The ldapConn is provided for any extra LDAP searches needed.
+	ResolvePrimaryGroupDN(user types.LDAPUser, ldapConn LDAPConn) (string, error)
+}

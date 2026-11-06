@@ -52,7 +52,7 @@ type SearchLimits struct {
 
 // DefaultSearchLimits returns SearchLimits populated with the library
 // defaults: SizeLimit=0 (server default), TimeLimit=30, MaxPages=0,
-// MaxEntries=0 (no client-side budget).
+// MaxEntries=0 (no client-side budget), RequirePaging=true.
 //
 // Useful for building a SearchLimits value incrementally before passing it
 // to WithSearchLimits or SetSearchLimits:
@@ -70,7 +70,7 @@ func DefaultSearchLimits() SearchLimits {
 		TimeLimit:     constants.DefaultSearchTimeLimit,
 		MaxPages:      0,
 		MaxEntries:    0,
-		RequirePaging: false,
+		RequirePaging: true,
 	}
 }
 
@@ -79,9 +79,12 @@ func DefaultSearchLimits() SearchLimits {
 //
 // NB: WithSearchLimits replaces the whole struct. Fields omitted in
 // `limits` get Go zero values, NOT the values from DefaultSearchLimits().
-// In particular, a zero TimeLimit means "no server-side time limit" —
-// pass DefaultSearchLimits() as the base if you want to keep the default
-// 30s limit:
+// In particular:
+//   - a zero TimeLimit means "no server-side time limit";
+//   - a zero RequirePaging means "silently accept missing paging control"
+//     even though DefaultSearchLimits() sets it to true.
+//
+// Pass DefaultSearchLimits() as the base if you want to keep the defaults:
 //
 //	limits := ldapper.DefaultSearchLimits()
 //	limits.SizeLimit = 100

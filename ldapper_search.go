@@ -58,10 +58,15 @@ func (ldapper *LDAPper) searchSingleEntryLocked(
 
 	switch {
 	case len(res.Entries) == 0:
-		return nil, fmt.Errorf("%w: %s %q does not exist", ErrNotFound, kind, name)
+		// Zero entries does not mean the object is absent — it may be hidden
+		// by ACL. Use the dedicated sentinel so callers cannot confuse the
+		// two cases.
+		return nil, fmt.Errorf("%w: %s %q not found or not visible",
+			ErrNotFoundOrNotVisible, kind, name)
 	case len(res.Entries) > 1:
 		return nil, fmt.Errorf("%w: too many entries for %s %q", ErrAmbiguousResult, kind, name)
 	}
+
 	return res.Entries[0], nil
 }
 

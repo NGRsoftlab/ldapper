@@ -6,7 +6,9 @@ import (
 )
 
 // GetGroup returns the group with the given cn inside baseDN.
-// Returns ErrNotFound if no entry matches and ErrAmbiguousResult if more than one does.
+// Returns ErrNotFoundOrNotVisible if no entry matches (the object may
+// either not exist or be hidden by ACL — LDAP cannot distinguish these),
+// and ErrAmbiguousResult if more than one does.
 func (ldapper *LDAPper) GetGroup(cn, baseDN string) (*types.LDAPGroup, error) {
 	ldapper.opMu.Lock()
 	defer ldapper.opMu.Unlock()

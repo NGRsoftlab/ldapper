@@ -92,11 +92,11 @@ func (a OPENLDAPAdapter) SearchUserGroupsFilterTemplateArgs(ldapUser types.LDAPU
 }
 
 func (a OPENLDAPAdapter) SearchOUFilterTemplate() string {
-	return "(&(objectClass=organizationalUnit)(ou=%s))"
+	return "(&(objectClass=organizationalUnit)(ou=%[1]s))"
 }
 
 func (a OPENLDAPAdapter) SearchGroupFilterTemplate() string {
-	return "(&(|(objectClass=groupOfNames)(objectClass=groupOfUniqueNames)(objectClass=posixGroup))(cn=%s))"
+	return "(&(|(objectClass=groupOfNames)(objectClass=groupOfUniqueNames)(objectClass=posixGroup))(cn=%[1]s))"
 }
 
 // ATTRS

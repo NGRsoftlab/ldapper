@@ -70,7 +70,7 @@ func (a ALDPROAdapter) OUObjectFilter() string {
 }
 
 func (a ALDPROAdapter) GroupObjectFilter() string {
-	return "(|(objectClass=groupOfNames)(objectClass=posixGroup)(objectClass=ipausergroup))"
+	return "(|(objectClass=groupOfNames)(objectClass=posixGroup)(objectClass=ipaUserGroup))"
 }
 
 func (a ALDPROAdapter) UserObjectFilter() string {
@@ -86,7 +86,7 @@ func (a ALDPROAdapter) SearchUserFilterTemplate() string {
 }
 
 func (a ALDPROAdapter) SearchUserGroupsFilterTemplate() string {
-	return "(|(&(|(objectClass=groupOfNames)(objectClass=ipausergroup)(objectClass=posixGroup))(member=%s))(&(objectClass=posixGroup)(memberUid=%s)))"
+	return "(|(&(|(objectClass=groupOfNames)(objectClass=ipaUserGroup)(objectClass=posixGroup))(|(member=%[1]s)(memberIndirect=%[1]s)))(&(objectClass=posixGroup)(memberUid=%[2]s)))"
 }
 
 func (a ALDPROAdapter) SearchUserGroupsFilterTemplateArgs(ldapUser types.LDAPUser) []any {
@@ -94,11 +94,11 @@ func (a ALDPROAdapter) SearchUserGroupsFilterTemplateArgs(ldapUser types.LDAPUse
 }
 
 func (a ALDPROAdapter) SearchOUFilterTemplate() string {
-	return "(&(|(objectClass=organizationalUnit)(objectClass=rbta-org-unit))(ou=%s))"
+	return "(&(|(objectClass=organizationalUnit)(objectClass=rbta-org-unit))(ou=%[1]s))"
 }
 
 func (a ALDPROAdapter) SearchGroupFilterTemplate() string {
-	return "(&(|(objectClass=groupOfNames)(objectClass=posixGroup)(objectClass=ipausergroup))(cn=%s))"
+	return "(&(|(objectClass=groupOfNames)(objectClass=posixGroup)(objectClass=ipaUserGroup))(cn=%[1]s))"
 }
 
 // ATTRS
@@ -155,8 +155,10 @@ func (a ALDPROAdapter) GroupAttrs() []string {
 		"description",
 
 		"gidNumber", // NB: posixGroup
+		"memberUid", // NB: posixGroup
 
 		"member",
+		"memberIndirect",
 		"memberOf",
 
 		"ipaUniqueID",

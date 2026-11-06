@@ -122,8 +122,8 @@ func (ldapper *LDAPper) CheckUserCredentials(username, password string) (*types.
 
 	user, err := ldapper.getUserLocked(username, ldapper.bindDN)
 	if err != nil {
-		if errors.Is(err, ErrNotFound) {
-			// Hide user existence.
+		if errors.Is(err, ErrNotFoundOrNotVisible) {
+			// Hide user existence — missing user must look like a wrong password.
 			return nil, ErrInvalidCredentials
 		}
 		return nil, err

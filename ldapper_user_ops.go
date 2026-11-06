@@ -6,9 +6,14 @@ import (
 
 	"github.com/go-ldap/ldap/v3"
 
+	"github.com/NGRsoftlab/ldapper/interfaces"
 	"github.com/NGRsoftlab/ldapper/types"
 )
 
+// GetUser returns the user matching username inside baseDN.
+// Returns ErrNotFoundOrNotVisible if no entry matches — the user may
+// either not exist or be hidden by ACL. Never infer "user does not
+// exist" from this error in security-sensitive code.
 func (ldapper *LDAPper) GetUser(username, baseDN string) (*types.LDAPUser, error) {
 	ldapper.opMu.Lock()
 	defer ldapper.opMu.Unlock()
@@ -35,22 +40,19 @@ func (ldapper *LDAPper) getUserLocked(username, baseDN string) (*types.LDAPUser,
 
 // GetUserGroups returns DNs of all groups the given user belongs to.
 //
-// Catalog-specific caveats:
+// For MSAD, this function resolves the user's primary group (via
+// primaryGroupID) by:
+//  1. finding the nearest domainDNS ancestor of the user's DN (this
+//     also returns the domain's objectSid),
+//  2. computing the group's SID from domain SID + primaryGroupID,
+//  3. searching for a group with that objectSid.
 //
-//   - MSAD: the user's primary group (primaryGroupID) is NOT included.
-//     AD treats primary group membership as implicit — it does not appear
-//     in member/memberOf and requires resolving objectSid against
-//     primaryGroupID via a separate search. If your authorization logic
-//     depends on the complete group set, resolve primaryGroupID separately
-//     or treat this method as "explicit memberships only".
-//
-//   - OpenLDAP: groupOfNames, groupOfUniqueNames and posixGroup are all
-//     covered (member, uniqueMember, memberUid respectively).
-//
-//   - FreeIPA / ALDPro: only member=<DN> is queried; nested and indirect
-//     memberships via memberIndirect are not expanded.
-//
-// TODO: think how to process memberIndirect in FreeIPA / ALDPro SearchUserGroupsFilterTemplate (if need)
+// This adds up to 3 additional LDAP round-trips per call (1-2 for the
+// domainDNS ancestor lookup, 1 for the primary group lookup). The domain
+// SID is NOT cached — for bulk operations against the same domain,
+// consider caching at the caller level.
+// Returns ErrNotFoundOrNotVisible if the user lookup yields no entries
+// (not present or not visible to the bind identity).
 func (ldapper *LDAPper) GetUserGroups(username, baseDN string) ([]string, error) {
 	ldapper.opMu.Lock()
 	defer ldapper.opMu.Unlock()
@@ -79,8 +81,34 @@ func (ldapper *LDAPper) getUserGroupsLocked(username, baseDN string) ([]string, 
 	}
 
 	groups := make([]string, 0, len(entries))
+	seen := make(map[string]struct{}, len(entries)) // Deduplication map
 	for _, entry := range entries {
+		if _, dup := seen[entry.DN]; dup {
+			continue
+		}
+		seen[entry.DN] = struct{}{}
 		groups = append(groups, entry.DN)
+	}
+
+	// Resolve the primary group if the adapter supports it
+	if resolver, ok := ldapper.catalogAdapter.(interfaces.PrimaryGroupResolver); ok {
+		var primaryGroupDN string
+
+		resolveErr := ldapper.withTimeout(ldapper.opTimeouts.Search, func() error {
+			var err error
+			primaryGroupDN, err = resolver.ResolvePrimaryGroupDN(*user, ldapper.connection)
+			return err
+		})
+
+		if resolveErr != nil {
+			return nil, fmt.Errorf("resolve primary group: %w", resolveErr)
+		}
+
+		if primaryGroupDN != "" {
+			if _, exists := seen[primaryGroupDN]; !exists {
+				groups = append(groups, primaryGroupDN)
+			}
+		}
 	}
 
 	return groups, nil

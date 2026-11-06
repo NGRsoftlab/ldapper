@@ -6,6 +6,9 @@ import (
 )
 
 // GetOU returns the organizational unit with the given ou name inside baseDN.
+// Returns ErrNotFoundOrNotVisible if no entry matches — the object may
+// either not exist or be hidden by ACL. Returns ErrAmbiguousResult if
+// more than one matches.
 func (ldapper *LDAPper) GetOU(ou, baseDN string) (*types.LDAPOU, error) {
 	ldapper.opMu.Lock()
 	defer ldapper.opMu.Unlock()

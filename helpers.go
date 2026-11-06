@@ -7,8 +7,6 @@ import (
 	"strings"
 
 	"github.com/go-ldap/ldap/v3"
-
-	"github.com/NGRsoftlab/ldapper/types"
 )
 
 func attrsToMap(entry *ldap.Entry, attributes []string) map[string][]string {
@@ -48,21 +46,6 @@ func parentDNOf(dn string) string {
 	return parent.String()
 }
 
-// trimDepth returns a copy of nodes truncated to maxDepth (1 = only roots).
-func trimDepth(nodes []*types.OUNormalizedInfo, maxDepth int) []*types.OUNormalizedInfo {
-	out := make([]*types.OUNormalizedInfo, 0, len(nodes))
-	for _, n := range nodes {
-		clone := *n
-		if maxDepth <= 1 {
-			clone.Children = make([]*types.OUNormalizedInfo, 0)
-		} else {
-			clone.Children = trimDepth(n.Children, maxDepth-1)
-		}
-		out = append(out, &clone)
-	}
-	return out
-}
-
 // canonicalDN returns a stable, case-folded representation of a DN suitable
 // for use as an equivalence key in tree construction. It approximates LDAP
 // DN equality by:
@@ -84,7 +67,7 @@ func trimDepth(nodes []*types.OUNormalizedInfo, maxDepth int) []*types.OUNormali
 // server string) under-merges and produces spurious roots.
 //
 // Malformed DNs fall back to strings.ToLower(dn). The entry will then be
-// rejected by AncestorOf checks upstream and skipped — the correct
+// rejected by AncestorOfFold checks upstream and skipped — the correct
 // fail-safe behaviour.
 func canonicalDN(dn string) string {
 	parsed, err := ldap.ParseDN(dn)

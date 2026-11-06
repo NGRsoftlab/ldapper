@@ -37,9 +37,18 @@ var (
 	ErrClosed      = errors.New("connection closed or not initialized")
 
 	// Result shape
-	ErrNotFound        = errors.New("not found")
-	ErrAmbiguousResult = errors.New("ambiguous result")
-	ErrPartialResult   = errors.New("partial result")
+	// ErrNotFound means the object is definitively absent — the LDAP server
+	// returned a no-such-object result code or an equivalent definitive signal.
+	ErrNotFound = errors.New("not found")
+
+	// ErrNotFoundOrNotVisible means a search returned zero entries. The object
+	// either does not exist or is hidden by access controls; LDAP does not
+	// distinguish these cases at the search layer, so callers MUST treat this
+	// as "cannot determine existence". Do not infer "user does not exist" from
+	// this error in security-sensitive paths.
+	ErrNotFoundOrNotVisible = errors.New("not found or not visible")
+	ErrAmbiguousResult      = errors.New("ambiguous result")
+	ErrPartialResult        = errors.New("partial result")
 
 	// Smth strange :)
 	ErrInsufficientAccess = errors.New("insufficient access rights")

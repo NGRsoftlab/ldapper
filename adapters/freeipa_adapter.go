@@ -84,7 +84,7 @@ func (a FREEIPAAdapter) OUObjectFilter() string {
 }
 
 func (a FREEIPAAdapter) GroupObjectFilter() string {
-	return "(|(objectClass=groupOfNames)(objectClass=posixGroup)(objectClass=ipausergroup))"
+	return "(|(objectClass=groupOfNames)(objectClass=posixGroup)(objectClass=ipaUserGroup))"
 }
 
 func (a FREEIPAAdapter) UserObjectFilter() string {
@@ -100,19 +100,19 @@ func (a FREEIPAAdapter) SearchUserFilterTemplate() string {
 }
 
 func (a FREEIPAAdapter) SearchUserGroupsFilterTemplate() string {
-	return "(&(|(objectClass=groupOfNames)(objectClass=posixGroup)(objectClass=ipausergroup))(member=%s))"
+	return "(|(&(|(objectClass=groupOfNames)(objectClass=ipaUserGroup)(objectClass=posixGroup))(|(member=%[1]s)(memberIndirect=%[1]s)))(&(objectClass=posixGroup)(memberUid=%[2]s)))"
 }
 
 func (a FREEIPAAdapter) SearchUserGroupsFilterTemplateArgs(ldapUser types.LDAPUser) []any {
-	return []any{ldapUser.DN}
+	return []any{ldapUser.DN, ldapUser.GetAttributeValue("uid")}
 }
 
 func (a FREEIPAAdapter) SearchOUFilterTemplate() string {
-	return "(&(|(objectClass=organizationalUnit)(objectClass=nsContainer))(ou=%s))"
+	return "(&(|(objectClass=organizationalUnit)(objectClass=nsContainer))(ou=%[1]s))"
 }
 
 func (a FREEIPAAdapter) SearchGroupFilterTemplate() string {
-	return "(&(|(objectClass=groupOfNames)(objectClass=posixGroup)(objectClass=ipausergroup))(cn=%s))"
+	return "(&(|(objectClass=groupOfNames)(objectClass=posixGroup)(objectClass=ipaUserGroup))(cn=%[1]s))"
 }
 
 // ATTRS

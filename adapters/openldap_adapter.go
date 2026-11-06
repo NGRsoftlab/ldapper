@@ -23,7 +23,7 @@ func (a OPENLDAPAdapter) GetNormalizedUserInfo(ldapUser types.LDAPUser) *types.U
 		Department:        ldapUser.GetAttributeValue("departmentNumber"),
 		Title:             ldapUser.GetAttributeValue("title"),
 		Manager:           ldapUser.GetAttributeValue("manager"),
-		Photo:             ldapUser.GetAttributeValue("jpegPhoto"),
+		Photo:             ldapUser.GetAttributeRawValue("jpegPhoto"),
 		Company:           ldapUser.GetAttributeValue("o"),
 		Country:           "",
 		Address:           ldapUser.GetAttributeValue("postalAddress"),
@@ -66,7 +66,7 @@ func (a OPENLDAPAdapter) OUObjectFilter() string {
 }
 
 func (a OPENLDAPAdapter) GroupObjectFilter() string {
-	return "(|(objectClass=groupOfNames)(objectClass=posixGroup))"
+	return "(|(objectClass=groupOfNames)(objectClass=groupOfUniqueNames)(objectClass=posixGroup))"
 }
 
 func (a OPENLDAPAdapter) UserObjectFilter() string {
@@ -80,7 +80,11 @@ func (a OPENLDAPAdapter) SearchUserFilterTemplate() string {
 }
 
 func (a OPENLDAPAdapter) SearchUserGroupsFilterTemplate() string {
-	return "(|(&(objectClass=groupOfNames)(member=%s))(&(objectClass=posixGroup)(memberUid=%s)))"
+	// Three membership models:
+	//   groupOfNames      → member=<full DN>
+	//   groupOfUniqueNames → uniqueMember=<full DN>
+	//   posixGroup        → memberUid=<short uid>
+	return "(|(&(objectClass=groupOfNames)(member=%[1]s))(&(objectClass=groupOfUniqueNames)(uniqueMember=%[1]s))(&(objectClass=posixGroup)(memberUid=%[2]s)))"
 }
 
 func (a OPENLDAPAdapter) SearchUserGroupsFilterTemplateArgs(ldapUser types.LDAPUser) []any {
@@ -92,7 +96,7 @@ func (a OPENLDAPAdapter) SearchOUFilterTemplate() string {
 }
 
 func (a OPENLDAPAdapter) SearchGroupFilterTemplate() string {
-	return "(&(|(objectClass=groupOfNames)(objectClass=posixGroup))(cn=%s))"
+	return "(&(|(objectClass=groupOfNames)(objectClass=groupOfUniqueNames)(objectClass=posixGroup))(cn=%s))"
 }
 
 // ATTRS

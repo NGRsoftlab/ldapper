@@ -17,8 +17,19 @@ var (
 	ErrInvalidArgument = errors.New("invalid argument")
 
 	// Authentication & authorization
+	// ErrInvalidCredentials is returned on a bind failure that was classified
+	// as a credential rejection with high confidence (LDAP result code 49).
 	ErrInvalidCredentials = errors.New("invalid credentials")
-	ErrNotAuthenticated   = errors.New("connection not authenticated")
+	// ErrInvalidCredentialsOrUnknown is returned by the bind-path classifier
+	// when the server returned an LDAP result code that could not be mapped
+	// to a specific sentinel. The underlying code is deliberately not exposed
+	// to avoid leaking server-side details (RFC 4513 §4.2: diagnosticMessage
+	// may echo the submitted credentials).
+	//
+	// Callers that need a boolean "credentials rejected" decision should treat
+	// this error as inconclusive, not as a rejection.
+	ErrInvalidCredentialsOrUnknown = errors.New("invalid credentials or unknown error")
+	ErrNotAuthenticated            = errors.New("connection not authenticated")
 
 	// Transport / availability
 	ErrUnavailable = errors.New("directory unavailable")
@@ -158,6 +169,6 @@ func classifySensitiveBindError(err error) error {
 		return ErrUnavailable
 	}
 
-	// LDAPResultOther and unknown codes: mask as credential rejection.
-	return ErrInvalidCredentials
+	// LDAPResultOther and unknown codes: mask as credential rejection or unknown error.
+	return ErrInvalidCredentialsOrUnknown
 }

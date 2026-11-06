@@ -27,7 +27,7 @@ func (a ALDPROAdapter) GetNormalizedUserInfo(ldapUser types.LDAPUser) *types.Use
 		Department:        ldapUser.GetAttributeValue("rbtadp"),
 		Title:             ldapUser.GetAttributeValue("title"),
 		Manager:           ldapUser.GetAttributeValue("manager"),
-		Photo:             ldapUser.GetAttributeValue("jpegPhoto"),
+		Photo:             ldapUser.GetAttributeRawValue("jpegPhoto"),
 		Company:           ldapUser.GetAttributeValue("o"),
 		Country:           ldapUser.GetAttributeValue("co"),
 		Address:           ldapUser.GetAttributeValue("streetAddress"),
@@ -37,10 +37,16 @@ func (a ALDPROAdapter) GetNormalizedUserInfo(ldapUser types.LDAPUser) *types.Use
 }
 
 func (a ALDPROAdapter) GetNormalizedOUInfoFromEntry(entry ldap.Entry) *types.OUNormalizedInfo {
+	// organizationalUnit -> ou, rbta-org-unit -> cn, just empty OU protection logic
+	ouValue := entry.GetAttributeValue("ou")
+	if ouValue == "" {
+		ouValue = entry.GetAttributeValue("cn")
+	}
+
 	return &types.OUNormalizedInfo{
 		DN:       entry.DN,
 		Name:     ouNameFromDN(entry.DN),
-		OU:       entry.GetAttributeValue("ou"),
+		OU:       ouValue,
 		Children: make([]*types.OUNormalizedInfo, 0),
 	}
 }
@@ -135,6 +141,7 @@ func (a ALDPROAdapter) OUAttrs() []string {
 	return []string{
 		"dn",
 		"ou",
+		"cn",
 		"description",
 		"manager",
 	}

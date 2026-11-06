@@ -23,7 +23,7 @@ func (a MSADAdapter) GetNormalizedUserInfo(ldapUser types.LDAPUser) *types.UserN
 		Department:        ldapUser.GetAttributeValue("department"),
 		Title:             ldapUser.GetAttributeValue("title"),
 		Manager:           ldapUser.GetAttributeValue("manager"),
-		Photo:             ldapUser.GetFirstNonNullAttributeValue([]string{"thumbnailPhoto", "jpegPhoto"}),
+		Photo:             ldapUser.GetFirstNonNullAttributeRawValue([]string{"thumbnailPhoto", "jpegPhoto"}),
 		Company:           ldapUser.GetAttributeValue("company"),
 		Country:           ldapUser.GetAttributeValue("co"),
 		Address:           ldapUser.GetAttributeValue("streetAddress"),

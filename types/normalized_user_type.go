@@ -14,7 +14,12 @@ type UserNormalizedInfo struct {
 	Title      string
 	Manager    string
 
-	Photo string
+	// Photo holds raw bytes of the user's JPEG/PNG image. Using string
+	// here corrupts non-UTF-8 binary data on JSON serialization: Go's
+	// json.Marshal replaces invalid UTF-8 with U+FFFD. If you serialize
+	// to JSON, encode with encoding/base64 explicitly or implement a
+	// custom MarshalJSON on this type.
+	Photo []byte
 
 	Company string
 	Country string

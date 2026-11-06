@@ -27,7 +27,7 @@ func (a FREEIPAAdapter) GetNormalizedUserInfo(ldapUser types.LDAPUser) *types.Us
 		Department:        "",
 		Title:             ldapUser.GetAttributeValue("title"),
 		Manager:           ldapUser.GetAttributeValue("manager"),
-		Photo:             ldapUser.GetAttributeValue("jpegPhoto"),
+		Photo:             ldapUser.GetAttributeRawValue("jpegPhoto"),
 		Company:           ldapUser.GetAttributeValue("o"),
 		Country:           ldapUser.GetAttributeValue("co"),
 		Address:           ldapUser.GetAttributeValue("street"),
@@ -37,10 +37,16 @@ func (a FREEIPAAdapter) GetNormalizedUserInfo(ldapUser types.LDAPUser) *types.Us
 }
 
 func (a FREEIPAAdapter) GetNormalizedOUInfoFromEntry(entry ldap.Entry) *types.OUNormalizedInfo {
+	// organizationalUnit -> ou,nsContainer -> cn, just empty OU protection logic
+	ouValue := entry.GetAttributeValue("ou")
+	if ouValue == "" {
+		ouValue = entry.GetAttributeValue("cn")
+	}
+
 	return &types.OUNormalizedInfo{
 		DN:       entry.DN,
 		Name:     ouNameFromDN(entry.DN),
-		OU:       entry.GetAttributeValue("ou"),
+		OU:       ouValue,
 		Children: make([]*types.OUNormalizedInfo, 0),
 	}
 }
@@ -151,6 +157,7 @@ func (a FREEIPAAdapter) UserAttrs() []string {
 func (a FREEIPAAdapter) OUAttrs() []string {
 	return []string{
 		"dn",
+		"cn",
 		"ou",
 		"objectClass",
 		"description",

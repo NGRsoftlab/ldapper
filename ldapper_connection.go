@@ -115,6 +115,8 @@ func dialHost(host string, port uint, useSSL, skipTLS bool, tlsCfg *tls.Config, 
 }
 
 // IsAlive reports whether the underlying LDAP connection is still usable.
+// Returns false after Close() — a closed client cannot be revived via
+// EnsureAlive (see ErrClosed).
 // It first checks the local state and then performs a lightweight round-trip
 // by querying the root DSE (works for every LDAP server and does not require auth).
 // NB: although RFC 4512 does not require objectClass on the root DSE,

@@ -34,6 +34,23 @@ func (ldapper *LDAPper) getUserLocked(username, baseDN string) (*types.LDAPUser,
 }
 
 // GetUserGroups returns DNs of all groups the given user belongs to.
+//
+// Catalog-specific caveats:
+//
+//   - MSAD: the user's primary group (primaryGroupID) is NOT included.
+//     AD treats primary group membership as implicit — it does not appear
+//     in member/memberOf and requires resolving objectSid against
+//     primaryGroupID via a separate search. If your authorization logic
+//     depends on the complete group set, resolve primaryGroupID separately
+//     or treat this method as "explicit memberships only".
+//
+//   - OpenLDAP: groupOfNames, groupOfUniqueNames and posixGroup are all
+//     covered (member, uniqueMember, memberUid respectively).
+//
+//   - FreeIPA / ALDPro: only member=<DN> is queried; nested and indirect
+//     memberships via memberIndirect are not expanded.
+//
+// TODO: think how to process memberIndirect in FreeIPA / ALDPro SearchUserGroupsFilterTemplate (if need)
 func (ldapper *LDAPper) GetUserGroups(username, baseDN string) ([]string, error) {
 	ldapper.opMu.Lock()
 	defer ldapper.opMu.Unlock()

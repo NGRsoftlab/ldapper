@@ -90,20 +90,20 @@ func (ldapper *LDAPper) newSearchRequest(
 }
 
 // searchPaged executes a search and follows the paging control until all
-// pages have been retrieved. If the server does not honor paging, it
-// silently falls back to a single search result.
+// pages have been retrieved. If the server does not honor paging, the
+// behavior depends on SearchLimits.RequirePaging: when false, the first
+// page is returned as-is (backward compatible); when true, ErrPartialResult
+// is returned because the result may have been truncated by the server.
 //
 // Caller must hold opMu. The lock is held across all pages because the
 // paging cookie is bound to the current connection and interleaving with
 // other operations would corrupt the protocol stream.
 //
 // Budgets:
-//   - MaxPages   bounds the number of successful Search calls. When exceeded,
-//     returns ErrPartialResult + entries collected so far.
-//   - MaxEntries bounds the total accumulated entries. When exceeded,
-//     returns ErrPartialResult + the truncated slice.
-//   - Repeated non-empty cookies are treated as a runaway server and cause
-//     an early return with ErrPartialResult.
+//   - MaxPages        bounds the number of successful Search calls.
+//   - MaxEntries      bounds the total accumulated entries.
+//   - RequirePaging   makes a missing paging control fatal (ErrPartialResult).
+//   - Repeated non-empty cookies are treated as a runaway server.
 func (ldapper *LDAPper) searchPaged(
 	baseDN string,
 	scope int,

@@ -910,3 +910,18 @@ func TestIntegrationALDPro_DialTimeout_NegativeClampedToZero(t *testing.T) {
 	conn.SetDialTimeout(-1 * time.Second)
 	assert.Equal(t, time.Duration(0), conn.GetDialTimeout())
 }
+
+func TestIntegrationALDPro_AuthenticateConn_FailedBind_InvalidatesState(t *testing.T) {
+	conn := newALDProConn(t)
+
+	_, err := conn.AuthenticateConn(aldproSvcDN, aldproSvcPass, aldproBaseDN)
+	require.NoError(t, err)
+
+	_, err = conn.AuthenticateConn(aldproSvcDN, "wrong-password", aldproBaseDN)
+	require.Error(t, err)
+	assert.True(t, errors.Is(err, ldapper.ErrInvalidCredentials))
+
+	_, err = conn.CheckUserCredentials(aldproUser1UID, aldproUser1Pass)
+	require.Error(t, err)
+	assert.True(t, errors.Is(err, ldapper.ErrNotAuthenticated))
+}

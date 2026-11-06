@@ -666,3 +666,18 @@ func TestIntegrationMSAD_DialTimeout_NegativeClampedToZero(t *testing.T) {
 	conn.SetDialTimeout(-1 * time.Second)
 	assert.Equal(t, time.Duration(0), conn.GetDialTimeout())
 }
+
+func TestIntegrationMSAD_AuthenticateConn_FailedBind_InvalidatesState(t *testing.T) {
+	conn := newMSADConn(t)
+
+	_, err := conn.AuthenticateConn(msadAdminDN, msadAdminPass, msadBaseDN)
+	require.NoError(t, err)
+
+	_, err = conn.AuthenticateConn(msadAdminDN, "wrong-password", msadBaseDN)
+	require.Error(t, err)
+	assert.True(t, errors.Is(err, ldapper.ErrInvalidCredentials))
+
+	_, err = conn.CheckUserCredentials(msadUser1SAM, msadUser1Pass)
+	require.Error(t, err)
+	assert.True(t, errors.Is(err, ldapper.ErrNotAuthenticated))
+}

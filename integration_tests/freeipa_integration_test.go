@@ -662,3 +662,19 @@ func TestIntegrationFreeIPA_GetOUUsers_EmptyOU(t *testing.T) {
 	require.NoError(t, err)
 	assert.Empty(t, users)
 }
+
+func TestIntegrationFreeIPA_AuthenticateConn_FailedBind_InvalidatesState(t *testing.T) {
+	requireFreeIPAUsers(t)
+	conn := newFreeIPAConn(t)
+
+	_, err := conn.AuthenticateConn(freeipaAdminDN, freeipaAdminPass, freeipaBaseDN)
+	require.NoError(t, err)
+
+	_, err = conn.AuthenticateConn(freeipaAdminDN, "wrong-password", freeipaBaseDN)
+	require.Error(t, err)
+	assert.True(t, errors.Is(err, ldapper.ErrInvalidCredentials))
+
+	_, err = conn.CheckUserCredentials(freeipaUser1UID, freeipaUser1Pass)
+	require.Error(t, err)
+	assert.True(t, errors.Is(err, ldapper.ErrNotAuthenticated))
+}

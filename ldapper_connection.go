@@ -137,7 +137,9 @@ func (ldapper *LDAPper) reconnectLocked() error {
 
 	if ldapper.isAuthenticated {
 		if err := ldapper.connection.Bind(ldapper.bindUser, ldapper.bindPassword); err != nil {
-			ldapper.isAuthenticated = false
+			// Rebind failure means the freshly-dialed connection cannot be
+			// treated as a service session — invalidate cached credentials.
+			ldapper.invalidateAuthLocked()
 			// NB: do not wrap the raw error — it may contain credentials.
 			return classifySensitiveBindError(err)
 		}
@@ -167,4 +169,5 @@ func (ldapper *LDAPper) Close() {
 	}
 	_ = ldapper.connection.Close()
 	ldapper.connection = nil
+	ldapper.invalidateAuthLocked()
 }

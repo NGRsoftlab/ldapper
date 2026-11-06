@@ -751,3 +751,24 @@ func TestIntegrationOpenLDAP_DialTimeout_NegativeClampedToZero(t *testing.T) {
 	conn.SetDialTimeout(-1 * time.Second)
 	assert.Equal(t, time.Duration(0), conn.GetDialTimeout())
 }
+
+func TestIntegrationOpenLDAP_AuthenticateConn_FailedBind_InvalidatesState(t *testing.T) {
+	conn := newOpenLDAPConn(t)
+
+	// 1. Successfully authenticate as user1.
+	_, err := conn.AuthenticateConn(openldapUser1DN, openldapUser1Pass, openldapBaseDN)
+	require.NoError(t, err)
+
+	// 2. Attempt to authenticate as user1 with a wrong password on the same
+	//    connection. RFC 4513 §4 transitions the live session to anonymous.
+	_, err = conn.AuthenticateConn(openldapUser1DN, "wrong-password", openldapBaseDN)
+	require.Error(t, err)
+	assert.True(t, errors.Is(err, ldapper.ErrInvalidCredentials))
+
+	// 3. The connection must report ErrNotAuthenticated — the cached
+	//    service-session state must not survive a failed Bind.
+	_, err = conn.CheckUserCredentials(openldapUser2UID, openldapUser2Pass)
+	require.Error(t, err)
+	assert.True(t, errors.Is(err, ldapper.ErrNotAuthenticated),
+		"post-failed-bind connection must not be treated as authenticated")
+}

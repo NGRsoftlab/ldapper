@@ -143,15 +143,24 @@ func TestAuthenticateConn(t *testing.T) {
 			},
 			nil, // bind succeeds
 		)
-		l := &LDAPper{connection: ac.mock, catalogAdapter: simpleUserAdapter()}
+		l := &LDAPper{
+			connection:      ac.mock,
+			catalogAdapter:  simpleUserAdapter(),
+			isAuthenticated: true, // pre-authenticated (this is the A01 scenario)
+			bindUser:        "svc-reader",
+			bindPassword:    "svc-pass",
+			bindDN:          "dc=example,dc=com",
+		}
 
 		_, err := l.AuthenticateConn(user, pass, baseDN)
 		if !errors.Is(err, ErrNotFound) {
 			t.Fatalf("errors.Is(%v, ErrNotFound) = false", err)
 		}
-		// State must remain unauthenticated when the lookup fails.
 		if l.isAuthenticated {
-			t.Fatalf("isAuthenticated must be false after failed lookup")
+			t.Fatalf("isAuthenticated must be false after failed post-bind lookup")
+		}
+		if l.bindUser != "" || l.bindPassword != "" {
+			t.Fatalf("bind credentials must be cleared: user=%q pass=%q", l.bindUser, l.bindPassword)
 		}
 	})
 
@@ -189,6 +198,76 @@ func TestAuthenticateConn(t *testing.T) {
 			t.Fatalf("isAuthenticated = false, want true")
 		}
 		if l.bindUser != user || l.bindPassword != pass || l.bindDN != baseDN {
+			t.Fatalf("cached creds = %q/%q/%q", l.bindUser, l.bindPassword, l.bindDN)
+		}
+	})
+
+	t.Run("failed bind on authenticated conn invalidates state", func(t *testing.T) {
+		// Simulate a pre-authenticated connection (previous AuthenticateConn
+		// succeeded) that is now asked to bind again with wrong credentials.
+		raw := &ldap.Error{ResultCode: ldap.LDAPResultInvalidCredentials, Err: errors.New("bad pw")}
+		ac := newAuthConn(nil, func(_ int, u, p string) error { return raw })
+		l := &LDAPper{
+			connection:      ac.mock,
+			catalogAdapter:  simpleUserAdapter(),
+			isAuthenticated: true,
+			bindUser:        "svc-reader",
+			bindPassword:    "svc-pass",
+			bindDN:          "dc=example,dc=com",
+		}
+
+		_, err := l.AuthenticateConn("alice", "wrong", baseDN)
+		if !errors.Is(err, ErrInvalidCredentials) {
+			t.Fatalf("errors.Is(%v, ErrInvalidCredentials) = false", err)
+		}
+
+		// Cached auth state must be cleared: the live LDAP session is anonymous
+		// (RFC 4513 §4) and must not be advertised as a service session.
+		if l.isAuthenticated {
+			t.Fatalf("isAuthenticated = true after failed bind on authenticated conn")
+		}
+		if l.bindUser != "" || l.bindPassword != "" {
+			t.Fatalf("bind credentials must be cleared: user=%q pass=%q", l.bindUser, l.bindPassword)
+		}
+		if l.bindDN != "dc=example,dc=com" {
+			t.Fatalf("bindDN must be preserved: %q", l.bindDN)
+		}
+
+		// CheckUserCredentials on the now-invalidated connection must report
+		// ErrNotAuthenticated, not attempt to Search/Bind anonymously.
+		ac.searchCalls = 0
+		ac.bindCalls = 0
+		_, err = l.CheckUserCredentials("alice", "whatever")
+		if !errors.Is(err, ErrNotAuthenticated) {
+			t.Fatalf("errors.Is(%v, ErrNotAuthenticated) = false", err)
+		}
+		if ac.searchCalls != 0 || ac.bindCalls != 0 {
+			t.Fatalf("no I/O must be issued after invalidation: search=%d bind=%d",
+				ac.searchCalls, ac.bindCalls)
+		}
+	})
+
+	t.Run("successful bind populates cached credentials", func(t *testing.T) {
+		userEntry := newLDAPEntry(
+			"cn=svc-reader,dc=example,dc=com",
+			map[string][]string{"uid": {"svc-reader"}},
+		)
+		ac := newAuthConn(
+			func(_ int, _ *ldap.SearchRequest) (*ldap.SearchResult, error) {
+				return &ldap.SearchResult{Entries: []*ldap.Entry{userEntry}}, nil
+			},
+			nil,
+		)
+		l := &LDAPper{connection: ac.mock, catalogAdapter: simpleUserAdapter()}
+
+		_, err := l.AuthenticateConn("svc-reader", "svc-pass", baseDN)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !l.isAuthenticated {
+			t.Fatalf("isAuthenticated = false after successful bind")
+		}
+		if l.bindUser != "svc-reader" || l.bindPassword != "svc-pass" || l.bindDN != baseDN {
 			t.Fatalf("cached creds = %q/%q/%q", l.bindUser, l.bindPassword, l.bindDN)
 		}
 	})

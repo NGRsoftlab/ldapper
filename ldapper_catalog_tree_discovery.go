@@ -7,84 +7,49 @@ import (
 
 	"github.com/go-ldap/ldap/v3"
 
-	"github.com/NGRsoftlab/ldapper/constants"
 	"github.com/NGRsoftlab/ldapper/types"
 )
-
-// parentDNOf returns the parent DN string, or "" for the topmost RDN.
-func parentDNOf(dn string) string {
-	parsed, err := ldap.ParseDN(dn)
-	if err != nil || parsed == nil || len(parsed.RDNs) <= 1 {
-		return ""
-	}
-	parent := &ldap.DN{RDNs: parsed.RDNs[1:]}
-	return parent.String()
-}
-
-// trimDepth returns a copy of nodes truncated to maxDepth (1 = only roots).
-func trimDepth(nodes []*types.OUInfo, maxDepth int) []*types.OUInfo {
-	out := make([]*types.OUInfo, 0, len(nodes))
-	for _, n := range nodes {
-		clone := *n
-		if maxDepth <= 1 {
-			clone.Children = make([]*types.OUInfo, 0)
-		} else {
-			clone.Children = trimDepth(n.Children, maxDepth-1)
-		}
-		out = append(out, &clone)
-	}
-	return out
-}
 
 // CATALOG OU-TREE DISCOVERY METHODS
 
 // GetCatalogTree fetches the whole OU subtree in a single LDAP search and
 // builds the tree on the client, optionally trimming to maxDepth (0 = no limit).
-func (conn *LDAPper) GetCatalogTree(baseDn string, maxDepth int) (types.CatalogTree, error) {
-	res := types.CatalogTree{Tree: make([]*types.OUInfo, 0)}
+// NB: returns tree with normalized ou objects
+func (ldapper *LDAPper) GetCatalogTree(baseDN string, maxDepth int) (types.CatalogTree, error) {
+	ldapper.opMu.Lock()
+	defer ldapper.opMu.Unlock()
+	return ldapper.getCatalogTreeLocked(baseDN, maxDepth)
+}
 
-	filter := conn.catalogAdapter.OUObjectFilter()
-	attrs := conn.catalogAdapter.OUAttrs()
+// Nodes whose direct parent is not in the fetched set (e.g., the base DN itself,
+// or entries filtered out by the server) are promoted to roots of res.Tree.
+func (ldapper *LDAPper) getCatalogTreeLocked(baseDN string, maxDepth int) (types.CatalogTree, error) {
+	res := types.CatalogTree{Tree: make([]*types.OUNormalizedInfo, 0)}
 
-	// Single subtree search + paged control (required for AD).
-	pagingControl := ldap.NewControlPaging(constants.DefaultCatalogTreePageSize)
-	var allEntries []*ldap.Entry
-
-	for {
-		req := conn.newSearchRequest(baseDn, ldap.ScopeWholeSubtree,
-			ldap.NeverDerefAliases, false, filter, attrs, []ldap.Control{pagingControl})
-
-		result, err := conn.connection.Search(req)
-		if err != nil {
-			return res, fmt.Errorf("unsuccessful ou search: %w", err)
-		}
-		allEntries = append(allEntries, result.Entries...)
-
-		// The server echoes the paging control back; extract the next cookie.
-		ctrl := ldap.FindControl(result.Controls, ldap.ControlTypePaging)
-		if ctrl == nil {
-			break // server did not honor paging: single page, done
-		}
-		next, ok := ctrl.(*ldap.ControlPaging)
-		if !ok {
-			break // unexpected control type: stop rather than loop forever
-		}
-		pagingControl.SetCookie(next.Cookie)
-		if len(next.Cookie) == 0 {
-			break // empty cookie = last page
-		}
+	if err := ldapper.requireConnLocked(); err != nil {
+		return res, err
 	}
 
-	// Convert entries once; filter to descendants of baseDn.
-	baseDN, err := ldap.ParseDN(baseDn)
+	dn, err := ldap.ParseDN(baseDN)
 	if err != nil {
-		return res, fmt.Errorf("invalid base DN %q: %w", baseDn, err)
+		return res, fmt.Errorf("%w: invalid DN %q: %v", ErrInvalidArgument, baseDN, err)
 	}
 
-	byDN := make(map[string]*types.OUInfo, len(allEntries))
+	allEntries, err := ldapper.searchPaged(dn.String(), ldap.ScopeWholeSubtree,
+		ldap.NeverDerefAliases, false,
+		ldapper.catalogAdapter.OUObjectFilter(),
+		ldapper.catalogAdapter.OUAttrs(), nil)
+	if err != nil {
+		return res, fmt.Errorf("unsuccessful ou search: %w", classifyLDAPError(err))
+	}
+
+	// NB: keys are lowercased so that DN comparisons are case-insensitive,
+	// matching ldap.DN.AncestorOf behavior.
+	byDN := make(map[string]*types.OUNormalizedInfo, len(allEntries))
 	order := make([]string, 0, len(allEntries)) // preserves server order
+
 	for _, e := range allEntries {
-		info := conn.catalogAdapter.OUInfoFromEntry(*e)
+		info := ldapper.catalogAdapter.GetNormalizedOUInfoFromEntry(*e)
 		if info == nil || info.DN == "" {
 			continue
 		}
@@ -92,21 +57,18 @@ func (conn *LDAPper) GetCatalogTree(baseDn string, maxDepth int) (types.CatalogT
 		if err != nil {
 			continue // malformed DN from server: skip rather than crash
 		}
-		if !baseDN.AncestorOf(parsed) {
-			// Skips both the base DN itself (not its own ancestor) and any
-			// entries outside baseDn returned by the server.
+		if !dn.AncestorOf(parsed) {
+			// Skips both the base DN itself and any entries outside baseDN.
 			continue
 		}
-		info.Children = make([]*types.OUInfo, 0)
-		byDN[info.DN] = info
+		byDN[strings.ToLower(info.DN)] = info
 		order = append(order, info.DN)
 	}
 
-	// Attach each entry to its nearest ancestor present in byDN.
-	for _, dn := range order {
-		info := byDN[dn]
-		parentDN := parentDNOf(info.DN)
-		if parent, ok := byDN[parentDN]; ok {
+	for _, dnItem := range order {
+		info := byDN[strings.ToLower(dnItem)]
+		parentKey := strings.ToLower(parentDNOf(info.DN))
+		if parent, ok := byDN[parentKey]; ok {
 			parent.Children = append(parent.Children, info)
 		} else {
 			res.Tree = append(res.Tree, info)
@@ -120,47 +82,53 @@ func (conn *LDAPper) GetCatalogTree(baseDn string, maxDepth int) (types.CatalogT
 	return res, nil
 }
 
-func (conn *LDAPper) GetRootOUs(rootDN string) ([]*types.OUInfo, error) {
-	res := make([]*types.OUInfo, 0)
-
-	filter := conn.catalogAdapter.OUObjectFilter()
-	attributes := conn.catalogAdapter.OUAttrs()
-
-	searchRequest := conn.newSearchRequest(rootDN, ldap.ScopeSingleLevel, ldap.NeverDerefAliases, false, filter, attributes, nil)
-
-	searchResult, err := conn.connection.Search(searchRequest)
-	if err != nil {
-		return res, fmt.Errorf("unsuccessful ou search: %s", err.Error())
-	}
-
-	for _, entry := range searchResult.Entries {
-		res = append(res, conn.catalogAdapter.OUInfoFromEntry(*entry))
-	}
-
-	return res, nil
+func (ldapper *LDAPper) ListSingleLevelOUs(rootDN string) ([]*types.OUNormalizedInfo, error) {
+	return ldapper.GetSubOUs(rootDN, ldap.ScopeSingleLevel)
 }
 
-func (conn *LDAPper) GetSubOUs(group string, level int) (res []*types.OUInfo, err error) {
-	res = make([]*types.OUInfo, 0)
+func (ldapper *LDAPper) GetSubOUs(parentDN string, scope int) ([]*types.OUNormalizedInfo, error) {
+	ldapper.opMu.Lock()
+	defer ldapper.opMu.Unlock()
+	return ldapper.getSubOUsLocked(parentDN, scope)
+}
 
-	filter := conn.catalogAdapter.OUObjectFilter()
-	attributes := conn.catalogAdapter.OUAttrs()
-
-	searchRequest := conn.newSearchRequest(group, level, ldap.NeverDerefAliases, false, filter, attributes, nil)
-
-	searchResult, err := conn.connection.Search(searchRequest)
-	if err != nil {
-		return res, fmt.Errorf("unsuccessful sub ou search: %s", err.Error())
+func (ldapper *LDAPper) getSubOUsLocked(parentDN string, scope int) ([]*types.OUNormalizedInfo, error) {
+	if err := ldapper.requireConnLocked(); err != nil {
+		return nil, err
 	}
 
-	for _, entry := range searchResult.Entries {
-		info := conn.catalogAdapter.OUInfoFromEntry(*entry)
+	switch scope {
+	case ldap.ScopeSingleLevel, ldap.ScopeWholeSubtree:
+	case ldap.ScopeBaseObject:
+		// NB: GetSubOUs returns descendants only, so ScopeBaseObject would
+		// always yield an empty list. Reject it explicitly.
+		return nil, fmt.Errorf("%w: ScopeBaseObject is not supported by GetSubOUs", ErrInvalidArgument)
+	default:
+		return nil, fmt.Errorf("%w: invalid scope %d", ErrInvalidArgument, scope)
+	}
 
-		info.Children = make([]*types.OUInfo, 0)
+	parentParsed, err := ldap.ParseDN(parentDN)
+	if err != nil {
+		return nil, fmt.Errorf("%w: invalid DN %q: %v", ErrInvalidArgument, parentDN, err)
+	}
 
-		if strings.HasSuffix(info.DN, ","+group) && info.DN != group {
-			res = append(res, info)
+	entries, err := ldapper.searchPaged(
+		parentParsed.String(), scope, ldap.NeverDerefAliases, false,
+		ldapper.catalogAdapter.OUObjectFilter(),
+		ldapper.catalogAdapter.OUAttrs(), nil,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("unsuccessful sub ou search: %w", classifyLDAPError(err))
+	}
+
+	res := make([]*types.OUNormalizedInfo, 0, len(entries))
+	for _, entry := range entries {
+		info := ldapper.catalogAdapter.GetNormalizedOUInfoFromEntry(*entry)
+		if info == nil || info.DN == parentParsed.String() {
+			// Base DN itself is excluded: "sub" means descendants only.
+			continue
 		}
+		res = append(res, info)
 	}
 
 	return res, nil

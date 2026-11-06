@@ -35,7 +35,6 @@ func TestFREEIPAAdapter_GetNormalizedUserInfo_FullMapping(t *testing.T) {
 	user := newLDAPUser(
 		"uid=user1,cn=users,cn=accounts,dc=example,dc=test",
 		map[string][]string{
-			"dn":              {"uid=user1,cn=users,cn=accounts,dc=example,dc=test"},
 			"cn":              {"User One"},
 			"mobile":          {"+1-555-0100"},
 			"telephoneNumber": {"+1-555-0101"},
@@ -43,6 +42,7 @@ func TestFREEIPAAdapter_GetNormalizedUserInfo_FullMapping(t *testing.T) {
 			"title":           {"Engineer"},
 			"manager":         {"uid=boss,cn=users,cn=accounts,dc=example,dc=test"},
 			"jpegPhoto":       {"photo-bytes"},
+			"o":               {"Example Inc."},
 			"co":              {"US"},
 			"street":          {"123 Main St"},
 			"l":               {"Springfield"},
@@ -53,7 +53,8 @@ func TestFREEIPAAdapter_GetNormalizedUserInfo_FullMapping(t *testing.T) {
 	info := adapter.GetNormalizedUserInfo(user)
 	require.NotNil(t, info)
 
-	assert.Equal(t, "uid=user1,cn=users,cn=accounts,dc=example,dc=test", info.DistinguishedName)
+	assert.Equal(t, "uid=user1,cn=users,cn=accounts,dc=example,dc=test", info.DistinguishedName,
+		"DistinguishedName comes from the LDAPUser struct field")
 	assert.Equal(t, "User One", info.CommonName)
 	assert.Equal(t, "+1-555-0100", info.Mobile)
 	assert.Equal(t, "+1-555-0101", info.Phone)
@@ -61,15 +62,14 @@ func TestFREEIPAAdapter_GetNormalizedUserInfo_FullMapping(t *testing.T) {
 	assert.Equal(t, "Engineer", info.Title)
 	assert.Equal(t, "uid=boss,cn=users,cn=accounts,dc=example,dc=test", info.Manager)
 	assert.Equal(t, "photo-bytes", info.Photo)
+	assert.Equal(t, "Example Inc.", info.Company, "Company comes from the o attribute")
 	assert.Equal(t, "US", info.Country)
 	assert.Equal(t, "123 Main St", info.Address)
 	assert.Equal(t, "Springfield", info.City)
 	assert.Equal(t, "12345", info.Index)
 
-	// FreeIPA hardcodes these to "" (department is not exposed on users,
-	// company is not present in FreeIPA schema).
+	// Department is hardcoded to "" in the FreeIPA adapter (no direct analog).
 	assert.Equal(t, "", info.Department)
-	assert.Equal(t, "", info.Company)
 }
 
 func TestFREEIPAAdapter_GetNormalizedUserInfo_EmptyUser(t *testing.T) {
@@ -121,11 +121,24 @@ func TestFREEIPAAdapter_GetNormalizedUserInfo_UsesStreetNotStreetAddress(t *test
 	assert.Equal(t, "Main Street", info.Address)
 }
 
+// TestFREEIPAAdapter_GetNormalizedUserInfo_DistinguishedNameFromStructField
+// pins the DN source: the struct field, not the "dn" attribute.
+func TestFREEIPAAdapter_GetNormalizedUserInfo_DistinguishedNameFromStructField(t *testing.T) {
+	adapter := FREEIPAAdapter{}
+	user := newLDAPUser("uid=from-struct,dc=x", map[string][]string{
+		"cn": {"Alice"},
+		"dn": {"uid=from-attr,dc=x"},
+	})
+
+	info := adapter.GetNormalizedUserInfo(user)
+	assert.Equal(t, "uid=from-struct,dc=x", info.DistinguishedName)
+}
+
 // ---------------------------------------------------------------------------
-// OUInfoFromEntry
+// GetNormalizedOUInfoFromEntry
 // ---------------------------------------------------------------------------
 
-func TestFREEIPAAdapter_OUInfoFromEntry(t *testing.T) {
+func TestFREEIPAAdapter_GetNormalizedOUInfoFromEntry(t *testing.T) {
 	adapter := FREEIPAAdapter{}
 	entry := ldap.Entry{
 		DN: "ou=people,dc=example,dc=test",
@@ -134,12 +147,12 @@ func TestFREEIPAAdapter_OUInfoFromEntry(t *testing.T) {
 		},
 	}
 
-	info := adapter.OUInfoFromEntry(entry)
+	info := adapter.GetNormalizedOUInfoFromEntry(entry)
 	require.NotNil(t, info)
 
 	assert.Equal(t, "ou=people,dc=example,dc=test", info.DN)
-	// FreeIPA sets Name = full DN (not just the leaf ou value).
-	assert.Equal(t, "ou=people,dc=example,dc=test", info.Name)
+	// Name is derived from the DN's first RDN via ouNameFromDN.
+	assert.Equal(t, "people", info.Name)
 	assert.Equal(t, "people", info.OU)
 
 	// Children must be a non-nil empty slice so callers can append without
@@ -148,12 +161,13 @@ func TestFREEIPAAdapter_OUInfoFromEntry(t *testing.T) {
 	assert.Empty(t, info.Children)
 }
 
-func TestFREEIPAAdapter_OUInfoFromEntry_EmptyEntry(t *testing.T) {
+func TestFREEIPAAdapter_GetNormalizedOUInfoFromEntry_EmptyEntry(t *testing.T) {
 	adapter := FREEIPAAdapter{}
-	info := adapter.OUInfoFromEntry(ldap.Entry{})
+	info := adapter.GetNormalizedOUInfoFromEntry(ldap.Entry{})
 
 	require.NotNil(t, info)
 	assert.Zero(t, info.DN)
+	assert.Zero(t, info.Name)
 	assert.Zero(t, info.OU)
 	assert.NotNil(t, info.Children)
 }
@@ -277,12 +291,13 @@ func TestFREEIPAAdapter_SearchUserGroupsFilterTemplateArgs_OneArgPerPlaceholder(
 func TestFREEIPAAdapter_UserAttrs_ContainsMappedAttributes(t *testing.T) {
 	adapter := FREEIPAAdapter{}
 
-	// Every attribute that GetNormalizedUserInfo reads from LDAPUser must be
-	// present in UserAttrs; otherwise the data is never requested from the
+	// Every attribute that GetNormalizedUserInfo reads *via GetAttributeValue*
+	// must be in UserAttrs; otherwise the data is never requested from the
 	// server and the normalized field stays empty.
+	// NB: DN is taken from the struct field, not an attribute.
 	required := []string{
-		"dn", "cn", "mobile", "telephoneNumber", "mail", "title",
-		"manager", "jpegPhoto", "co", "street", "l", "postalCode",
+		"cn", "mobile", "telephoneNumber", "mail", "title",
+		"manager", "jpegPhoto", "o", "co", "street", "l", "postalCode",
 	}
 
 	attrs := adapter.UserAttrs()

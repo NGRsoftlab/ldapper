@@ -1,0 +1,30 @@
+// Copyright 2020-2026 NGR Softlab
+package ldapper
+
+import (
+	"github.com/NGRsoftlab/ldapper/types"
+)
+
+// GetOU returns the organizational unit with the given ou name inside baseDN.
+func (ldapper *LDAPper) GetOU(ou, baseDN string) (*types.LDAPOU, error) {
+	ldapper.opMu.Lock()
+	defer ldapper.opMu.Unlock()
+	return ldapper.getOULocked(ou, baseDN)
+}
+
+func (ldapper *LDAPper) getOULocked(ou, baseDN string) (*types.LDAPOU, error) {
+	attrs := ldapper.catalogAdapter.OUAttrs()
+
+	entry, err := ldapper.searchSingleEntryLocked(
+		kindOU, ou, baseDN,
+		ldapper.catalogAdapter.SearchOUFilterTemplate(), attrs,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	return &types.LDAPOU{
+		DN:         entry.DN,
+		Attributes: attrsToMap(entry, attrs),
+	}, nil
+}

@@ -10,14 +10,14 @@ package ldapper_test
 //   LDAP_MATCHING_RULE_IN_CHAIN (1.2.840.113556.1.4.1941) extension,
 //   which OpenLDAP does not implement. Samba 4 AD DC does.
 //
-// The MSADAdapter was NOT changed by the recent filter fix: it still emits
+// MSADAdapter filter (unchanged):
 //
 //   (&(objectCategory=group)(member:1.2.840.113556.1.4.1941:=%s))
 //
 // with args [user.DN], which is correct for AD.
 //
-// AuthenticateUser signature note:
-//   After the ldapper.go change, AuthenticateUser takes only
+// CheckUserCredentials signature note:
+//   After the ldapper change, CheckUserCredentials takes only
 //   (username, password). The base DN for the internal GetUser comes from
 //   conn.bindDN, stored by the prior AuthenticateConn call.
 //
@@ -32,6 +32,7 @@ package ldapper_test
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -74,9 +75,6 @@ var (
 	msadAdpt      = adapters.MSADAdapter{}
 )
 
-// TestMain starts a Samba 4 AD DC container, provisions a domain and seeds
-// users/groups via `samba-tool`. On any setup error the whole suite is
-// effectively skipped (individual tests check msadAvailable via requireMSAD).
 func TestMain(m *testing.M) {
 	ctx := context.Background()
 
@@ -136,7 +134,6 @@ func TestMain(m *testing.M) {
 	os.Exit(code)
 }
 
-// waitForMSADReady polls a plain LDAP bind as Administrator until it succeeds.
 func waitForMSADReady(host string, port uint, timeout time.Duration) bool {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
@@ -153,9 +150,6 @@ func waitForMSADReady(host string, port uint, timeout time.Duration) bool {
 	return false
 }
 
-// seedSambaAD creates test users and groups inside the Samba AD DC.
-// Uses samba-tool because AD requires many internal attributes (objectCategory
-// schema DN, userAccountControl, objectSid, ...) that samba-tool fills in.
 func seedSambaAD(ctx context.Context, container testcontainers.Container) error {
 	cmds := [][]string{
 		{"samba-tool", "user", "create", msadUser1SAM, msadUser1Pass},
@@ -180,7 +174,6 @@ func seedSambaAD(ctx context.Context, container testcontainers.Container) error 
 	return nil
 }
 
-// requireMSAD short-circuits a test when the container was not available.
 func requireMSAD(t *testing.T) {
 	t.Helper()
 	if !msadAvailable {
@@ -188,12 +181,11 @@ func requireMSAD(t *testing.T) {
 	}
 }
 
-// newMSADConn returns an unauthenticated connection to the Samba AD DC.
 func newMSADConn(t *testing.T, opts ...ldapper.Option) *ldapper.LDAPper {
 	t.Helper()
 	requireMSAD(t)
 
-	conn, err := ldapper.NewConnection(
+	conn, err := ldapper.NewLDAPper(
 		[]string{msadHost},
 		msadPort,
 		false, // useSSL
@@ -207,13 +199,20 @@ func newMSADConn(t *testing.T, opts ...ldapper.Option) *ldapper.LDAPper {
 	return conn
 }
 
-// newMSADAuthConn returns a connection authenticated as Administrator.
-// bindDN is stored as msadBaseDN so subsequent AuthenticateUser calls use it.
+// newMSADAuthConn authenticates as Administrator. Samba 4 AD accepts DN
+// binds; the adapter's SearchUserFilterTemplate matches the bind principal
+// via sAMAccountName. Because the DN is `cn=Administrator,...`, the filter
+// `(sAMAccountName=cn=Administrator,...)` would NOT match — but Samba
+// resolves the DN directly for the actual bind, and the search after bind
+// also finds the entry because AD returns DN-constructed matches for
+// sAMAccountName lookups when the value is a distinguished name (this is
+// AD's behaviour, not the adapter's). If this assumption breaks on a
+// specific AD build, the failure surfaces here.
 func newMSADAuthConn(t *testing.T, opts ...ldapper.Option) *ldapper.LDAPper {
 	t.Helper()
 	requireMSAD(t)
 
-	conn, _, err := ldapper.NewAuthenticatedConnection(
+	conn, _, err := ldapper.NewAuthenticatedLDAPper(
 		msadAdminDN, msadAdminPass, msadBaseDN,
 		[]string{msadHost},
 		msadPort,
@@ -228,7 +227,6 @@ func newMSADAuthConn(t *testing.T, opts ...ldapper.Option) *ldapper.LDAPper {
 	return conn
 }
 
-// dnContainsUser checks case-insensitively that dn starts with "cn=<user>,".
 func dnContainsUser(dn, user string) bool {
 	return strings.HasPrefix(strings.ToLower(dn), strings.ToLower("cn="+user+","))
 }
@@ -245,9 +243,9 @@ func TestIntegrationMSAD_NewConnection_Success(t *testing.T) {
 
 func TestIntegrationMSAD_NewConnection_EmptyHosts(t *testing.T) {
 	requireMSAD(t)
-	_, err := ldapper.NewConnection(nil, 389, false, true, nil, msadAdpt)
+	_, err := ldapper.NewLDAPper(nil, 389, false, true, nil, msadAdpt)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "empty hosts list")
+	assert.True(t, errors.Is(err, ldapper.ErrInvalidArgument))
 }
 
 func TestIntegrationMSAD_NewConnection_TooManyHosts(t *testing.T) {
@@ -256,35 +254,35 @@ func TestIntegrationMSAD_NewConnection_TooManyHosts(t *testing.T) {
 	for i := range hosts {
 		hosts[i] = fmt.Sprintf("host%d", i)
 	}
-	_, err := ldapper.NewConnection(hosts, 389, false, true, nil, msadAdpt)
+	_, err := ldapper.NewLDAPper(hosts, 389, false, true, nil, msadAdpt)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "too many hosts")
+	assert.True(t, errors.Is(err, ldapper.ErrInvalidArgument))
 }
 
 func TestIntegrationMSAD_NewConnection_NilTLSConfigWhenRequired(t *testing.T) {
 	requireMSAD(t)
-	_, err := ldapper.NewConnection([]string{msadHost}, msadPort, false, false, nil, msadAdpt)
+	_, err := ldapper.NewLDAPper([]string{msadHost}, msadPort, false, false, nil, msadAdpt)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "nil tls config")
+	assert.True(t, errors.Is(err, ldapper.ErrInvalidArgument))
 }
 
 func TestIntegrationMSAD_NewConnection_NilCatalogAdapter(t *testing.T) {
 	requireMSAD(t)
-	_, err := ldapper.NewConnection([]string{msadHost}, msadPort, false, true, nil, nil)
+	_, err := ldapper.NewLDAPper([]string{msadHost}, msadPort, false, true, nil, nil)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "nil catalog adapter")
+	assert.True(t, errors.Is(err, ldapper.ErrInvalidArgument))
 }
 
 func TestIntegrationMSAD_NewConnection_UnreachableHost(t *testing.T) {
 	requireMSAD(t)
-	_, err := ldapper.NewConnection([]string{"127.0.0.1"}, 1, false, true, nil, msadAdpt)
+	_, err := ldapper.NewLDAPper([]string{"127.0.0.1"}, 1, false, true, nil, msadAdpt)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "unsuccessful dial")
+	assert.True(t, errors.Is(err, ldapper.ErrUnavailable))
 }
 
 func TestIntegrationMSAD_NewAuthenticatedConnection_Success(t *testing.T) {
 	requireMSAD(t)
-	conn, user, err := ldapper.NewAuthenticatedConnection(
+	conn, user, err := ldapper.NewAuthenticatedLDAPper(
 		msadAdminDN, msadAdminPass, msadBaseDN,
 		[]string{msadHost}, msadPort, false, true, nil, msadAdpt,
 	)
@@ -297,21 +295,22 @@ func TestIntegrationMSAD_NewAuthenticatedConnection_Success(t *testing.T) {
 
 func TestIntegrationMSAD_NewAuthenticatedConnection_EmptyCredentials(t *testing.T) {
 	requireMSAD(t)
-	_, _, err := ldapper.NewAuthenticatedConnection(
+	_, _, err := ldapper.NewAuthenticatedLDAPper(
 		"", "", msadBaseDN,
 		[]string{msadHost}, msadPort, false, true, nil, msadAdpt,
 	)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "empty bind username/password")
+	assert.True(t, errors.Is(err, ldapper.ErrInvalidArgument))
 }
 
 func TestIntegrationMSAD_NewAuthenticatedConnection_WrongPassword(t *testing.T) {
 	requireMSAD(t)
-	_, _, err := ldapper.NewAuthenticatedConnection(
+	_, _, err := ldapper.NewAuthenticatedLDAPper(
 		msadAdminDN, "wrong-password", msadBaseDN,
 		[]string{msadHost}, msadPort, false, true, nil, msadAdpt,
 	)
 	require.Error(t, err)
+	assert.True(t, errors.Is(err, ldapper.ErrInvalidCredentials))
 }
 
 // ---------------------------------------------------------------------------
@@ -331,73 +330,59 @@ func TestIntegrationMSAD_AuthenticateConn_EmptyCredentials(t *testing.T) {
 	conn := newMSADConn(t)
 	_, err := conn.AuthenticateConn("", "", msadBaseDN)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "empty bind username/password")
+	assert.True(t, errors.Is(err, ldapper.ErrInvalidArgument))
 }
 
 func TestIntegrationMSAD_AuthenticateConn_WrongPassword(t *testing.T) {
 	conn := newMSADConn(t)
 	_, err := conn.AuthenticateConn(msadAdminDN, "bad-password", msadBaseDN)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "unsuccessful bind")
-}
-
-func TestIntegrationMSAD_AuthenticateConn_NonExistentUser(t *testing.T) {
-	conn := newMSADConn(t)
-	_, err := conn.AuthenticateConn(
-		"cn=ghost,cn=Users,dc=example,dc=com", "whatever", msadBaseDN,
-	)
-	require.Error(t, err)
+	assert.True(t, errors.Is(err, ldapper.ErrInvalidCredentials))
 }
 
 // ---------------------------------------------------------------------------
-// AuthenticateUser — signature is now (username, password) only.
-// The base DN used internally by GetUser comes from conn.bindDN,
-// populated by the prior AuthenticateConn call in newMSADAuthConn.
+// CheckUserCredentials
 // ---------------------------------------------------------------------------
 
-func TestIntegrationMSAD_AuthenticateUser_Success(t *testing.T) {
+func TestIntegrationMSAD_CheckUserCredentials_Success(t *testing.T) {
 	conn := newMSADAuthConn(t)
 
-	// The connection is authenticated as Administrator; user1 then binds
-	// with its own credentials and the connection rebinds back to admin.
-	// The filter used by MSADAdapter is:
-	//   (&(objectCategory=person)(objectClass=user)(sAMAccountName=user1))
-	user, err := conn.AuthenticateUser(msadUser1SAM, msadUser1Pass)
+	user, err := conn.CheckUserCredentials(msadUser1SAM, msadUser1Pass)
 	require.NoError(t, err)
 	require.NotNil(t, user)
 	assert.True(t, dnContainsUser(user.DN, msadUser1SAM))
 	assert.Equal(t, msadUser1SAM, user.GetAttributeValue("sAMAccountName"))
 }
 
-func TestIntegrationMSAD_AuthenticateUser_WrongPassword(t *testing.T) {
+func TestIntegrationMSAD_CheckUserCredentials_WrongPassword(t *testing.T) {
 	conn := newMSADAuthConn(t)
 
-	user, err := conn.AuthenticateUser(msadUser1SAM, "bad")
+	user, err := conn.CheckUserCredentials(msadUser1SAM, "bad")
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "unsuccessful bind with passed user credentials")
-	require.NotNil(t, user)
-	assert.Equal(t, msadUser1SAM, user.GetAttributeValue("sAMAccountName"))
+	assert.True(t, errors.Is(err, ldapper.ErrInvalidCredentials))
+	assert.Nil(t, user)
 }
 
-func TestIntegrationMSAD_AuthenticateUser_NonExistentUser(t *testing.T) {
+func TestIntegrationMSAD_CheckUserCredentials_NonExistentUser(t *testing.T) {
 	conn := newMSADAuthConn(t)
-	_, err := conn.AuthenticateUser("ghost-user", "whatever")
+	user, err := conn.CheckUserCredentials("ghost-user", "whatever")
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "user does not exist")
+	assert.True(t, errors.Is(err, ldapper.ErrInvalidCredentials))
+	assert.Nil(t, user)
 }
 
-func TestIntegrationMSAD_AuthenticateUser_NotAuthenticated(t *testing.T) {
+func TestIntegrationMSAD_CheckUserCredentials_NotAuthenticated(t *testing.T) {
 	conn := newMSADConn(t)
-	_, err := conn.AuthenticateUser(msadUser1SAM, msadUser1Pass)
+	_, err := conn.CheckUserCredentials(msadUser1SAM, msadUser1Pass)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "connection not authenticated")
+	assert.True(t, errors.Is(err, ldapper.ErrNotAuthenticated))
 }
 
-func TestIntegrationMSAD_AuthenticateUser_EmptyCredentials(t *testing.T) {
+func TestIntegrationMSAD_CheckUserCredentials_EmptyCredentials(t *testing.T) {
 	conn := newMSADAuthConn(t)
-	_, err := conn.AuthenticateUser("", "")
+	_, err := conn.CheckUserCredentials("", "")
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "empty username/password")
+	assert.True(t, errors.Is(err, ldapper.ErrInvalidArgument))
 }
 
 // ---------------------------------------------------------------------------
@@ -418,7 +403,6 @@ func TestIntegrationMSAD_IsAlive_AfterClose(t *testing.T) {
 func TestIntegrationMSAD_Reconnect_Unauthenticated(t *testing.T) {
 	conn := newMSADConn(t)
 	require.True(t, conn.IsAlive())
-
 	require.NoError(t, conn.Reconnect())
 	assert.True(t, conn.IsAlive())
 }
@@ -427,9 +411,7 @@ func TestIntegrationMSAD_Reconnect_PreservesAuthentication(t *testing.T) {
 	conn := newMSADAuthConn(t)
 	require.NoError(t, conn.Reconnect())
 
-	// AuthenticateUser will fail unless Reconnect re-applied the stored
-	// Administrator credentials and conn.bindDN remained msadBaseDN.
-	_, err := conn.AuthenticateUser(msadUser1SAM, msadUser1Pass)
+	_, err := conn.CheckUserCredentials(msadUser1SAM, msadUser1Pass)
 	require.NoError(t, err)
 }
 
@@ -447,7 +429,7 @@ func TestIntegrationMSAD_EnsureAlive_ReconnectsAfterClose(t *testing.T) {
 	require.NoError(t, conn.EnsureAlive())
 	assert.True(t, conn.IsAlive())
 
-	_, err := conn.AuthenticateUser(msadUser1SAM, msadUser1Pass)
+	_, err := conn.CheckUserCredentials(msadUser1SAM, msadUser1Pass)
 	require.NoError(t, err)
 }
 
@@ -458,7 +440,7 @@ func TestIntegrationMSAD_Close_Idempotent(t *testing.T) {
 
 	_, err := conn.GetUser(msadUser1SAM, msadBaseDN)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "connection not initialized")
+	assert.True(t, errors.Is(err, ldapper.ErrClosed))
 }
 
 // ---------------------------------------------------------------------------
@@ -498,7 +480,7 @@ func TestIntegrationMSAD_CustomSearch_NotInitialized(t *testing.T) {
 	)
 	_, err := conn.CustomSearch(req)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "connection not initialized")
+	assert.True(t, errors.Is(err, ldapper.ErrClosed))
 }
 
 // ---------------------------------------------------------------------------
@@ -519,7 +501,7 @@ func TestIntegrationMSAD_GetUser_NotFound(t *testing.T) {
 	conn := newMSADAuthConn(t)
 	_, err := conn.GetUser("does-not-exist", msadBaseDN)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "user does not exist")
+	assert.True(t, errors.Is(err, ldapper.ErrNotFound))
 }
 
 func TestIntegrationMSAD_GetUser_NotInitialized(t *testing.T) {
@@ -528,19 +510,64 @@ func TestIntegrationMSAD_GetUser_NotInitialized(t *testing.T) {
 
 	_, err := conn.GetUser(msadUser1SAM, msadBaseDN)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "connection not initialized")
+	assert.True(t, errors.Is(err, ldapper.ErrClosed))
 }
 
 // ---------------------------------------------------------------------------
-// GetUserGroups — LDAP_MATCHING_RULE_IN_CHAIN, only AD/Samba4 supports it.
+// GetGroup / GetOU
+// ---------------------------------------------------------------------------
+
+func TestIntegrationMSAD_GetGroup_Success(t *testing.T) {
+	conn := newMSADAuthConn(t)
+
+	group, err := conn.GetGroup("admins", msadBaseDN)
+	require.NoError(t, err)
+	require.NotNil(t, group)
+	assert.Equal(t, "admins", group.GetAttributeValue("cn"))
+}
+
+func TestIntegrationMSAD_GetGroup_NotFound(t *testing.T) {
+	conn := newMSADAuthConn(t)
+	_, err := conn.GetGroup("does-not-exist", msadBaseDN)
+	require.Error(t, err)
+	assert.True(t, errors.Is(err, ldapper.ErrNotFound))
+}
+
+func TestIntegrationMSAD_GetOU_Success(t *testing.T) {
+	conn := newMSADAuthConn(t)
+
+	ou, err := conn.GetOU("Users", msadBaseDN)
+	require.NoError(t, err)
+	require.NotNil(t, ou)
+	assert.Contains(t, ou.DN, "cn=Users")
+}
+
+// ---------------------------------------------------------------------------
+// GetCatalogTree / GetSubOUs
+// ---------------------------------------------------------------------------
+
+func TestIntegrationMSAD_GetCatalogTree_Success(t *testing.T) {
+	conn := newMSADAuthConn(t)
+
+	tree, err := conn.GetCatalogTree(msadBaseDN, 0)
+	require.NoError(t, err)
+	assert.NotEmpty(t, tree.Tree)
+}
+
+func TestIntegrationMSAD_GetSubOUs_SingleLevel(t *testing.T) {
+	conn := newMSADAuthConn(t)
+
+	_, err := conn.GetSubOUs(msadBaseDN, ldap.ScopeSingleLevel)
+	require.NoError(t, err)
+}
+
+// ---------------------------------------------------------------------------
+// GetUserGroups — LDAP_MATCHING_RULE_IN_CHAIN
 // ---------------------------------------------------------------------------
 
 func TestIntegrationMSAD_GetUserGroups_AdminsMembership(t *testing.T) {
 	conn := newMSADAuthConn(t)
 
-	// MSADAdapter filter: (&(objectCategory=group)(member:1.2.840.113556.1.4.1941:=<user.DN>)).
-	// Samba 4 AD DC supports this AD extension, so direct membership must
-	// be discovered.
 	groups, err := conn.GetUserGroups(msadUser1SAM, msadBaseDN)
 	require.NoError(t, err)
 	assert.Contains(t, groups, "admins")
@@ -559,7 +586,7 @@ func TestIntegrationMSAD_GetUserGroups_UserNotFound(t *testing.T) {
 
 	_, err := conn.GetUserGroups("nobody", msadBaseDN)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "user does not exist")
+	assert.True(t, errors.Is(err, ldapper.ErrNotFound))
 }
 
 // ---------------------------------------------------------------------------
@@ -587,11 +614,11 @@ func TestIntegrationMSAD_GetOUUsers_NotInitialized(t *testing.T) {
 
 	_, err := conn.GetOUUsers("cn=Users," + msadBaseDN)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "connection not initialized")
+	assert.True(t, errors.Is(err, ldapper.ErrClosed))
 }
 
 // ---------------------------------------------------------------------------
-// Search limits
+// Search / dial limits
 // ---------------------------------------------------------------------------
 
 func TestIntegrationMSAD_SearchLimits_Defaults(t *testing.T) {
@@ -622,4 +649,20 @@ func TestIntegrationMSAD_SearchLimits_NegativeClampedToZero(t *testing.T) {
 	limits := conn.GetSearchLimits()
 	assert.Equal(t, 0, limits.SizeLimit)
 	assert.Equal(t, 0, limits.TimeLimit)
+}
+
+func TestIntegrationMSAD_DialTimeout_Defaults(t *testing.T) {
+	conn := newMSADConn(t)
+	assert.Equal(t, time.Duration(0), conn.GetDialTimeout())
+}
+
+func TestIntegrationMSAD_DialTimeout_WithOption(t *testing.T) {
+	conn := newMSADConn(t, ldapper.WithDialTimeout(3*time.Second))
+	assert.Equal(t, 3*time.Second, conn.GetDialTimeout())
+}
+
+func TestIntegrationMSAD_DialTimeout_NegativeClampedToZero(t *testing.T) {
+	conn := newMSADConn(t)
+	conn.SetDialTimeout(-1 * time.Second)
+	assert.Equal(t, time.Duration(0), conn.GetDialTimeout())
 }

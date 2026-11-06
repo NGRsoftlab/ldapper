@@ -8,7 +8,8 @@ const (
 	DefaultSearchSizeLimit = 0 // 0 — no size limit (server default)
 	DefaultSearchTimeLimit = 30
 
-	DefaultMaxHostsLength = 50
+	DefaultMaxHostsLength        = 50
+	DefaultCatalogSearchPageSize = 1000
 
-	DefaultCatalogTreePageSize = 1000
+	DefaultDialTimeout = 0
 )

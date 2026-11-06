@@ -7,24 +7,9 @@ type LDAPUser struct {
 }
 
 func (lu *LDAPUser) GetAttributeValue(attribute string) string {
-	temp := lu.Attributes[attribute]
-	if len(temp) == 0 {
-		return ""
-	}
-
-	return temp[0]
+	return attrValue(lu.Attributes, attribute)
 }
 
 func (lu *LDAPUser) GetFirstNonNullAttributeValue(alternatives []string) string {
-	for _, alternative := range alternatives {
-		temp := lu.Attributes[alternative]
-		if len(temp) == 0 {
-			continue
-		}
-		if temp[0] != "" {
-			return temp[0]
-		}
-	}
-
-	return ""
+	return firstAttrValue(lu.Attributes, alternatives)
 }

@@ -17,7 +17,6 @@ import (
 func TestOPENLDAPAdapter_GetNormalizedUserInfo_FullAttributes(t *testing.T) {
 	adapter := OPENLDAPAdapter{}
 	user := newLDAPUser("uid=jdoe,ou=people,dc=example,dc=com", map[string][]string{
-		"dn":               {"uid=jdoe,ou=people,dc=example,dc=com"},
 		"cn":               {"John Doe"},
 		"mobile":           {"+7-999-123-45-67"},
 		"telephoneNumber":  {"+7-495-123-45-67"},
@@ -26,13 +25,15 @@ func TestOPENLDAPAdapter_GetNormalizedUserInfo_FullAttributes(t *testing.T) {
 		"title":            {"Engineer"},
 		"manager":          {"uid=jboss,ou=people,dc=example,dc=com"},
 		"jpegPhoto":        {"jpeg-bytes"},
+		"o":                {"Example Inc."},
 		"postalAddress":    {"Tverskaya 1, Moscow, 101000"},
 	})
 
 	info := adapter.GetNormalizedUserInfo(user)
 
 	assert.NotNil(t, info)
-	// OpenLDAP reads DN from the "dn" attribute, not from the struct field.
+	// NB: OpenLDAP's GetNormalizedUserInfo uses the LDAPUser struct field for
+	// DN, NOT the "dn" attribute.
 	assert.Equal(t, "uid=jdoe,ou=people,dc=example,dc=com", info.DistinguishedName)
 	assert.Equal(t, "John Doe", info.CommonName)
 	assert.Equal(t, "+7-999-123-45-67", info.Mobile)
@@ -43,29 +44,35 @@ func TestOPENLDAPAdapter_GetNormalizedUserInfo_FullAttributes(t *testing.T) {
 	assert.Equal(t, "Engineer", info.Title)
 	assert.Equal(t, "uid=jboss,ou=people,dc=example,dc=com", info.Manager)
 	assert.Equal(t, "jpeg-bytes", info.Photo)
+	assert.Equal(t, "Example Inc.", info.Company, "Company comes from the o attribute")
 	// OpenLDAP reads address from "postalAddress", not "streetAddress" / "street".
 	assert.Equal(t, "Tverskaya 1, Moscow, 101000", info.Address)
 }
 
-// TestOPENLDAPAdapter_GetNormalizedUserInfo_HardcodedEmptyFields documents
-// that Company, Country, City and Index are hardcoded to empty in the
-// OpenLDAP adapter — even if matching LDAP attributes exist on the entry.
+// TestOPENLDAPAdapter_GetNormalizedUserInfo_HardcodedEmptyFields documents the
+// fields that the OpenLDAP adapter *always* leaves empty (Country, City, Index),
+// while Company is actually mapped from "o" and Address from "postalAddress".
 func TestOPENLDAPAdapter_GetNormalizedUserInfo_HardcodedEmptyFields(t *testing.T) {
 	adapter := OPENLDAPAdapter{}
 	user := newLDAPUser("uid=jdoe,dc=example,dc=com", map[string][]string{
-		"cn":         {"John Doe"},
-		"company":    {"Example Inc."},
-		"co":         {"RU"},
-		"l":          {"Moscow"},
-		"postalCode": {"101000"},
+		"cn":            {"John Doe"},
+		"o":             {"Example Inc."},
+		"co":            {"RU"},
+		"l":             {"Moscow"},
+		"postalCode":    {"101000"},
+		"postalAddress": {"Tverskaya 1"},
 	})
 
 	info := adapter.GetNormalizedUserInfo(user)
 
-	assert.Empty(t, info.Company)
-	assert.Empty(t, info.Country)
-	assert.Empty(t, info.City)
-	assert.Empty(t, info.Index)
+	// Hardcoded to "" in the OpenLDAP adapter.
+	assert.Empty(t, info.Country, "Country is hardcoded to empty")
+	assert.Empty(t, info.City, "City is hardcoded to empty")
+	assert.Empty(t, info.Index, "Index is hardcoded to empty")
+
+	// But Company and Address DO come from LDAP (o / postalAddress).
+	assert.Equal(t, "Example Inc.", info.Company, "Company is mapped from o")
+	assert.Equal(t, "Tverskaya 1", info.Address, "Address is mapped from postalAddress")
 }
 
 func TestOPENLDAPAdapter_GetNormalizedUserInfo_EmptyUser(t *testing.T) {
@@ -94,16 +101,18 @@ func TestOPENLDAPAdapter_GetNormalizedUserInfo_NilAttributesMap(t *testing.T) {
 	})
 }
 
-func TestOPENLDAPAdapter_GetNormalizedUserInfo_DistinguishedNameFromAttrOnly(t *testing.T) {
-	// DN must come from the "dn" attribute; the struct's DN field is ignored.
-	user := newLDAPUser("uid=jdoe,dc=x", map[string][]string{
+// TestOPENLDAPAdapter_GetNormalizedUserInfo_DistinguishedNameFromStructField
+// pins the DN source: the struct field wins over the "dn" attribute.
+func TestOPENLDAPAdapter_GetNormalizedUserInfo_DistinguishedNameFromStructField(t *testing.T) {
+	user := newLDAPUser("uid=from-struct,dc=x", map[string][]string{
 		"cn": {"John"},
+		"dn": {"uid=from-attr,dc=x"},
 	})
 
 	info := OPENLDAPAdapter{}.GetNormalizedUserInfo(user)
 
-	assert.Empty(t, info.DistinguishedName,
-		"DistinguishedName must be filled only from the \"dn\" attribute")
+	assert.Equal(t, "uid=from-struct,dc=x", info.DistinguishedName,
+		"DistinguishedName must come from the struct field, not the dn attribute")
 }
 
 func TestOPENLDAPAdapter_GetNormalizedUserInfo_PhotoOnlyJpeg(t *testing.T) {
@@ -118,9 +127,9 @@ func TestOPENLDAPAdapter_GetNormalizedUserInfo_PhotoOnlyJpeg(t *testing.T) {
 		"thumbnailPhoto is not used by the OpenLDAP adapter")
 }
 
-// ---------- OUInfoFromEntry ----------
+// ---------- GetNormalizedOUInfoFromEntry ----------
 
-func TestOPENLDAPAdapter_OUInfoFromEntry_FullAttributes(t *testing.T) {
+func TestOPENLDAPAdapter_GetNormalizedOUInfoFromEntry_FullAttributes(t *testing.T) {
 	entry := ldap.Entry{
 		DN: "ou=IT,ou=Departments,dc=example,dc=com",
 		Attributes: []*ldap.EntryAttribute{
@@ -128,18 +137,19 @@ func TestOPENLDAPAdapter_OUInfoFromEntry_FullAttributes(t *testing.T) {
 		},
 	}
 
-	info := OPENLDAPAdapter{}.OUInfoFromEntry(entry)
+	info := OPENLDAPAdapter{}.GetNormalizedOUInfoFromEntry(entry)
 
 	assert.NotNil(t, info)
 	assert.Equal(t, "ou=IT,ou=Departments,dc=example,dc=com", info.DN)
-	// OpenLDAP: Name equals the entry DN, not the "name"/"ou" attribute.
-	assert.Equal(t, "ou=IT,ou=Departments,dc=example,dc=com", info.Name)
-	// OpenLDAP: OU comes from the "ou" attribute, not from the DN.
+	// NB: Name comes from ouNameFromDN(entry.DN), not from the DN itself.
+	assert.Equal(t, "IT", info.Name)
+	// OpenLDAP: OU comes from the "ou" attribute.
 	assert.Equal(t, "IT", info.OU)
 }
 
-func TestOPENLDAPAdapter_OUInfoFromEntry_NameIsAlwaysDN(t *testing.T) {
-	// Name must equal DN regardless of a "name" attribute on the entry.
+// TestOPENLDAPAdapter_GetNormalizedOUInfoFromEntry_NameFromDNFirstRDN verifies
+// that the "name" attribute is irrelevant — Name is derived from the DN.
+func TestOPENLDAPAdapter_GetNormalizedOUInfoFromEntry_NameFromDNFirstRDN(t *testing.T) {
 	entry := ldap.Entry{
 		DN: "ou=IT,dc=example,dc=com",
 		Attributes: []*ldap.EntryAttribute{
@@ -148,14 +158,14 @@ func TestOPENLDAPAdapter_OUInfoFromEntry_NameIsAlwaysDN(t *testing.T) {
 		},
 	}
 
-	info := OPENLDAPAdapter{}.OUInfoFromEntry(entry)
+	info := OPENLDAPAdapter{}.GetNormalizedOUInfoFromEntry(entry)
 
-	assert.Equal(t, "ou=IT,dc=example,dc=com", info.Name)
+	assert.Equal(t, "IT", info.Name)
 	assert.NotEqual(t, "IGNORED", info.Name)
 }
 
-func TestOPENLDAPAdapter_OUInfoFromEntry_MissingOUAttribute(t *testing.T) {
-	// Absent "ou" attribute leaves OU empty; DN and Name stay populated.
+func TestOPENLDAPAdapter_GetNormalizedOUInfoFromEntry_MissingOUAttribute(t *testing.T) {
+	// Absent "ou" attribute leaves OU empty; Name still comes from the DN.
 	entry := ldap.Entry{
 		DN: "ou=IT,dc=example,dc=com",
 		Attributes: []*ldap.EntryAttribute{
@@ -163,14 +173,14 @@ func TestOPENLDAPAdapter_OUInfoFromEntry_MissingOUAttribute(t *testing.T) {
 		},
 	}
 
-	info := OPENLDAPAdapter{}.OUInfoFromEntry(entry)
+	info := OPENLDAPAdapter{}.GetNormalizedOUInfoFromEntry(entry)
 
 	assert.Equal(t, "ou=IT,dc=example,dc=com", info.DN)
-	assert.Equal(t, "ou=IT,dc=example,dc=com", info.Name)
+	assert.Equal(t, "IT", info.Name)
 	assert.Empty(t, info.OU)
 }
 
-func TestOPENLDAPAdapter_OUInfoFromEntry_UsesFirstValueOfMultiValuedOU(t *testing.T) {
+func TestOPENLDAPAdapter_GetNormalizedOUInfoFromEntry_UsesFirstValueOfMultiValuedOU(t *testing.T) {
 	entry := ldap.Entry{
 		DN: "ou=IT,dc=example,dc=com",
 		Attributes: []*ldap.EntryAttribute{
@@ -178,14 +188,15 @@ func TestOPENLDAPAdapter_OUInfoFromEntry_UsesFirstValueOfMultiValuedOU(t *testin
 		},
 	}
 
-	info := OPENLDAPAdapter{}.OUInfoFromEntry(entry)
+	info := OPENLDAPAdapter{}.GetNormalizedOUInfoFromEntry(entry)
 
 	assert.Equal(t, "IT", info.OU)
 }
 
-// TestOPENLDAPAdapter_OUInfoFromEntry_DegenerateInputs covers empty entries and
-// nil attributes; Children must always be a non-nil empty slice.
-func TestOPENLDAPAdapter_OUInfoFromEntry_DegenerateInputs(t *testing.T) {
+// TestOPENLDAPAdapter_GetNormalizedOUInfoFromEntry_DegenerateInputs covers
+// empty entries and nil attributes; Children must always be a non-nil empty
+// slice.
+func TestOPENLDAPAdapter_GetNormalizedOUInfoFromEntry_DegenerateInputs(t *testing.T) {
 	tests := []struct {
 		name  string
 		entry ldap.Entry
@@ -196,7 +207,7 @@ func TestOPENLDAPAdapter_OUInfoFromEntry_DegenerateInputs(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			assert.NotPanics(t, func() {
-				info := OPENLDAPAdapter{}.OUInfoFromEntry(tc.entry)
+				info := OPENLDAPAdapter{}.GetNormalizedOUInfoFromEntry(tc.entry)
 				assert.NotNil(t, info)
 				assert.Equal(t, tc.entry.DN, info.DN)
 				assert.NotNil(t, info.Children)
@@ -206,11 +217,11 @@ func TestOPENLDAPAdapter_OUInfoFromEntry_DegenerateInputs(t *testing.T) {
 	}
 }
 
-func TestOPENLDAPAdapter_OUInfoFromEntry_ChildrenAppendable(t *testing.T) {
-	info := OPENLDAPAdapter{}.OUInfoFromEntry(ldap.Entry{DN: "ou=IT,dc=x"})
+func TestOPENLDAPAdapter_GetNormalizedOUInfoFromEntry_ChildrenAppendable(t *testing.T) {
+	info := OPENLDAPAdapter{}.GetNormalizedOUInfoFromEntry(ldap.Entry{DN: "ou=IT,dc=x"})
 
 	assert.NotPanics(t, func() {
-		info.Children = append(info.Children, &types.OUInfo{DN: "ou=Sub,ou=IT,dc=x"})
+		info.Children = append(info.Children, &types.OUNormalizedInfo{DN: "ou=Sub,ou=IT,dc=x"})
 	})
 	assert.Len(t, info.Children, 1)
 }
@@ -377,8 +388,9 @@ func TestOPENLDAPAdapter_SearchUserGroupsFilterTemplateArgs_NilAttributesMap(t *
 // ---------- ATTRS ----------
 
 func TestOPENLDAPAdapter_UserAttrs(t *testing.T) {
+	// NB: "dn" is NOT part of UserAttrs — DistinguishedName comes from the
+	// LDAPUser struct field populated by the search layer.
 	expected := []string{
-		"dn",
 		// common (person class)
 		"cn", "sn",
 		// organizationalPerson class
@@ -398,7 +410,7 @@ func TestOPENLDAPAdapter_UserAttrs_ContainsCriticalAttributes(t *testing.T) {
 	attrs := OPENLDAPAdapter{}.UserAttrs()
 
 	critical := []string{
-		"dn", "cn", "sn", "uid", "mail", "mobile", "telephoneNumber",
+		"cn", "sn", "uid", "mail", "mobile", "telephoneNumber",
 		"departmentNumber", "jpegPhoto", "manager", "title", "postalAddress",
 		"uidNumber", "gidNumber", "homeDirectory",
 	}

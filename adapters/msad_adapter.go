@@ -12,10 +12,8 @@ type MSADAdapter struct{}
 // CAST
 
 func (a MSADAdapter) GetNormalizedUserInfo(ldapUser types.LDAPUser) *types.UserNormalizedInfo {
-	// TODO: think what else we need in normalized user info
-
 	return &types.UserNormalizedInfo{
-		DistinguishedName: ldapUser.GetAttributeValue("distinguishedName"),
+		DistinguishedName: ldapUser.DN,
 		CommonName:        ldapUser.GetAttributeValue("cn"),
 		Mobile:            ldapUser.GetAttributeValue("mobile"),
 		Phone:             ldapUser.GetAttributeValue("telephoneNumber"),
@@ -32,12 +30,12 @@ func (a MSADAdapter) GetNormalizedUserInfo(ldapUser types.LDAPUser) *types.UserN
 	}
 }
 
-func (a MSADAdapter) OUInfoFromEntry(entry ldap.Entry) *types.OUInfo {
-	return &types.OUInfo{
+func (a MSADAdapter) GetNormalizedOUInfoFromEntry(entry ldap.Entry) *types.OUNormalizedInfo {
+	return &types.OUNormalizedInfo{
 		DN:       entry.DN,
-		Name:     entry.GetAttributeValue("name"),
+		Name:     ouNameFromDN(entry.DN),
 		OU:       entry.DN,
-		Children: make([]*types.OUInfo, 0),
+		Children: make([]*types.OUNormalizedInfo, 0),
 	}
 }
 

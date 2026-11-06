@@ -2,118 +2,202 @@
 package ldapper
 
 import (
-	"errors"
 	"fmt"
 
 	"github.com/go-ldap/ldap/v3"
 
-	"github.com/NGRsoftlab/ldapper/types"
+	"github.com/NGRsoftlab/ldapper/constants"
 )
 
 // SEARCH METHODS
 
-func (conn *LDAPper) CustomSearch(searchRequest *ldap.SearchRequest) (*ldap.SearchResult, error) {
-	if conn.connection == nil {
-		return nil, errors.New("connection not initialized")
+// lookupKind names the entity being looked up — used only for error messages.
+type lookupKind string
+
+const (
+	kindUser  lookupKind = "user"
+	kindGroup lookupKind = "group"
+	kindOU    lookupKind = "ou"
+)
+
+// searchSingleEntryLocked performs a "single object by unique key" lookup:
+// validates inputs, builds the filter from the adapter template, and enforces
+// the 0 / 1 / >1 contract using SizeLimit=2. Caller must hold opMu.
+func (ldapper *LDAPper) searchSingleEntryLocked(
+	kind lookupKind,
+	name, baseDN, filterTemplate string,
+	attributes []string,
+) (*ldap.Entry, error) {
+
+	if err := ldapper.requireConnLocked(); err != nil {
+		return nil, err
+	}
+	if err := validateBaseDN(baseDN); err != nil {
+		return nil, err
+	}
+	if name == "" {
+		return nil, fmt.Errorf("%w: empty %s name", ErrInvalidArgument, kind)
 	}
 
-	return conn.connection.Search(searchRequest)
+	filter := fmt.Sprintf(filterTemplate, ldap.EscapeFilter(name))
+
+	// NB: SizeLimit=2 is enough to detect duplicates without over-fetching,
+	// and is independent of user-configured searchLimits.
+	req := ldap.NewSearchRequest(
+		baseDN, ldap.ScopeWholeSubtree, ldap.NeverDerefAliases,
+		2, ldapper.searchLimits.TimeLimit, false, filter, attributes, nil,
+	)
+
+	res, err := ldapper.connection.Search(req)
+	if err != nil {
+		return nil, fmt.Errorf("unsuccessful %s search: %w", kind, classifyLDAPError(err))
+	}
+
+	switch {
+	case len(res.Entries) == 0:
+		return nil, fmt.Errorf("%w: %s %q does not exist", ErrNotFound, kind, name)
+	case len(res.Entries) > 1:
+		return nil, fmt.Errorf("%w: too many entries for %s %q", ErrAmbiguousResult, kind, name)
+	}
+	return res.Entries[0], nil
 }
 
-func (conn *LDAPper) GetUser(username, baseDN string) (*types.LDAPUser, error) {
-	if conn.connection == nil {
-		return nil, errors.New("connection not initialized")
-	}
-
-	filter := fmt.Sprintf(conn.catalogAdapter.SearchUserFilterTemplate(), username)
-	attributes := conn.catalogAdapter.UserAttrs()
-
-	searchRequest := conn.newSearchRequest(baseDN, ldap.ScopeWholeSubtree, ldap.NeverDerefAliases, false, filter, attributes, nil)
-
-	searchResult, err := conn.connection.Search(searchRequest)
-	if err != nil {
-		return nil, fmt.Errorf("unsuccessful user search: %s", err.Error())
-	}
-
-	if len(searchResult.Entries) < 1 {
-		return nil, errors.New("user does not exist")
-	}
-
-	if len(searchResult.Entries) > 1 {
-		return nil, errors.New("too many entries returned")
-	}
-
-	user := &types.LDAPUser{
-		DN:         searchResult.Entries[0].DN,
-		Attributes: map[string][]string{},
-	}
-
-	for _, attr := range conn.catalogAdapter.UserAttrs() {
-		user.Attributes[attr] = searchResult.Entries[0].GetAttributeValues(attr)
-	}
-
-	return user, nil
+// newSearchRequest builds a search request using connection-level limits.
+// All search methods should use it instead of calling ldap.NewSearchRequest directly.
+func (ldapper *LDAPper) newSearchRequest(
+	baseDN string,
+	scope int,
+	derefAliases int,
+	typesOnly bool,
+	filter string,
+	attributes []string,
+	controls []ldap.Control,
+) *ldap.SearchRequest {
+	return ldap.NewSearchRequest(
+		baseDN,
+		scope,
+		derefAliases,
+		ldapper.searchLimits.SizeLimit,
+		ldapper.searchLimits.TimeLimit,
+		typesOnly,
+		filter,
+		attributes,
+		controls,
+	)
 }
 
-func (conn *LDAPper) GetUserGroups(username, baseDN string) ([]string, error) {
-	if conn.connection == nil {
-		return nil, errors.New("connection not initialized")
-	}
+// searchPaged executes a search and follows the paging control until all
+// pages have been retrieved. If the server does not honor paging, it silently
+// falls back to a single search result.
+//
+// Caller must hold opMu. The lock is held across all pages because the paging
+// cookie is bound to the current connection and interleaving with other
+// operations would corrupt the protocol stream.
+func (ldapper *LDAPper) searchPaged(
+	baseDN string,
+	scope int,
+	derefAliases int,
+	typesOnly bool,
+	filter string,
+	attributes []string,
+	controls []ldap.Control,
+) ([]*ldap.Entry, error) {
 
-	user, err := conn.GetUser(username, baseDN)
-	if err != nil {
+	if err := ldapper.requireConnLocked(); err != nil {
 		return nil, err
 	}
 
-	filter := fmt.Sprintf(
-		conn.catalogAdapter.SearchUserGroupsFilterTemplate(),
-		conn.catalogAdapter.SearchUserGroupsFilterTemplateArgs(*user)...,
-	)
-
-	searchRequest := conn.newSearchRequest(baseDN, ldap.ScopeWholeSubtree, ldap.NeverDerefAliases, false, filter, []string{"cn"}, nil)
-
-	searchResult, err := conn.connection.Search(searchRequest)
-	if err != nil {
-		return nil, fmt.Errorf("unsuccessful user groups search: %s", err.Error())
+	if err := validateBaseDN(baseDN); err != nil {
+		return nil, err
 	}
 
-	groups := make([]string, 0)
-	for _, entry := range searchResult.Entries {
-		groups = append(groups, entry.GetAttributeValues("cn")...)
+	pagingControl := ldap.NewControlPaging(constants.DefaultCatalogSearchPageSize)
+
+	// Preserve caller-provided controls and add the paging control on top.
+	pageControls := make([]ldap.Control, 0, len(controls)+1)
+	pageControls = append(pageControls, controls...)
+	pageControls = append(pageControls, pagingControl)
+
+	var allEntries []*ldap.Entry
+
+	for {
+		req := ldapper.newSearchRequest(baseDN, scope, derefAliases, typesOnly, filter, attributes, pageControls)
+
+		result, err := ldapper.connection.Search(req)
+		if err != nil {
+			// NB: paging is honored by most servers; when it is not and the server
+			// returns a size-limit error, preserve what we already fetched so callers
+			// can decide how to proceed.
+			if ldap.IsErrorWithCode(err, ldap.LDAPResultSizeLimitExceeded) && len(allEntries) > 0 {
+				return allEntries, fmt.Errorf("%w: %w", ErrPartialResult, err)
+			}
+			return nil, err
+		}
+
+		allEntries = append(allEntries, result.Entries...)
+
+		// The server echoes the paging control back; extract the next cookie.
+		ctrl := ldap.FindControl(result.Controls, ldap.ControlTypePaging)
+		if ctrl == nil {
+			break // server did not honor paging: single page, done
+		}
+
+		next, ok := ctrl.(*ldap.ControlPaging)
+		if !ok {
+			break // unexpected control type: stop rather than loop forever
+		}
+
+		pagingControl.SetCookie(next.Cookie)
+		if len(next.Cookie) == 0 {
+			break // empty cookie = last page
+		}
 	}
 
-	return groups, nil
+	return allEntries, nil
 }
 
-func (conn *LDAPper) GetOUUsers(ou string) ([]*types.LDAPUser, error) {
-	if conn.connection == nil {
-		return nil, errors.New("connection not initialized")
+// CustomSearchPaged is a public proxy for searchPaged that accepts a
+// pre-built ldap.SearchRequest. Automatic paging is applied on top of the
+// request's controls.
+// NB: just public proxy-method for ldapper.searchPaged call with *ldap.SearchRequest param, automatic paging
+func (ldapper *LDAPper) CustomSearchPaged(searchRequest *ldap.SearchRequest) ([]*ldap.Entry, error) {
+	if searchRequest == nil {
+		return nil, fmt.Errorf("%w: nil search request", ErrInvalidArgument)
 	}
 
-	res := make([]*types.LDAPUser, 0)
+	ldapper.opMu.Lock()
+	defer ldapper.opMu.Unlock()
 
-	filter := conn.catalogAdapter.UserObjectFilter()
-	attributes := conn.catalogAdapter.UserAttrs()
+	return ldapper.searchPaged(
+		searchRequest.BaseDN,
+		searchRequest.Scope,
+		searchRequest.DerefAliases,
+		searchRequest.TypesOnly,
+		searchRequest.Filter,
+		searchRequest.Attributes,
+		searchRequest.Controls)
+}
 
-	searchRequest := conn.newSearchRequest(ou, ldap.ScopeWholeSubtree, ldap.NeverDerefAliases, false, filter, attributes, nil)
+// CustomSearch executes the given search request as-is.
+// No paging, no search-limit overrides, no DN validation are applied —
+// the caller is responsible for the request semantics.
+// Use CustomSearchPaged if you want automatic paging.
+func (ldapper *LDAPper) CustomSearch(searchRequest *ldap.SearchRequest) (*ldap.SearchResult, error) {
+	ldapper.opMu.Lock()
+	defer ldapper.opMu.Unlock()
 
-	searchResult, err := conn.connection.Search(searchRequest)
+	if err := ldapper.requireConnLocked(); err != nil {
+		return nil, err
+	}
+
+	if searchRequest == nil {
+		return nil, fmt.Errorf("%w: nil search request", ErrInvalidArgument)
+	}
+
+	res, err := ldapper.connection.Search(searchRequest)
 	if err != nil {
-		return nil, fmt.Errorf("unsuccessful ou users search: %s", err.Error())
+		return nil, fmt.Errorf("custom search: %w", classifyLDAPError(err))
 	}
 
-	for _, entry := range searchResult.Entries {
-		user := &types.LDAPUser{
-			DN:         entry.DN,
-			Attributes: map[string][]string{},
-		}
-
-		for _, attr := range conn.catalogAdapter.UserAttrs() {
-			user.Attributes[attr] = entry.GetAttributeValues(attr)
-		}
-
-		res = append(res, user)
-	}
-
-	return res, err
+	return res, nil
 }

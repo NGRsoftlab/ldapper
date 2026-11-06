@@ -1,0 +1,159 @@
+// Copyright 2020-2026 NGR Softlab
+package ldapper
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"os"
+
+	"github.com/go-ldap/ldap/v3"
+)
+
+var (
+	// Input/config validation
+	ErrInvalidArgument = errors.New("invalid argument")
+
+	// Authentication & authorization
+	ErrInvalidCredentials = errors.New("invalid credentials")
+	ErrNotAuthenticated   = errors.New("connection not authenticated")
+
+	// Transport / availability
+	ErrUnavailable = errors.New("directory unavailable")
+	ErrTimeout     = errors.New("operation timed out")
+	ErrClosed      = errors.New("connection closed or not initialized")
+
+	// Result shape
+	ErrNotFound        = errors.New("not found")
+	ErrAmbiguousResult = errors.New("ambiguous result")
+	ErrPartialResult   = errors.New("partial result")
+
+	// Smth strange :)
+	ErrInsufficientAccess = errors.New("insufficient access rights")
+)
+
+// isTimeoutError reports whether err represents a timeout / deadline condition.
+func isTimeoutError(err error) bool {
+	if err == nil {
+		return false
+	}
+	// context.DeadlineExceeded and os.ErrDeadlineExceeded are the same
+	// class since Go 1.15, but check both for clarity / robustness.
+	if errors.Is(err, context.DeadlineExceeded) ||
+		errors.Is(err, os.ErrDeadlineExceeded) {
+		return true
+	}
+	if netErr, ok := errors.AsType[net.Error](err); ok && netErr.Timeout() {
+		return true
+	}
+	return false
+}
+
+// isTransportError reports whether err originates from the network layer
+// (connection failure, timeout, broken pipe, EOF) rather than from an LDAP
+// protocol response. Useful to distinguish "server unavailable" from
+// "credentials rejected" in security-sensitive paths where raw error text
+// must not be exposed.
+func isTransportError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if isTimeoutError(err) {
+		return true
+	}
+	switch {
+	case errors.Is(err, io.EOF),
+		errors.Is(err, io.ErrUnexpectedEOF),
+		errors.Is(err, net.ErrClosed):
+		return true
+	}
+	// Any net.Error (including *net.OpError): Dial/Read/Write failures.
+	if _, ok := errors.AsType[net.Error](err); ok {
+		return true
+	}
+	// Underlying syscall errors from read/write: ECONNRESET, EPIPE, etc.
+	if _, ok := errors.AsType[*os.SyscallError](err); ok {
+		return true
+	}
+	return false
+}
+
+// classifyLDAPError maps transport/protocol errors to public sentinels.
+// The original error is preserved in the chain so callers can still
+// errors.As() it to *ldap.Error or net.Error.
+func classifyLDAPError(err error) error {
+	if err == nil {
+		return nil
+	}
+
+	switch {
+	case ldap.IsErrorWithCode(err, ldap.LDAPResultInvalidCredentials):
+		return fmt.Errorf("%w: %w", ErrInvalidCredentials, err)
+
+	case ldap.IsErrorWithCode(err, ldap.LDAPResultTimeout),
+		ldap.IsErrorWithCode(err, ldap.LDAPResultTimeLimitExceeded):
+		return fmt.Errorf("%w: %w", ErrTimeout, err)
+
+	case ldap.IsErrorWithCode(err, ldap.LDAPResultUnavailable),
+		ldap.IsErrorWithCode(err, ldap.LDAPResultBusy),
+		ldap.IsErrorWithCode(err, ldap.LDAPResultServerDown):
+		return fmt.Errorf("%w: %w", ErrUnavailable, err)
+
+	case ldap.IsErrorWithCode(err, ldap.LDAPResultSizeLimitExceeded):
+		return fmt.Errorf("%w: %w", ErrPartialResult, err)
+
+	case ldap.IsErrorWithCode(err, ldap.LDAPResultNoSuchObject):
+		return fmt.Errorf("%w: %w", ErrNotFound, err)
+	}
+
+	if errors.Is(err, net.ErrClosed) {
+		return fmt.Errorf("%w: %w", ErrClosed, err)
+	}
+	if isTransportError(err) {
+		if isTimeoutError(err) {
+			return fmt.Errorf("%w: %w", ErrTimeout, err)
+		}
+		return fmt.Errorf("%w: %w", ErrUnavailable, err)
+	}
+
+	return err
+}
+
+// classifySensitiveBindError is the bind-path counterpart: it classifies
+// based on result code but never includes the underlying error text, which
+// may echo back the submitted credentials.
+func classifySensitiveBindError(err error) error {
+	if err == nil {
+		return nil
+	}
+
+	switch {
+	case ldap.IsErrorWithCode(err, ldap.LDAPResultInvalidCredentials):
+		return ErrInvalidCredentials
+	case ldap.IsErrorWithCode(err, ldap.LDAPResultTimeout),
+		ldap.IsErrorWithCode(err, ldap.LDAPResultTimeLimitExceeded):
+		return ErrTimeout
+	case ldap.IsErrorWithCode(err, ldap.LDAPResultUnavailable),
+		ldap.IsErrorWithCode(err, ldap.LDAPResultBusy),
+		ldap.IsErrorWithCode(err, ldap.LDAPResultServerDown):
+		return ErrUnavailable
+	case ldap.IsErrorWithCode(err, ldap.LDAPResultInsufficientAccessRights):
+		return ErrInsufficientAccess
+	}
+
+	if errors.Is(err, net.ErrClosed) {
+		return ErrClosed
+	}
+	if isTransportError(err) {
+		if isTimeoutError(err) {
+			return ErrTimeout
+		}
+		return ErrUnavailable
+	}
+
+	// Unknown bind failure — treat as credential rejection without leaking
+	// server-side details.
+	return ErrInvalidCredentials
+}

@@ -3,479 +3,377 @@ package ldapper
 
 import (
 	"errors"
-	"strings"
 	"testing"
 
 	"github.com/go-ldap/ldap/v3"
 
-	"github.com/NGRsoftlab/ldapper/constants"
 	"github.com/NGRsoftlab/ldapper/mocks"
 	"github.com/NGRsoftlab/ldapper/types"
 )
 
-// ---------- parentDNOf ----------
-
-func TestParentDNOf(t *testing.T) {
-	tests := []struct {
-		name string
-		in   string
-		want string
-	}{
-		{"top_level", "dc=x", ""},
-		{"two_level", "ou=users,dc=x", "dc=x"},
-		{"deep", "ou=a,ou=b,dc=x", "ou=b,dc=x"},
-		{"escaped_comma", `cn=Doe\, John,ou=users,dc=x`, "ou=users,dc=x"},
-		{"empty", "", ""},
-		{"invalid", "ou=x,,dc=y", ""},
-	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := parentDNOf(tc.in); got != tc.want {
-				t.Fatalf("got %q, want %q", got, tc.want)
+// ouTreeAdapter returns a fake adapter that projects every entry into an
+// OUNormalizedInfo with an empty (non-nil) Children slice. This matches
+// the behaviour of the built-in adapters and keeps DeepEqual comparisons
+// deterministic.
+func ouTreeAdapter() *fakeAdapter {
+	return &fakeAdapter{
+		ouObjFilter: "(&(objectClass=organizationalUnit))",
+		ouAttrs:     []string{"ou"},
+		normalizedOU: func(e ldap.Entry) *types.OUNormalizedInfo {
+			return &types.OUNormalizedInfo{
+				DN:       e.DN,
+				Name:     e.DN,
+				OU:       e.GetAttributeValue("ou"),
+				Children: make([]*types.OUNormalizedInfo, 0),
 			}
-		})
+		},
 	}
 }
 
-// ---------- trimDepth ----------
+// collectDNs flattens a tree to the set of DNs reachable from its roots,
+// ignoring structure. Sufficient for "is every node present once" checks.
+func collectDNs(nodes []*types.OUNormalizedInfo) []string {
+	var out []string
+	for _, n := range nodes {
+		out = append(out, n.DN)
+		out = append(out, collectDNs(n.Children)...)
+	}
+	return out
+}
 
-func TestTrimDepth(t *testing.T) {
-	// Fixture (3 levels):
-	//   A -> A1 -> A11
-	//     -> A2
-	//   B
-	newTree := func() []*types.OUInfo {
-		return []*types.OUInfo{
-			{DN: "A", Children: []*types.OUInfo{
-				{DN: "A1", Children: []*types.OUInfo{
-					{DN: "A11", Children: []*types.OUInfo{}},
-				}},
-				{DN: "A2", Children: []*types.OUInfo{}},
-			}},
-			{DN: "B", Children: []*types.OUInfo{}},
+// findNode locates a node by DN in a tree (recursive).
+func findNode(nodes []*types.OUNormalizedInfo, dn string) *types.OUNormalizedInfo {
+	for _, n := range nodes {
+		if n.DN == dn {
+			return n
+		}
+		if got := findNode(n.Children, dn); got != nil {
+			return got
 		}
 	}
-
-	t.Run("depth_1_roots_only", func(t *testing.T) {
-		orig := newTree()
-		got := trimDepth(orig, 1)
-		if len(got) != 2 || got[0].DN != "A" || got[1].DN != "B" {
-			t.Fatalf("unexpected roots: %+v", got)
-		}
-		for _, n := range got {
-			if len(n.Children) != 0 {
-				t.Errorf("expected no children at depth 1, got: %+v", n.Children)
-			}
-		}
-		// trimDepth must return copies, not mutate the input.
-		if len(orig[0].Children) != 2 {
-			t.Error("trimDepth must not mutate the original tree")
-		}
-	})
-
-	t.Run("depth_2", func(t *testing.T) {
-		got := trimDepth(newTree(), 2)
-		if len(got[0].Children) != 2 {
-			t.Fatalf("expected 2 children of A, got %d", len(got[0].Children))
-		}
-		for _, c := range got[0].Children {
-			if len(c.Children) != 0 {
-				t.Errorf("expected no grandchildren at depth 2, got: %+v", c.Children)
-			}
-		}
-	})
-
-	t.Run("depth_above_height_keeps_full_tree", func(t *testing.T) {
-		got := trimDepth(newTree(), 10)
-		if len(got[0].Children[0].Children) != 1 || got[0].Children[0].Children[0].DN != "A11" {
-			t.Fatalf("expected A11 preserved, got: %+v", got[0].Children[0].Children)
-		}
-	})
-
-	t.Run("empty_input", func(t *testing.T) {
-		got := trimDepth(nil, 5)
-		if got == nil || len(got) != 0 {
-			t.Fatalf("expected non-nil empty slice, got: %+v", got)
-		}
-	})
+	return nil
 }
 
 // ---------- GetCatalogTree ----------
 
-func TestGetCatalogTree_SearchError(t *testing.T) {
-	conn := newTestConnection(&testCatalogAdapter{}, &mocks.MockLDAPConn{
-		SearchFunc: func(*ldap.SearchRequest) (*ldap.SearchResult, error) {
-			return nil, errors.New("boom")
-		},
+// TestGetCatalogTree covers tree building from a single paged search:
+// filtering, orphan promotion, case-insensitive DN matching, malformed
+// entries and depth trimming.
+func TestGetCatalogTree(t *testing.T) {
+	const baseDN = "dc=example,dc=com"
+
+	t.Run("nil connection", func(t *testing.T) {
+		l := &LDAPper{catalogAdapter: ouTreeAdapter()}
+		_, err := l.GetCatalogTree(baseDN, 0)
+		if !errors.Is(err, ErrClosed) {
+			t.Fatalf("errors.Is(%v, ErrClosed) = false", err)
+		}
 	})
-	tree, err := conn.GetCatalogTree("dc=x", 0)
-	if err == nil || !strings.Contains(err.Error(), "unsuccessful ou search") {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if tree.Tree == nil || len(tree.Tree) != 0 {
-		t.Errorf("tree must be non-nil and empty on error, got: %+v", tree.Tree)
-	}
-}
 
-func TestGetCatalogTree_InvalidBaseDN(t *testing.T) {
-	conn := newTestConnection(&testCatalogAdapter{}, mockOUs())
-	_, err := conn.GetCatalogTree("ou=x,,dc=y", 0)
-	if err == nil || !strings.Contains(err.Error(), "invalid base DN") {
-		t.Fatalf("unexpected error: %v", err)
-	}
-}
-
-func TestGetCatalogTree_EmptyResult(t *testing.T) {
-	conn := newTestConnection(&testCatalogAdapter{}, mockOUs())
-	tree, err := conn.GetCatalogTree("dc=x", 0)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if tree.Tree == nil || len(tree.Tree) != 0 {
-		t.Fatalf("expected non-nil empty tree, got: %+v", tree.Tree)
-	}
-}
-
-// TestGetCatalogTree_DropsBaseDN: the base DN itself must be filtered out.
-func TestGetCatalogTree_DropsBaseDN(t *testing.T) {
-	conn := newTestConnection(&testCatalogAdapter{}, mockOUs(
-		newLDAPEntry("dc=x", nil),
-		newLDAPEntry("ou=a,dc=x", nil),
-	))
-	tree, err := conn.GetCatalogTree("dc=x", 0)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if len(tree.Tree) != 1 || tree.Tree[0].DN != "ou=a,dc=x" {
-		t.Fatalf("base DN must be dropped, got: %+v", tree.Tree)
-	}
-}
-
-// TestGetCatalogTree_FiltersForeignDNs: entries outside baseDn must be dropped
-// even if the server returns them.
-func TestGetCatalogTree_FiltersForeignDNs(t *testing.T) {
-	conn := newTestConnection(&testCatalogAdapter{}, mockOUs(
-		newLDAPEntry("ou=a,dc=x", nil), // kept
-		newLDAPEntry("ou=b,dc=y", nil), // foreign: drop
-		newLDAPEntry("ou=c,dc=x", nil), // kept
-	))
-	tree, err := conn.GetCatalogTree("dc=x", 0)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if len(tree.Tree) != 2 {
-		t.Fatalf("expected 2 roots, got %d: %+v", len(tree.Tree), tree.Tree)
-	}
-	for _, r := range tree.Tree {
-		if !strings.HasSuffix(r.DN, ",dc=x") {
-			t.Errorf("foreign DN leaked: %s", r.DN)
+	t.Run("invalid base DN", func(t *testing.T) {
+		l := &LDAPper{connection: mockOUs(), catalogAdapter: ouTreeAdapter()}
+		_, err := l.GetCatalogTree("not a dn", 0)
+		if !errors.Is(err, ErrInvalidArgument) {
+			t.Fatalf("errors.Is(%v, ErrInvalidArgument) = false", err)
 		}
-	}
-}
+	})
 
-// TestGetCatalogTree_SkipsMalformedDN: a malformed entry DN must not abort
-// the whole call, only that entry is skipped.
-func TestGetCatalogTree_SkipsMalformedDN(t *testing.T) {
-	conn := newTestConnection(&testCatalogAdapter{}, mockOUs(
-		newLDAPEntry("ou=x,,dc=y", nil), // malformed: skip
-		newLDAPEntry("ou=ok,dc=x", nil), // keep
-	))
-	tree, err := conn.GetCatalogTree("dc=x", 0)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if len(tree.Tree) != 1 || tree.Tree[0].DN != "ou=ok,dc=x" {
-		t.Fatalf("unexpected roots: %+v", tree.Tree)
-	}
-}
-
-// TestGetCatalogTree_BuildsHierarchy verifies parent-child links are built
-// from DN structure regardless of the order entries arrive in.
-func TestGetCatalogTree_BuildsHierarchy(t *testing.T) {
-	conn := newTestConnection(&testCatalogAdapter{}, mockOUs(
-		newLDAPEntry("ou=grand,ou=a1,ou=a,dc=x", nil), // appears before parent
-		newLDAPEntry("ou=a1,ou=a,dc=x", nil),
-		newLDAPEntry("ou=a,dc=x", nil),
-		newLDAPEntry("ou=a2,ou=a,dc=x", nil),
-		newLDAPEntry("ou=b,dc=x", nil),
-	))
-	tree, err := conn.GetCatalogTree("dc=x", 0)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if len(tree.Tree) != 2 {
-		t.Fatalf("expected 2 roots, got %d: %+v", len(tree.Tree), tree.Tree)
-	}
-
-	// Index all nodes by DN for assertions independent of child order.
-	idx := map[string]*types.OUInfo{}
-	var walk func(nodes []*types.OUInfo)
-	walk = func(nodes []*types.OUInfo) {
-		for _, n := range nodes {
-			idx[n.DN] = n
-			walk(n.Children)
+	t.Run("empty base DN rejected by searchPaged", func(t *testing.T) {
+		l := &LDAPper{connection: mockOUs(), catalogAdapter: ouTreeAdapter()}
+		_, err := l.GetCatalogTree("", 0)
+		if !errors.Is(err, ErrInvalidArgument) {
+			t.Fatalf("errors.Is(%v, ErrInvalidArgument) = false", err)
 		}
-	}
-	walk(tree.Tree)
+	})
 
-	a := idx["ou=a,dc=x"]
-	if a == nil || len(a.Children) != 2 {
-		t.Fatalf("unexpected A: %+v", a)
-	}
-	a1 := idx["ou=a1,ou=a,dc=x"]
-	if a1 == nil || len(a1.Children) != 1 || a1.Children[0].DN != "ou=grand,ou=a1,ou=a,dc=x" {
-		t.Fatalf("unexpected A1: %+v", a1)
-	}
-	if b := idx["ou=b,dc=x"]; b == nil || len(b.Children) != 0 {
-		t.Errorf("unexpected B: %+v", b)
-	}
-}
-
-func TestGetCatalogTree_MaxDepth(t *testing.T) {
-	entries := []*ldap.Entry{
-		newLDAPEntry("ou=a,dc=x", nil),
-		newLDAPEntry("ou=a1,ou=a,dc=x", nil),
-		newLDAPEntry("ou=grand,ou=a1,ou=a,dc=x", nil),
-	}
-
-	t.Run("depth_1", func(t *testing.T) {
-		tree, err := newTestConnection(&testCatalogAdapter{}, mockOUs(entries...)).
-			GetCatalogTree("dc=x", 1)
+	t.Run("empty result yields empty tree", func(t *testing.T) {
+		l := &LDAPper{connection: mockOUs(), catalogAdapter: ouTreeAdapter()}
+		tree, err := l.GetCatalogTree(baseDN, 0)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		if len(tree.Tree) != 1 || len(tree.Tree[0].Children) != 0 {
-			t.Fatalf("expected roots only, got: %+v", tree.Tree)
+		if len(tree.Tree) != 0 {
+			t.Fatalf("tree.Tree = %v, want empty", tree.Tree)
 		}
 	})
 
-	t.Run("depth_2", func(t *testing.T) {
-		tree, err := newTestConnection(&testCatalogAdapter{}, mockOUs(entries...)).
-			GetCatalogTree("dc=x", 2)
+	t.Run("single root node", func(t *testing.T) {
+		entry := newLDAPEntry("ou=Sales,dc=example,dc=com", map[string][]string{"ou": {"Sales"}})
+		l := &LDAPper{connection: mockOUs(entry), catalogAdapter: ouTreeAdapter()}
+		tree, err := l.GetCatalogTree(baseDN, 0)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		if len(tree.Tree[0].Children) != 1 || len(tree.Tree[0].Children[0].Children) != 0 {
-			t.Fatalf("expected one level of children, got: %+v", tree.Tree)
+		if len(tree.Tree) != 1 || tree.Tree[0].DN != entry.DN {
+			t.Fatalf("tree.Tree = %v", tree.Tree)
+		}
+		if len(tree.Tree[0].Children) != 0 {
+			t.Fatalf("leaf has children: %v", tree.Tree[0].Children)
 		}
 	})
 
-	t.Run("depth_0_no_trim", func(t *testing.T) {
-		tree, err := newTestConnection(&testCatalogAdapter{}, mockOUs(entries...)).
-			GetCatalogTree("dc=x", 0)
+	t.Run("two siblings at root", func(t *testing.T) {
+		e1 := newLDAPEntry("ou=People,dc=example,dc=com", nil)
+		e2 := newLDAPEntry("ou=Sales,dc=example,dc=com", nil)
+		l := &LDAPper{connection: mockOUs(e1, e2), catalogAdapter: ouTreeAdapter()}
+		tree, err := l.GetCatalogTree(baseDN, 0)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		if len(tree.Tree[0].Children[0].Children) != 1 {
-			t.Fatalf("expected full tree, got: %+v", tree.Tree)
+		if len(tree.Tree) != 2 {
+			t.Fatalf("len = %d, want 2", len(tree.Tree))
 		}
-	})
-}
-
-// TestGetCatalogTree_Paging: server echoes a paging control with a non-empty
-// cookie, forcing a second request; both pages are aggregated into one tree.
-func TestGetCatalogTree_Paging(t *testing.T) {
-	searchCalls := 0
-	conn := newTestConnection(&testCatalogAdapter{}, &mocks.MockLDAPConn{
-		SearchFunc: func(req *ldap.SearchRequest) (*ldap.SearchResult, error) {
-			searchCalls++
-			var cookie []byte
-			if len(req.Controls) > 0 {
-				if pc, ok := req.Controls[0].(*ldap.ControlPaging); ok {
-					cookie = pc.Cookie
-				}
-			}
-			next := ldap.NewControlPaging(constants.DefaultCatalogTreePageSize)
-			switch string(cookie) {
-			case "":
-				next.SetCookie([]byte("page2"))
-				return &ldap.SearchResult{
-					Entries:  []*ldap.Entry{newLDAPEntry("ou=a,dc=x", nil)},
-					Controls: []ldap.Control{next},
-				}, nil
-			case "page2":
-				// Empty cookie = last page.
-				return &ldap.SearchResult{
-					Entries:  []*ldap.Entry{newLDAPEntry("ou=b,dc=x", nil)},
-					Controls: []ldap.Control{next},
-				}, nil
-			}
-			t.Fatalf("unexpected cookie: %q", cookie)
-			return nil, nil
-		},
-	})
-
-	tree, err := conn.GetCatalogTree("dc=x", 0)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if searchCalls != 2 {
-		t.Fatalf("expected 2 searches, got %d", searchCalls)
-	}
-	if len(tree.Tree) != 2 {
-		t.Fatalf("expected 2 roots, got %d: %+v", len(tree.Tree), tree.Tree)
-	}
-}
-
-// TestGetCatalogTree_ServerIgnoresPaging: if the server does not echo a
-// paging control, the loop must stop after the first request.
-func TestGetCatalogTree_ServerIgnoresPaging(t *testing.T) {
-	searchCalls := 0
-	conn := newTestConnection(&testCatalogAdapter{}, &mocks.MockLDAPConn{
-		SearchFunc: func(*ldap.SearchRequest) (*ldap.SearchResult, error) {
-			searchCalls++
-			return &ldap.SearchResult{
-				Entries: []*ldap.Entry{newLDAPEntry("ou=a,dc=x", nil)},
-			}, nil
-		},
-	})
-	if _, err := conn.GetCatalogTree("dc=x", 0); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if searchCalls != 1 {
-		t.Errorf("expected 1 search when server ignores paging, got %d", searchCalls)
-	}
-}
-
-// TestGetCatalogTree_RequestShape verifies the first search request carries
-// the expected base, scope, filter, attributes, paging control and limits.
-func TestGetCatalogTree_RequestShape(t *testing.T) {
-	var captured *ldap.SearchRequest
-	adapter := &testCatalogAdapter{
-		ouObjectFilter: "(objectClass=organizationalUnit)",
-		ouAttrs:        []string{"ou"},
-	}
-	conn := newTestConnection(adapter, &mocks.MockLDAPConn{
-		SearchFunc: func(req *ldap.SearchRequest) (*ldap.SearchResult, error) {
-			if captured == nil {
-				captured = req
-			}
-			return &ldap.SearchResult{}, nil
-		},
-	})
-	conn.SetSearchLimits(50, 15)
-
-	if _, err := conn.GetCatalogTree("dc=x", 0); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if captured == nil {
-		t.Fatal("search request not captured")
-	}
-	if captured.BaseDN != "dc=x" {
-		t.Errorf("BaseDN: %s", captured.BaseDN)
-	}
-	if captured.Scope != ldap.ScopeWholeSubtree {
-		t.Errorf("Scope: %d", captured.Scope)
-	}
-	if captured.Filter != "(objectClass=organizationalUnit)" {
-		t.Errorf("Filter: %s", captured.Filter)
-	}
-	if len(captured.Attributes) != 1 || captured.Attributes[0] != "ou" {
-		t.Errorf("Attributes: %v", captured.Attributes)
-	}
-	if captured.SizeLimit != 50 || captured.TimeLimit != 15 {
-		t.Errorf("limits: size=%d time=%d", captured.SizeLimit, captured.TimeLimit)
-	}
-	if len(captured.Controls) != 1 {
-		t.Fatalf("expected 1 paging control, got %d", len(captured.Controls))
-	}
-	pc, ok := captured.Controls[0].(*ldap.ControlPaging)
-	if !ok {
-		t.Fatalf("expected *ControlPaging, got %T", captured.Controls[0])
-	}
-	if len(pc.Cookie) != 0 {
-		t.Errorf("first request must start with empty cookie, got %q", pc.Cookie)
-	}
-	if pc.PagingSize != constants.DefaultCatalogTreePageSize {
-		t.Errorf("PagingSize: %d", pc.PagingSize)
-	}
-}
-
-// ---------- GetRootOUs ----------
-
-func TestGetRootOUs(t *testing.T) {
-	t.Run("search_error", func(t *testing.T) {
-		conn := newTestConnection(&testCatalogAdapter{
-			ouObjectFilter: "(objectClass=organizationalUnit)",
-		}, &mocks.MockLDAPConn{
-			SearchFunc: func(*ldap.SearchRequest) (*ldap.SearchResult, error) {
-				return nil, errors.New("boom")
-			},
-		})
-		if _, err := conn.GetRootOUs("dc=x"); err == nil ||
-			!strings.Contains(err.Error(), "unsuccessful ou search") {
-			t.Fatalf("unexpected error: %v", err)
+		dns := collectDNs(tree.Tree)
+		if len(dns) != 2 {
+			t.Fatalf("dns = %v", dns)
 		}
 	})
 
-	t.Run("success", func(t *testing.T) {
-		var captured *ldap.SearchRequest
-		conn := newTestConnection(&testCatalogAdapter{
-			ouObjectFilter: "(objectClass=organizationalUnit)",
-			ouAttrs:        []string{"ou"},
-		}, &mocks.MockLDAPConn{
-			SearchFunc: func(req *ldap.SearchRequest) (*ldap.SearchResult, error) {
-				captured = req
-				return &ldap.SearchResult{Entries: []*ldap.Entry{
-					newLDAPEntry("ou=a,dc=x", nil),
-					newLDAPEntry("ou=b,dc=x", nil),
-				}}, nil
-			},
-		})
-		ous, err := conn.GetRootOUs("dc=x")
+	t.Run("parent-child hierarchy", func(t *testing.T) {
+		parent := newLDAPEntry("ou=Sales,dc=example,dc=com", nil)
+		child := newLDAPEntry("ou=EMEA,ou=Sales,dc=example,dc=com", nil)
+		l := &LDAPper{connection: mockOUs(parent, child), catalogAdapter: ouTreeAdapter()}
+		tree, err := l.GetCatalogTree(baseDN, 0)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		if len(ous) != 2 || ous[0].DN != "ou=a,dc=x" || ous[1].DN != "ou=b,dc=x" {
-			t.Fatalf("unexpected OUs: %+v", ous)
+		if len(tree.Tree) != 1 || tree.Tree[0].DN != parent.DN {
+			t.Fatalf("root = %v", tree.Tree)
 		}
-		if captured.Scope != ldap.ScopeSingleLevel {
-			t.Errorf("expected ScopeSingleLevel, got %d", captured.Scope)
+		if len(tree.Tree[0].Children) != 1 || tree.Tree[0].Children[0].DN != child.DN {
+			t.Fatalf("children = %v", tree.Tree[0].Children)
 		}
-		if captured.BaseDN != "dc=x" {
-			t.Errorf("unexpected BaseDN: %s", captured.BaseDN)
+	})
+
+	t.Run("case-insensitive parent match", func(t *testing.T) {
+		parent := newLDAPEntry("OU=Sales,DC=example,DC=com", nil)
+		child := newLDAPEntry("ou=EMEA,ou=sales,dc=example,dc=com", nil)
+		l := &LDAPper{connection: mockOUs(parent, child), catalogAdapter: ouTreeAdapter()}
+		tree, err := l.GetCatalogTree(baseDN, 0)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		// Despite differing case, the child must attach to the parent.
+		if len(tree.Tree) != 1 || len(tree.Tree[0].Children) != 1 {
+			t.Fatalf("hierarchy lost on case difference: %+v", tree.Tree)
+		}
+	})
+
+	t.Run("base DN itself is excluded", func(t *testing.T) {
+		base := newLDAPEntry(baseDN, nil)
+		child := newLDAPEntry("ou=Sales,dc=example,dc=com", nil)
+		l := &LDAPper{connection: mockOUs(base, child), catalogAdapter: ouTreeAdapter()}
+		tree, err := l.GetCatalogTree(baseDN, 0)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if findNode(tree.Tree, baseDN) != nil {
+			t.Fatalf("base DN must be excluded, tree = %v", tree.Tree)
+		}
+		if findNode(tree.Tree, child.DN) == nil {
+			t.Fatalf("child missing")
+		}
+	})
+
+	t.Run("entry outside base DN is excluded", func(t *testing.T) {
+		inside := newLDAPEntry("ou=Sales,dc=example,dc=com", nil)
+		outside := newLDAPEntry("ou=Sales,dc=other,dc=com", nil)
+		l := &LDAPper{connection: mockOUs(inside, outside), catalogAdapter: ouTreeAdapter()}
+		tree, err := l.GetCatalogTree(baseDN, 0)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if findNode(tree.Tree, outside.DN) != nil {
+			t.Fatalf("out-of-tree DN leaked: %v", tree.Tree)
+		}
+		if findNode(tree.Tree, inside.DN) == nil {
+			t.Fatalf("in-tree DN missing")
+		}
+	})
+
+	t.Run("orphan promoted to root", func(t *testing.T) {
+		// Child without its parent present (e.g. server filtered the parent).
+		orphan := newLDAPEntry("ou=EMEA,ou=Sales,dc=example,dc=com", nil)
+		l := &LDAPper{connection: mockOUs(orphan), catalogAdapter: ouTreeAdapter()}
+		tree, err := l.GetCatalogTree(baseDN, 0)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(tree.Tree) != 1 || tree.Tree[0].DN != orphan.DN {
+			t.Fatalf("orphan not promoted: %v", tree.Tree)
+		}
+	})
+
+	t.Run("malformed entry DN is skipped", func(t *testing.T) {
+		good := newLDAPEntry("ou=Sales,dc=example,dc=com", nil)
+		bad := newLDAPEntry("not-a-valid-dn", nil)
+		l := &LDAPper{connection: mockOUs(good, bad), catalogAdapter: ouTreeAdapter()}
+		tree, err := l.GetCatalogTree(baseDN, 0)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if findNode(tree.Tree, "not-a-valid-dn") != nil {
+			t.Fatalf("malformed DN not skipped: %v", tree.Tree)
+		}
+		if findNode(tree.Tree, good.DN) == nil {
+			t.Fatalf("good entry missing")
+		}
+	})
+
+	t.Run("empty DN from adapter is skipped", func(t *testing.T) {
+		good := newLDAPEntry("ou=Sales,dc=example,dc=com", nil)
+		bad := newLDAPEntry("", nil) // adapter returns info with DN=""
+		l := &LDAPper{connection: mockOUs(good, bad), catalogAdapter: ouTreeAdapter()}
+		tree, err := l.GetCatalogTree(baseDN, 0)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(tree.Tree) != 1 {
+			t.Fatalf("tree = %v", tree.Tree)
+		}
+	})
+
+	t.Run("maxDepth=1 keeps only roots", func(t *testing.T) {
+		parent := newLDAPEntry("ou=Sales,dc=example,dc=com", nil)
+		child := newLDAPEntry("ou=EMEA,ou=Sales,dc=example,dc=com", nil)
+		l := &LDAPper{connection: mockOUs(parent, child), catalogAdapter: ouTreeAdapter()}
+		tree, err := l.GetCatalogTree(baseDN, 1)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(tree.Tree) != 1 {
+			t.Fatalf("tree = %v", tree.Tree)
+		}
+		if len(tree.Tree[0].Children) != 0 {
+			t.Fatalf("maxDepth=1 should clear children, got %v", tree.Tree[0].Children)
+		}
+	})
+
+	t.Run("search error propagates as ErrInvalidArgument via searchPaged", func(t *testing.T) {
+		raw := &ldap.Error{ResultCode: ldap.LDAPResultUnavailable, Err: errors.New("down")}
+		mock := &mocks.MockLDAPConn{
+			SearchFunc: func(*ldap.SearchRequest) (*ldap.SearchResult, error) { return nil, raw },
+		}
+		l := &LDAPper{connection: mock, catalogAdapter: ouTreeAdapter()}
+		_, err := l.GetCatalogTree(baseDN, 0)
+		if !errors.Is(err, ErrUnavailable) {
+			t.Fatalf("errors.Is(%v, ErrUnavailable) = false", err)
 		}
 	})
 }
 
-// ---------- GetSubOUs ----------
+// ---------- GetSubOUs / ListSingleLevelOUs ----------
 
+// TestGetSubOUs covers the descendants-only contract, scope validation and
+// base DN exclusion.
 func TestGetSubOUs(t *testing.T) {
-	t.Run("search_error", func(t *testing.T) {
-		conn := newTestConnection(&testCatalogAdapter{
-			ouObjectFilter: "(objectClass=organizationalUnit)",
-		}, &mocks.MockLDAPConn{
-			SearchFunc: func(*ldap.SearchRequest) (*ldap.SearchResult, error) {
-				return nil, errors.New("boom")
-			},
-		})
-		if _, err := conn.GetSubOUs("ou=p,dc=x", ldap.ScopeSingleLevel); err == nil ||
-			!strings.Contains(err.Error(), "unsuccessful sub ou search") {
-			t.Fatalf("unexpected error: %v", err)
+	const baseDN = "dc=example,dc=com"
+
+	t.Run("nil connection", func(t *testing.T) {
+		l := &LDAPper{catalogAdapter: ouTreeAdapter()}
+		_, err := l.GetSubOUs(baseDN, ldap.ScopeSingleLevel)
+		if !errors.Is(err, ErrClosed) {
+			t.Fatalf("errors.Is(%v, ErrClosed) = false", err)
 		}
 	})
 
-	t.Run("filters_non_children", func(t *testing.T) {
-		conn := newTestConnection(&testCatalogAdapter{
-			ouObjectFilter: "(objectClass=organizationalUnit)",
-		}, &mocks.MockLDAPConn{
-			SearchFunc: func(*ldap.SearchRequest) (*ldap.SearchResult, error) {
-				return &ldap.SearchResult{Entries: []*ldap.Entry{
-					newLDAPEntry("ou=child,ou=parent,dc=x", nil), // kept
-					newLDAPEntry("ou=other,dc=y", nil),           // unrelated
-					newLDAPEntry("ou=parent,dc=x", nil),          // group itself
-				}}, nil
-			},
-		})
-		res, err := conn.GetSubOUs("ou=parent,dc=x", ldap.ScopeSingleLevel)
+	t.Run("ScopeBaseObject rejected", func(t *testing.T) {
+		l := &LDAPper{connection: mockOUs(), catalogAdapter: ouTreeAdapter()}
+		_, err := l.GetSubOUs(baseDN, ldap.ScopeBaseObject)
+		if !errors.Is(err, ErrInvalidArgument) {
+			t.Fatalf("errors.Is(%v, ErrInvalidArgument) = false", err)
+		}
+	})
+
+	t.Run("invalid scope rejected", func(t *testing.T) {
+		l := &LDAPper{connection: mockOUs(), catalogAdapter: ouTreeAdapter()}
+		_, err := l.GetSubOUs(baseDN, 99)
+		if !errors.Is(err, ErrInvalidArgument) {
+			t.Fatalf("errors.Is(%v, ErrInvalidArgument) = false", err)
+		}
+	})
+
+	t.Run("malformed parent DN rejected", func(t *testing.T) {
+		l := &LDAPper{connection: mockOUs(), catalogAdapter: ouTreeAdapter()}
+		_, err := l.GetSubOUs("not a dn", ldap.ScopeSingleLevel)
+		if !errors.Is(err, ErrInvalidArgument) {
+			t.Fatalf("errors.Is(%v, ErrInvalidArgument) = false", err)
+		}
+	})
+
+	t.Run("single-level returns direct children", func(t *testing.T) {
+		// Server for ScopeSingleLevel returns only direct children.
+		e1 := newLDAPEntry("ou=Sales,dc=example,dc=com", nil)
+		e2 := newLDAPEntry("ou=People,dc=example,dc=com", nil)
+		l := &LDAPper{connection: mockOUs(e1, e2), catalogAdapter: ouTreeAdapter()}
+		ous, err := l.GetSubOUs(baseDN, ldap.ScopeSingleLevel)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		if len(res) != 1 || res[0].DN != "ou=child,ou=parent,dc=x" {
-			t.Fatalf("unexpected result: %+v", res)
-		}
-		if res[0].Children == nil {
-			t.Error("Children must be initialized to a non-nil slice")
+		if len(ous) != 2 {
+			t.Fatalf("len = %d, want 2", len(ous))
 		}
 	})
+
+	t.Run("subtree excludes base DN itself", func(t *testing.T) {
+		base := newLDAPEntry(baseDN, nil)
+		child := newLDAPEntry("ou=Sales,dc=example,dc=com", nil)
+		l := &LDAPper{connection: mockOUs(base, child), catalogAdapter: ouTreeAdapter()}
+		ous, err := l.GetSubOUs(baseDN, ldap.ScopeWholeSubtree)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(ous) != 1 || ous[0].DN != child.DN {
+			t.Fatalf("ous = %v (base must be excluded)", ous)
+		}
+	})
+
+	t.Run("empty result", func(t *testing.T) {
+		l := &LDAPper{connection: mockOUs(), catalogAdapter: ouTreeAdapter()}
+		ous, err := l.GetSubOUs(baseDN, ldap.ScopeSingleLevel)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(ous) != 0 {
+			t.Fatalf("ous = %v, want empty", ous)
+		}
+	})
+
+	t.Run("search error classified", func(t *testing.T) {
+		raw := &ldap.Error{ResultCode: ldap.LDAPResultUnavailable, Err: errors.New("down")}
+		mock := &mocks.MockLDAPConn{
+			SearchFunc: func(*ldap.SearchRequest) (*ldap.SearchResult, error) { return nil, raw },
+		}
+		l := &LDAPper{connection: mock, catalogAdapter: ouTreeAdapter()}
+		_, err := l.GetSubOUs(baseDN, ldap.ScopeSingleLevel)
+		if !errors.Is(err, ErrUnavailable) {
+			t.Fatalf("errors.Is(%v, ErrUnavailable) = false", err)
+		}
+	})
+}
+
+// TestListSingleLevelOUs verifies the thin delegate wrapper.
+func TestListSingleLevelOUs(t *testing.T) {
+	const baseDN = "dc=example,dc=com"
+	e1 := newLDAPEntry("ou=Sales,dc=example,dc=com", nil)
+
+	var observedScope int
+	mock := &mocks.MockLDAPConn{
+		SearchFunc: func(req *ldap.SearchRequest) (*ldap.SearchResult, error) {
+			observedScope = req.Scope
+			return &ldap.SearchResult{Entries: []*ldap.Entry{e1}}, nil
+		},
+	}
+	l := &LDAPper{connection: mock, catalogAdapter: ouTreeAdapter()}
+
+	ous, err := l.ListSingleLevelOUs(baseDN)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if observedScope != ldap.ScopeSingleLevel {
+		t.Fatalf("scope = %d, want ScopeSingleLevel", observedScope)
+	}
+	if len(ous) != 1 || ous[0].DN != e1.DN {
+		t.Fatalf("ous = %v", ous)
+	}
 }

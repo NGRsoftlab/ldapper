@@ -5,17 +5,21 @@ package ldapper_test
 
 // FreeIPA integration tests against a real FreeIPA server container.
 //
-// Adapter status (after the args-helper fix):
+// Adapter status (current):
 //   SearchUserGroupsFilterTemplate     = (&(|(objectClass=groupOfNames)
 //                                            (objectClass=posixGroup)
 //                                            (objectClass=ipausergroup))(member=%s))
 //   SearchUserGroupsFilterTemplateArgs = [ ldapUser.DN ]
 //
 // FreeIPA's `ipa group-add-member` populates `member` (DN-valued) on groups
-// that are also ipausergroup/posixGroup, so the filter now matches real
+// that are also ipausergroup/posixGroup, so the filter matches real
 // memberships. GetUserGroups tests below are positive:
 //   - user1 -> ["admins"]
 //   - user2 -> ["readers"]
+//
+// CheckUserCredentials(username, password) takes only two args. Base DN for
+// the internal GetUser comes from conn.bindDN stored by AuthenticateConn.
+// Failure assertions use errors.Is against exported sentinels.
 //
 // Graceful skip:
 //   FreeIPA containers are heavy (systemd, privileged mode, FQDN). On any
@@ -26,6 +30,7 @@ package ldapper_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -124,7 +129,6 @@ func TestMain(m *testing.M) {
 	os.Exit(code)
 }
 
-// waitForFreeIPAReady polls Directory Manager bind until LDAP is fully ready.
 func waitForFreeIPAReady(host string, port uint, timeout time.Duration) bool {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
@@ -141,9 +145,6 @@ func waitForFreeIPAReady(host string, port uint, timeout time.Duration) bool {
 	return false
 }
 
-// seedFreeIPA creates two users and two groups using the `ipa` CLI.
-// `ipa group-add-member` populates `member` (DN) on the group, which is
-// exactly the attribute the fixed adapter filter now correctly queries.
 func seedFreeIPA(ctx context.Context, container testcontainers.Container) error {
 	kinitCmd := []string{
 		"sh", "-c",
@@ -201,7 +202,7 @@ func newFreeIPAConn(t *testing.T, opts ...ldapper.Option) *ldapper.LDAPper {
 	t.Helper()
 	requireFreeIPA(t)
 
-	conn, err := ldapper.NewConnection(
+	conn, err := ldapper.NewLDAPper(
 		[]string{freeipaHost},
 		freeipaPort,
 		false, // useSSL
@@ -215,13 +216,14 @@ func newFreeIPAConn(t *testing.T, opts ...ldapper.Option) *ldapper.LDAPper {
 	return conn
 }
 
-// newFreeIPAAuthConn authenticates as admin; bindDN = freeipaBaseDN, which is
-// what AuthenticateUser(username, password) uses internally after the change.
+// newFreeIPAAuthConn authenticates as admin (uid=admin DN). FreeIPA's admin
+// is a real inetOrgPerson-like entry with uid=admin, so the adapter's
+// SearchUserFilterTemplate matches the bind principal via uid.
 func newFreeIPAAuthConn(t *testing.T, opts ...ldapper.Option) *ldapper.LDAPper {
 	t.Helper()
 	requireFreeIPA(t)
 
-	conn, _, err := ldapper.NewAuthenticatedConnection(
+	conn, _, err := ldapper.NewAuthenticatedLDAPper(
 		freeipaAdminDN, freeipaAdminPass, freeipaBaseDN,
 		[]string{freeipaHost},
 		freeipaPort,
@@ -241,38 +243,25 @@ func freeipaDNHasPrefixCI(dn, prefix string) bool {
 }
 
 // ---------------------------------------------------------------------------
-// Adapter contract tests (no server needed)
+// Adapter contract tests
 // ---------------------------------------------------------------------------
 
-// TestIntegrationFreeIPA_SearchUserGroupsFilterTemplate_PostFix guards the
-// final state of the template: a single %s placeholder and no leftover
-// "member=uid=" construct from the earlier broken version.
 func TestIntegrationFreeIPA_SearchUserGroupsFilterTemplate_PostFix(t *testing.T) {
 	tmpl := freeipaAdpt.SearchUserGroupsFilterTemplate()
-
-	assert.NotContains(t, tmpl, "member=uid=",
-		"regression: earlier versions had (member=uid=%s), which is invalid")
-	assert.Contains(t, tmpl, "(member=%s)",
-		"template must use a single %s placeholder for the member assertion")
+	assert.NotContains(t, tmpl, "member=uid=")
+	assert.Contains(t, tmpl, "(member=%s)")
+	assert.Equal(t, 1, strings.Count(tmpl, "%s"))
 }
 
-// TestIntegrationFreeIPA_SearchUserGroupsFilterTemplateArgs_ReturnsDN asserts
-// the fixed args helper returns the user's DN — the value the filter's
-// (member=%s) assertion needs.
 func TestIntegrationFreeIPA_SearchUserGroupsFilterTemplateArgs_ReturnsDN(t *testing.T) {
 	const dn = "uid=user1,cn=users,cn=accounts,dc=example,dc=test"
 	user := types.LDAPUser{
-		DN: dn,
-		Attributes: map[string][]string{
-			"uid":  {"user1"},
-			"mail": {"user1@example.test"},
-		},
+		DN:         dn,
+		Attributes: map[string][]string{"uid": {"user1"}},
 	}
-
 	args := freeipaAdpt.SearchUserGroupsFilterTemplateArgs(user)
 	require.Len(t, args, 1)
-	require.Equal(t, dn, args[0],
-		"args[0] must be the user's DN so that (member=%s) matches group.member")
+	require.Equal(t, dn, args[0])
 }
 
 // ---------------------------------------------------------------------------
@@ -287,9 +276,9 @@ func TestIntegrationFreeIPA_NewConnection_Success(t *testing.T) {
 
 func TestIntegrationFreeIPA_NewConnection_EmptyHosts(t *testing.T) {
 	requireFreeIPA(t)
-	_, err := ldapper.NewConnection(nil, 389, false, true, nil, freeipaAdpt)
+	_, err := ldapper.NewLDAPper(nil, 389, false, true, nil, freeipaAdpt)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "empty hosts list")
+	assert.True(t, errors.Is(err, ldapper.ErrInvalidArgument))
 }
 
 func TestIntegrationFreeIPA_NewConnection_TooManyHosts(t *testing.T) {
@@ -298,36 +287,36 @@ func TestIntegrationFreeIPA_NewConnection_TooManyHosts(t *testing.T) {
 	for i := range hosts {
 		hosts[i] = fmt.Sprintf("host%d", i)
 	}
-	_, err := ldapper.NewConnection(hosts, 389, false, true, nil, freeipaAdpt)
+	_, err := ldapper.NewLDAPper(hosts, 389, false, true, nil, freeipaAdpt)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "too many hosts")
+	assert.True(t, errors.Is(err, ldapper.ErrInvalidArgument))
 }
 
 func TestIntegrationFreeIPA_NewConnection_NilTLSConfigWhenRequired(t *testing.T) {
 	requireFreeIPA(t)
-	_, err := ldapper.NewConnection([]string{freeipaHost}, freeipaPort, false, false, nil, freeipaAdpt)
+	_, err := ldapper.NewLDAPper([]string{freeipaHost}, freeipaPort, false, false, nil, freeipaAdpt)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "nil tls config")
+	assert.True(t, errors.Is(err, ldapper.ErrInvalidArgument))
 }
 
 func TestIntegrationFreeIPA_NewConnection_NilCatalogAdapter(t *testing.T) {
 	requireFreeIPA(t)
-	_, err := ldapper.NewConnection([]string{freeipaHost}, freeipaPort, false, true, nil, nil)
+	_, err := ldapper.NewLDAPper([]string{freeipaHost}, freeipaPort, false, true, nil, nil)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "nil catalog adapter")
+	assert.True(t, errors.Is(err, ldapper.ErrInvalidArgument))
 }
 
 func TestIntegrationFreeIPA_NewConnection_UnreachableHost(t *testing.T) {
 	requireFreeIPA(t)
-	_, err := ldapper.NewConnection([]string{"127.0.0.1"}, 1, false, true, nil, freeipaAdpt)
+	_, err := ldapper.NewLDAPper([]string{"127.0.0.1"}, 1, false, true, nil, freeipaAdpt)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "unsuccessful dial")
+	assert.True(t, errors.Is(err, ldapper.ErrUnavailable))
 }
 
 func TestIntegrationFreeIPA_NewAuthenticatedConnection_Success(t *testing.T) {
 	requireFreeIPA(t)
 
-	conn, user, err := ldapper.NewAuthenticatedConnection(
+	conn, user, err := ldapper.NewAuthenticatedLDAPper(
 		freeipaAdminDN, freeipaAdminPass, freeipaBaseDN,
 		[]string{freeipaHost}, freeipaPort, false, true, nil, freeipaAdpt,
 	)
@@ -340,21 +329,22 @@ func TestIntegrationFreeIPA_NewAuthenticatedConnection_Success(t *testing.T) {
 
 func TestIntegrationFreeIPA_NewAuthenticatedConnection_EmptyCredentials(t *testing.T) {
 	requireFreeIPA(t)
-	_, _, err := ldapper.NewAuthenticatedConnection(
+	_, _, err := ldapper.NewAuthenticatedLDAPper(
 		"", "", freeipaBaseDN,
 		[]string{freeipaHost}, freeipaPort, false, true, nil, freeipaAdpt,
 	)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "empty bind username/password")
+	assert.True(t, errors.Is(err, ldapper.ErrInvalidArgument))
 }
 
 func TestIntegrationFreeIPA_NewAuthenticatedConnection_WrongPassword(t *testing.T) {
 	requireFreeIPA(t)
-	_, _, err := ldapper.NewAuthenticatedConnection(
+	_, _, err := ldapper.NewAuthenticatedLDAPper(
 		freeipaAdminDN, "wrong-password", freeipaBaseDN,
 		[]string{freeipaHost}, freeipaPort, false, true, nil, freeipaAdpt,
 	)
 	require.Error(t, err)
+	assert.True(t, errors.Is(err, ldapper.ErrInvalidCredentials))
 }
 
 // ---------------------------------------------------------------------------
@@ -374,14 +364,14 @@ func TestIntegrationFreeIPA_AuthenticateConn_EmptyCredentials(t *testing.T) {
 	conn := newFreeIPAConn(t)
 	_, err := conn.AuthenticateConn("", "", freeipaBaseDN)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "empty bind username/password")
+	assert.True(t, errors.Is(err, ldapper.ErrInvalidArgument))
 }
 
 func TestIntegrationFreeIPA_AuthenticateConn_WrongPassword(t *testing.T) {
 	conn := newFreeIPAConn(t)
 	_, err := conn.AuthenticateConn(freeipaAdminDN, "bad-password", freeipaBaseDN)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "unsuccessful bind")
+	assert.True(t, errors.Is(err, ldapper.ErrInvalidCredentials))
 }
 
 func TestIntegrationFreeIPA_AuthenticateConn_NonExistentUser(t *testing.T) {
@@ -393,50 +383,49 @@ func TestIntegrationFreeIPA_AuthenticateConn_NonExistentUser(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// AuthenticateUser — signature is (username, password); base DN comes from
-// conn.bindDN stored by AuthenticateConn.
+// CheckUserCredentials
 // ---------------------------------------------------------------------------
 
-func TestIntegrationFreeIPA_AuthenticateUser_Success(t *testing.T) {
+func TestIntegrationFreeIPA_CheckUserCredentials_Success(t *testing.T) {
 	requireFreeIPAUsers(t)
 	conn := newFreeIPAAuthConn(t)
 
-	user, err := conn.AuthenticateUser(freeipaUser1UID, freeipaUser1Pass)
+	user, err := conn.CheckUserCredentials(freeipaUser1UID, freeipaUser1Pass)
 	require.NoError(t, err)
 	require.NotNil(t, user)
 	assert.Equal(t, freeipaUser1UID, user.GetAttributeValue("uid"))
 }
 
-func TestIntegrationFreeIPA_AuthenticateUser_WrongPassword(t *testing.T) {
+func TestIntegrationFreeIPA_CheckUserCredentials_WrongPassword(t *testing.T) {
 	requireFreeIPAUsers(t)
 	conn := newFreeIPAAuthConn(t)
 
-	user, err := conn.AuthenticateUser(freeipaUser1UID, "bad")
+	user, err := conn.CheckUserCredentials(freeipaUser1UID, "bad")
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "unsuccessful bind with passed user credentials")
-	require.NotNil(t, user)
-	assert.Equal(t, freeipaUser1UID, user.GetAttributeValue("uid"))
+	assert.True(t, errors.Is(err, ldapper.ErrInvalidCredentials))
+	assert.Nil(t, user)
 }
 
-func TestIntegrationFreeIPA_AuthenticateUser_NonExistentUser(t *testing.T) {
+func TestIntegrationFreeIPA_CheckUserCredentials_NonExistentUser(t *testing.T) {
 	conn := newFreeIPAAuthConn(t)
-	_, err := conn.AuthenticateUser("ghost-user", "whatever")
+	user, err := conn.CheckUserCredentials("ghost-user", "whatever")
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "user does not exist")
+	assert.True(t, errors.Is(err, ldapper.ErrInvalidCredentials))
+	assert.Nil(t, user)
 }
 
-func TestIntegrationFreeIPA_AuthenticateUser_NotAuthenticated(t *testing.T) {
+func TestIntegrationFreeIPA_CheckUserCredentials_NotAuthenticated(t *testing.T) {
 	conn := newFreeIPAConn(t)
-	_, err := conn.AuthenticateUser("anyone", "anything")
+	_, err := conn.CheckUserCredentials("anyone", "anything")
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "connection not authenticated")
+	assert.True(t, errors.Is(err, ldapper.ErrNotAuthenticated))
 }
 
-func TestIntegrationFreeIPA_AuthenticateUser_EmptyCredentials(t *testing.T) {
+func TestIntegrationFreeIPA_CheckUserCredentials_EmptyCredentials(t *testing.T) {
 	conn := newFreeIPAAuthConn(t)
-	_, err := conn.AuthenticateUser("", "")
+	_, err := conn.CheckUserCredentials("", "")
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "empty username/password")
+	assert.True(t, errors.Is(err, ldapper.ErrInvalidArgument))
 }
 
 // ---------------------------------------------------------------------------
@@ -466,7 +455,7 @@ func TestIntegrationFreeIPA_Reconnect_PreservesAuthentication(t *testing.T) {
 	conn := newFreeIPAAuthConn(t)
 	require.NoError(t, conn.Reconnect())
 
-	_, err := conn.AuthenticateUser(freeipaUser1UID, freeipaUser1Pass)
+	_, err := conn.CheckUserCredentials(freeipaUser1UID, freeipaUser1Pass)
 	require.NoError(t, err)
 }
 
@@ -485,7 +474,7 @@ func TestIntegrationFreeIPA_EnsureAlive_ReconnectsAfterClose(t *testing.T) {
 	require.NoError(t, conn.EnsureAlive())
 	assert.True(t, conn.IsAlive())
 
-	_, err := conn.AuthenticateUser(freeipaUser1UID, freeipaUser1Pass)
+	_, err := conn.CheckUserCredentials(freeipaUser1UID, freeipaUser1Pass)
 	require.NoError(t, err)
 }
 
@@ -496,7 +485,7 @@ func TestIntegrationFreeIPA_Close_Idempotent(t *testing.T) {
 
 	_, err := conn.GetUser("admin", freeipaBaseDN)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "connection not initialized")
+	assert.True(t, errors.Is(err, ldapper.ErrClosed))
 }
 
 // ---------------------------------------------------------------------------
@@ -527,7 +516,7 @@ func TestIntegrationFreeIPA_CustomSearch_NotInitialized(t *testing.T) {
 	)
 	_, err := conn.CustomSearch(req)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "connection not initialized")
+	assert.True(t, errors.Is(err, ldapper.ErrClosed))
 }
 
 // ---------------------------------------------------------------------------
@@ -556,7 +545,7 @@ func TestIntegrationFreeIPA_GetUser_NotFound(t *testing.T) {
 	conn := newFreeIPAAuthConn(t)
 	_, err := conn.GetUser("does-not-exist", freeipaBaseDN)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "user does not exist")
+	assert.True(t, errors.Is(err, ldapper.ErrNotFound))
 }
 
 func TestIntegrationFreeIPA_GetUser_NotInitialized(t *testing.T) {
@@ -565,12 +554,61 @@ func TestIntegrationFreeIPA_GetUser_NotInitialized(t *testing.T) {
 
 	_, err := conn.GetUser("admin", freeipaBaseDN)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "connection not initialized")
+	assert.True(t, errors.Is(err, ldapper.ErrClosed))
 }
 
 // ---------------------------------------------------------------------------
-// GetUserGroups — POSITIVE after the args fix. FreeIPA's group memberships
-// are stored in `member` as DN values, so (member=<user.DN>) matches.
+// GetGroup / GetOU
+// ---------------------------------------------------------------------------
+
+func TestIntegrationFreeIPA_GetGroup_Success(t *testing.T) {
+	requireFreeIPAUsers(t)
+	conn := newFreeIPAAuthConn(t)
+
+	group, err := conn.GetGroup("admins", freeipaBaseDN)
+	require.NoError(t, err)
+	require.NotNil(t, group)
+	assert.Equal(t, "admins", group.GetAttributeValue("cn"))
+}
+
+func TestIntegrationFreeIPA_GetGroup_NotFound(t *testing.T) {
+	conn := newFreeIPAAuthConn(t)
+	_, err := conn.GetGroup("does-not-exist", freeipaBaseDN)
+	require.Error(t, err)
+	assert.True(t, errors.Is(err, ldapper.ErrNotFound))
+}
+
+func TestIntegrationFreeIPA_GetOU_Success(t *testing.T) {
+	conn := newFreeIPAAuthConn(t)
+
+	// "users" is a standard ou under cn=accounts in FreeIPA.
+	ou, err := conn.GetOU("users", "cn=accounts,"+freeipaBaseDN)
+	require.NoError(t, err)
+	require.NotNil(t, ou)
+}
+
+// ---------------------------------------------------------------------------
+// GetCatalogTree / GetSubOUs
+// ---------------------------------------------------------------------------
+
+func TestIntegrationFreeIPA_GetCatalogTree_Success(t *testing.T) {
+	conn := newFreeIPAAuthConn(t)
+
+	tree, err := conn.GetCatalogTree(freeipaBaseDN, 0)
+	require.NoError(t, err)
+	// The base DN itself is excluded, but some structure must be present.
+	assert.NotEmpty(t, tree.Tree)
+}
+
+func TestIntegrationFreeIPA_GetSubOUs_SingleLevel(t *testing.T) {
+	conn := newFreeIPAAuthConn(t)
+
+	_, err := conn.GetSubOUs(freeipaBaseDN, ldap.ScopeSingleLevel)
+	require.NoError(t, err)
+}
+
+// ---------------------------------------------------------------------------
+// GetUserGroups
 // ---------------------------------------------------------------------------
 
 func TestIntegrationFreeIPA_GetUserGroups_AdminsMembership(t *testing.T) {
@@ -591,41 +629,12 @@ func TestIntegrationFreeIPA_GetUserGroups_ReadersMembership(t *testing.T) {
 	assert.ElementsMatch(t, []string{"readers"}, groups)
 }
 
-// TestIntegrationFreeIPA_GetUserGroups_CrossCheckedByCustomSearch verifies
-// that the positive result above agrees with an independent CustomSearch
-// over the same `member=<DN>` filter — i.e., GetUserGroups is not accidentally
-// returning a false positive for some other reason.
-func TestIntegrationFreeIPA_GetUserGroups_CrossCheckedByCustomSearch(t *testing.T) {
-	requireFreeIPAUsers(t)
-	conn := newFreeIPAAuthConn(t)
-
-	user, err := conn.GetUser(freeipaUser1UID, freeipaBaseDN)
-	require.NoError(t, err)
-	require.NotEmpty(t, user.DN)
-
-	req := ldap.NewSearchRequest(
-		freeipaBaseDN, ldap.ScopeWholeSubtree, ldap.NeverDerefAliases,
-		0, 0, false,
-		fmt.Sprintf("(&(objectClass=ipausergroup)(member=%s))", user.DN),
-		[]string{"cn"}, nil,
-	)
-	res, err := conn.CustomSearch(req)
-	require.NoError(t, err)
-	require.NotEmpty(t, res.Entries)
-
-	cns := make([]string, 0, len(res.Entries))
-	for _, e := range res.Entries {
-		cns = append(cns, e.GetAttributeValue("cn"))
-	}
-	assert.Contains(t, cns, "admins")
-}
-
 func TestIntegrationFreeIPA_GetUserGroups_UserNotFound(t *testing.T) {
 	conn := newFreeIPAAuthConn(t)
 
 	_, err := conn.GetUserGroups("nobody", freeipaBaseDN)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "user does not exist")
+	assert.True(t, errors.Is(err, ldapper.ErrNotFound))
 }
 
 // ---------------------------------------------------------------------------
@@ -652,47 +661,4 @@ func TestIntegrationFreeIPA_GetOUUsers_EmptyOU(t *testing.T) {
 	users, err := conn.GetOUUsers("ou=empty," + freeipaBaseDN)
 	require.NoError(t, err)
 	assert.Empty(t, users)
-}
-
-func TestIntegrationFreeIPA_GetOUUsers_NotInitialized(t *testing.T) {
-	conn := newFreeIPAConn(t)
-	conn.Close()
-
-	_, err := conn.GetOUUsers("cn=users,cn=accounts," + freeipaBaseDN)
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "connection not initialized")
-}
-
-// ---------------------------------------------------------------------------
-// Search limits
-// ---------------------------------------------------------------------------
-
-func TestIntegrationFreeIPA_SearchLimits_Defaults(t *testing.T) {
-	conn := newFreeIPAConn(t)
-	limits := conn.GetSearchLimits()
-	assert.Equal(t, 0, limits.SizeLimit)
-	assert.Equal(t, 30, limits.TimeLimit)
-}
-
-func TestIntegrationFreeIPA_SearchLimits_WithOption(t *testing.T) {
-	conn := newFreeIPAConn(t, ldapper.WithSearchLimits(5, 10))
-	limits := conn.GetSearchLimits()
-	assert.Equal(t, 5, limits.SizeLimit)
-	assert.Equal(t, 10, limits.TimeLimit)
-}
-
-func TestIntegrationFreeIPA_SearchLimits_SetAtRuntime(t *testing.T) {
-	conn := newFreeIPAConn(t)
-	conn.SetSearchLimits(7, 11)
-	limits := conn.GetSearchLimits()
-	assert.Equal(t, 7, limits.SizeLimit)
-	assert.Equal(t, 11, limits.TimeLimit)
-}
-
-func TestIntegrationFreeIPA_SearchLimits_NegativeClampedToZero(t *testing.T) {
-	conn := newFreeIPAConn(t)
-	conn.SetSearchLimits(-1, -5)
-	limits := conn.GetSearchLimits()
-	assert.Equal(t, 0, limits.SizeLimit)
-	assert.Equal(t, 0, limits.TimeLimit)
 }

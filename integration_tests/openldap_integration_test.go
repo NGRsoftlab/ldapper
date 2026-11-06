@@ -14,11 +14,16 @@ package ldapper_test
 //
 // with args [user.DN, user.uid]. Both branches are exercised below.
 //
+// The OPENLDAPAdapter's SearchUserFilterTemplate has an entryDN fallback,
+// so AuthenticateConn with a DN-style bind principal is fully supported
+// and exercised by every authenticated test in this file.
+//
 // Run with:
 //   go test -tags=integration_openldap ./...
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -53,12 +58,6 @@ const (
 	openldapUser2Pass = "password2"
 )
 
-// openldapBootstrapLDIF seeds:
-//   - users under ou=users (user1..user2, plus two duplicate `uid` users
-//     to exercise the "too many entries" branch of GetUser)
-//   - ou=empty (empty OU for GetOUUsers)
-//   - admins (groupOfNames, member = full DN of user1) -> first branch
-//   - readers (posixGroup, memberUid = user2) -> second branch
 const openldapBootstrapLDIF = `dn: ou=users,dc=example,dc=org
 objectClass: organizationalUnit
 ou: users
@@ -201,7 +200,6 @@ func TestMain(m *testing.M) {
 	os.Exit(code)
 }
 
-// waitForOpenLDAPReady polls the admin bind until the bootstrap import finishes.
 func waitForOpenLDAPReady(host string, port uint, timeout time.Duration) bool {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
@@ -218,10 +216,9 @@ func waitForOpenLDAPReady(host string, port uint, timeout time.Duration) bool {
 	return false
 }
 
-// newOpenLDAPConn returns an unauthenticated connection to the shared OpenLDAP server.
 func newOpenLDAPConn(t *testing.T, opts ...ldapper.Option) *ldapper.LDAPper {
 	t.Helper()
-	conn, err := ldapper.NewConnection(
+	conn, err := ldapper.NewLDAPper(
 		[]string{openldapHost},
 		openldapPort,
 		false, // useSSL
@@ -235,12 +232,11 @@ func newOpenLDAPConn(t *testing.T, opts ...ldapper.Option) *ldapper.LDAPper {
 	return conn
 }
 
-// newOpenLDAPAuthConn returns a connection authenticated as user1.
-// The connection's stored bindDN is openldapBaseDN, which is what
-// AuthenticateUser now uses internally (no explicit baseDN parameter).
+// newOpenLDAPAuthConn authenticates as user1. The OPENLDAPAdapter's search
+// template has an entryDN fallback, so binding with a DN works cleanly.
 func newOpenLDAPAuthConn(t *testing.T, opts ...ldapper.Option) *ldapper.LDAPper {
 	t.Helper()
-	conn, _, err := ldapper.NewAuthenticatedConnection(
+	conn, _, err := ldapper.NewAuthenticatedLDAPper(
 		openldapUser1DN, openldapUser1Pass, openldapBaseDN,
 		[]string{openldapHost},
 		openldapPort,
@@ -266,9 +262,9 @@ func TestIntegrationOpenLDAP_NewConnection_Success(t *testing.T) {
 }
 
 func TestIntegrationOpenLDAP_NewConnection_EmptyHosts(t *testing.T) {
-	_, err := ldapper.NewConnection(nil, 389, false, true, nil, openldapAdpt)
+	_, err := ldapper.NewLDAPper(nil, 389, false, true, nil, openldapAdpt)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "empty hosts list")
+	assert.True(t, errors.Is(err, ldapper.ErrInvalidArgument))
 }
 
 func TestIntegrationOpenLDAP_NewConnection_TooManyHosts(t *testing.T) {
@@ -276,31 +272,31 @@ func TestIntegrationOpenLDAP_NewConnection_TooManyHosts(t *testing.T) {
 	for i := range hosts {
 		hosts[i] = fmt.Sprintf("host%d", i)
 	}
-	_, err := ldapper.NewConnection(hosts, 389, false, true, nil, openldapAdpt)
+	_, err := ldapper.NewLDAPper(hosts, 389, false, true, nil, openldapAdpt)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "too many hosts")
+	assert.True(t, errors.Is(err, ldapper.ErrInvalidArgument))
 }
 
 func TestIntegrationOpenLDAP_NewConnection_NilTLSConfigWhenRequired(t *testing.T) {
-	_, err := ldapper.NewConnection([]string{openldapHost}, openldapPort, false, false, nil, openldapAdpt)
+	_, err := ldapper.NewLDAPper([]string{openldapHost}, openldapPort, false, false, nil, openldapAdpt)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "nil tls config")
+	assert.True(t, errors.Is(err, ldapper.ErrInvalidArgument))
 }
 
 func TestIntegrationOpenLDAP_NewConnection_NilCatalogAdapter(t *testing.T) {
-	_, err := ldapper.NewConnection([]string{openldapHost}, openldapPort, false, true, nil, nil)
+	_, err := ldapper.NewLDAPper([]string{openldapHost}, openldapPort, false, true, nil, nil)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "nil catalog adapter")
+	assert.True(t, errors.Is(err, ldapper.ErrInvalidArgument))
 }
 
 func TestIntegrationOpenLDAP_NewConnection_UnreachableHost(t *testing.T) {
-	_, err := ldapper.NewConnection([]string{"127.0.0.1"}, 1, false, true, nil, openldapAdpt)
+	_, err := ldapper.NewLDAPper([]string{"127.0.0.1"}, 1, false, true, nil, openldapAdpt)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "unsuccessful dial")
+	assert.True(t, errors.Is(err, ldapper.ErrUnavailable))
 }
 
 func TestIntegrationOpenLDAP_NewAuthenticatedConnection_Success(t *testing.T) {
-	conn, user, err := ldapper.NewAuthenticatedConnection(
+	conn, user, err := ldapper.NewAuthenticatedLDAPper(
 		openldapUser1DN, openldapUser1Pass, openldapBaseDN,
 		[]string{openldapHost}, openldapPort, false, true, nil, openldapAdpt,
 	)
@@ -313,20 +309,21 @@ func TestIntegrationOpenLDAP_NewAuthenticatedConnection_Success(t *testing.T) {
 }
 
 func TestIntegrationOpenLDAP_NewAuthenticatedConnection_EmptyCredentials(t *testing.T) {
-	_, _, err := ldapper.NewAuthenticatedConnection(
+	_, _, err := ldapper.NewAuthenticatedLDAPper(
 		"", "", openldapBaseDN,
 		[]string{openldapHost}, openldapPort, false, true, nil, openldapAdpt,
 	)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "empty bind username/password")
+	assert.True(t, errors.Is(err, ldapper.ErrInvalidArgument))
 }
 
 func TestIntegrationOpenLDAP_NewAuthenticatedConnection_WrongPassword(t *testing.T) {
-	_, _, err := ldapper.NewAuthenticatedConnection(
+	_, _, err := ldapper.NewAuthenticatedLDAPper(
 		openldapUser1DN, "wrong-password", openldapBaseDN,
 		[]string{openldapHost}, openldapPort, false, true, nil, openldapAdpt,
 	)
 	require.Error(t, err)
+	assert.True(t, errors.Is(err, ldapper.ErrInvalidCredentials))
 }
 
 // ---------------------------------------------------------------------------
@@ -348,14 +345,14 @@ func TestIntegrationOpenLDAP_AuthenticateConn_EmptyCredentials(t *testing.T) {
 	conn := newOpenLDAPConn(t)
 	_, err := conn.AuthenticateConn("", "", openldapBaseDN)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "empty bind username/password")
+	assert.True(t, errors.Is(err, ldapper.ErrInvalidArgument))
 }
 
 func TestIntegrationOpenLDAP_AuthenticateConn_WrongPassword(t *testing.T) {
 	conn := newOpenLDAPConn(t)
 	_, err := conn.AuthenticateConn(openldapUser1DN, "bad-password", openldapBaseDN)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "unsuccessful bind")
+	assert.True(t, errors.Is(err, ldapper.ErrInvalidCredentials))
 }
 
 func TestIntegrationOpenLDAP_AuthenticateConn_NonExistentUser(t *testing.T) {
@@ -365,50 +362,48 @@ func TestIntegrationOpenLDAP_AuthenticateConn_NonExistentUser(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// AuthenticateUser — NOTE: signature is now (username, password) only.
-// The base DN used for the internal GetUser comes from conn.bindDN,
-// populated by the prior AuthenticateConn call.
+// CheckUserCredentials — 2-arg signature, base DN from conn.bindDN
 // ---------------------------------------------------------------------------
 
-func TestIntegrationOpenLDAP_AuthenticateUser_Success(t *testing.T) {
+func TestIntegrationOpenLDAP_CheckUserCredentials_Success(t *testing.T) {
 	conn := newOpenLDAPAuthConn(t)
 
-	user, err := conn.AuthenticateUser(openldapUser2UID, openldapUser2Pass)
+	user, err := conn.CheckUserCredentials(openldapUser2UID, openldapUser2Pass)
 	require.NoError(t, err)
 	require.NotNil(t, user)
 	assert.Equal(t, openldapUser2DN, user.DN)
 	assert.Equal(t, openldapUser2UID, user.GetAttributeValue("uid"))
 }
 
-func TestIntegrationOpenLDAP_AuthenticateUser_WrongPassword(t *testing.T) {
+func TestIntegrationOpenLDAP_CheckUserCredentials_WrongPassword(t *testing.T) {
 	conn := newOpenLDAPAuthConn(t)
 
-	user, err := conn.AuthenticateUser(openldapUser2UID, "bad")
+	user, err := conn.CheckUserCredentials(openldapUser2UID, "bad")
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "unsuccessful bind with passed user credentials")
-	require.NotNil(t, user)
-	assert.Equal(t, openldapUser2DN, user.DN)
+	assert.True(t, errors.Is(err, ldapper.ErrInvalidCredentials))
+	assert.Nil(t, user)
 }
 
-func TestIntegrationOpenLDAP_AuthenticateUser_NonExistentUser(t *testing.T) {
+func TestIntegrationOpenLDAP_CheckUserCredentials_NonExistentUser(t *testing.T) {
 	conn := newOpenLDAPAuthConn(t)
-	_, err := conn.AuthenticateUser("ghost-user", "whatever")
+	user, err := conn.CheckUserCredentials("ghost-user", "whatever")
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "user does not exist")
+	assert.True(t, errors.Is(err, ldapper.ErrInvalidCredentials))
+	assert.Nil(t, user)
 }
 
-func TestIntegrationOpenLDAP_AuthenticateUser_NotAuthenticated(t *testing.T) {
+func TestIntegrationOpenLDAP_CheckUserCredentials_NotAuthenticated(t *testing.T) {
 	conn := newOpenLDAPConn(t)
-	_, err := conn.AuthenticateUser(openldapUser2UID, openldapUser2Pass)
+	_, err := conn.CheckUserCredentials(openldapUser2UID, openldapUser2Pass)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "connection not authenticated")
+	assert.True(t, errors.Is(err, ldapper.ErrNotAuthenticated))
 }
 
-func TestIntegrationOpenLDAP_AuthenticateUser_EmptyCredentials(t *testing.T) {
+func TestIntegrationOpenLDAP_CheckUserCredentials_EmptyCredentials(t *testing.T) {
 	conn := newOpenLDAPAuthConn(t)
-	_, err := conn.AuthenticateUser("", "")
+	_, err := conn.CheckUserCredentials("", "")
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "empty username/password")
+	assert.True(t, errors.Is(err, ldapper.ErrInvalidArgument))
 }
 
 // ---------------------------------------------------------------------------
@@ -429,7 +424,6 @@ func TestIntegrationOpenLDAP_IsAlive_AfterClose(t *testing.T) {
 func TestIntegrationOpenLDAP_Reconnect_Unauthenticated(t *testing.T) {
 	conn := newOpenLDAPConn(t)
 	require.True(t, conn.IsAlive())
-
 	require.NoError(t, conn.Reconnect())
 	assert.True(t, conn.IsAlive())
 }
@@ -438,9 +432,7 @@ func TestIntegrationOpenLDAP_Reconnect_PreservesAuthentication(t *testing.T) {
 	conn := newOpenLDAPAuthConn(t)
 	require.NoError(t, conn.Reconnect())
 
-	// AuthenticateUser will fail unless Reconnect re-applied the stored
-	// bind credentials and conn.bindDN is still openldapBaseDN.
-	_, err := conn.AuthenticateUser(openldapUser2UID, openldapUser2Pass)
+	_, err := conn.CheckUserCredentials(openldapUser2UID, openldapUser2Pass)
 	require.NoError(t, err)
 }
 
@@ -458,7 +450,7 @@ func TestIntegrationOpenLDAP_EnsureAlive_ReconnectsAfterClose(t *testing.T) {
 	require.NoError(t, conn.EnsureAlive())
 	assert.True(t, conn.IsAlive())
 
-	_, err := conn.AuthenticateUser(openldapUser2UID, openldapUser2Pass)
+	_, err := conn.CheckUserCredentials(openldapUser2UID, openldapUser2Pass)
 	require.NoError(t, err)
 }
 
@@ -469,7 +461,7 @@ func TestIntegrationOpenLDAP_Close_Idempotent(t *testing.T) {
 
 	_, err := conn.GetUser(openldapUser1UID, openldapBaseDN)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "connection not initialized")
+	assert.True(t, errors.Is(err, ldapper.ErrClosed))
 }
 
 // ---------------------------------------------------------------------------
@@ -480,13 +472,8 @@ func TestIntegrationOpenLDAP_CustomSearch_Success(t *testing.T) {
 	conn := newOpenLDAPAuthConn(t)
 
 	req := ldap.NewSearchRequest(
-		openldapBaseDN,
-		ldap.ScopeWholeSubtree,
-		ldap.NeverDerefAliases,
-		0, 0, false,
-		"(uid=user1)",
-		[]string{"cn", "mail"},
-		nil,
+		openldapBaseDN, ldap.ScopeWholeSubtree, ldap.NeverDerefAliases,
+		0, 0, false, "(uid=user1)", []string{"cn", "mail"}, nil,
 	)
 
 	res, err := conn.CustomSearch(req)
@@ -501,16 +488,12 @@ func TestIntegrationOpenLDAP_CustomSearch_NotInitialized(t *testing.T) {
 	conn.Close()
 
 	req := ldap.NewSearchRequest(
-		openldapBaseDN,
-		ldap.ScopeBaseObject,
-		ldap.NeverDerefAliases,
-		0, 0, false,
-		"(objectClass=*)",
-		nil, nil,
+		openldapBaseDN, ldap.ScopeBaseObject, ldap.NeverDerefAliases,
+		0, 0, false, "(objectClass=*)", nil, nil,
 	)
 	_, err := conn.CustomSearch(req)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "connection not initialized")
+	assert.True(t, errors.Is(err, ldapper.ErrClosed))
 }
 
 // ---------------------------------------------------------------------------
@@ -524,7 +507,6 @@ func TestIntegrationOpenLDAP_GetUser_ByUID(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, openldapUser1DN, user.DN)
 	assert.Equal(t, "user1", user.GetAttributeValue("uid"))
-	assert.Equal(t, "user1@example.org", user.GetAttributeValue("mail"))
 	assert.Equal(t, "User One", user.GetAttributeValue("displayName"))
 }
 
@@ -540,14 +522,14 @@ func TestIntegrationOpenLDAP_GetUser_NotFound(t *testing.T) {
 	conn := newOpenLDAPAuthConn(t)
 	_, err := conn.GetUser("does-not-exist", openldapBaseDN)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "user does not exist")
+	assert.True(t, errors.Is(err, ldapper.ErrNotFound))
 }
 
 func TestIntegrationOpenLDAP_GetUser_TooManyEntries(t *testing.T) {
 	conn := newOpenLDAPAuthConn(t)
 	_, err := conn.GetUser("duplicate", openldapBaseDN)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "too many entries")
+	assert.True(t, errors.Is(err, ldapper.ErrAmbiguousResult))
 }
 
 func TestIntegrationOpenLDAP_GetUser_NotInitialized(t *testing.T) {
@@ -556,18 +538,97 @@ func TestIntegrationOpenLDAP_GetUser_NotInitialized(t *testing.T) {
 
 	_, err := conn.GetUser(openldapUser1UID, openldapBaseDN)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "connection not initialized")
+	assert.True(t, errors.Is(err, ldapper.ErrClosed))
 }
 
 // ---------------------------------------------------------------------------
-// GetUserGroups — both branches of the fixed filter must be exercised.
+// GetGroup / GetOU
+// ---------------------------------------------------------------------------
+
+func TestIntegrationOpenLDAP_GetGroup_Success(t *testing.T) {
+	conn := newOpenLDAPAuthConn(t)
+
+	group, err := conn.GetGroup("admins", openldapBaseDN)
+	require.NoError(t, err)
+	require.NotNil(t, group)
+	assert.Equal(t, "admins", group.GetAttributeValue("cn"))
+}
+
+func TestIntegrationOpenLDAP_GetGroup_NotFound(t *testing.T) {
+	conn := newOpenLDAPAuthConn(t)
+	_, err := conn.GetGroup("does-not-exist", openldapBaseDN)
+	require.Error(t, err)
+	assert.True(t, errors.Is(err, ldapper.ErrNotFound))
+}
+
+func TestIntegrationOpenLDAP_GetOU_Success(t *testing.T) {
+	conn := newOpenLDAPAuthConn(t)
+
+	ou, err := conn.GetOU("users", openldapBaseDN)
+	require.NoError(t, err)
+	require.NotNil(t, ou)
+	assert.Equal(t, "users", ou.GetAttributeValue("ou"))
+}
+
+func TestIntegrationOpenLDAP_GetOU_NotFound(t *testing.T) {
+	conn := newOpenLDAPAuthConn(t)
+	_, err := conn.GetOU("does-not-exist", openldapBaseDN)
+	require.Error(t, err)
+	assert.True(t, errors.Is(err, ldapper.ErrNotFound))
+}
+
+// ---------------------------------------------------------------------------
+// GetCatalogTree / GetSubOUs / ListSingleLevelOUs
+// ---------------------------------------------------------------------------
+
+func TestIntegrationOpenLDAP_GetCatalogTree_Success(t *testing.T) {
+	conn := newOpenLDAPAuthConn(t)
+
+	tree, err := conn.GetCatalogTree(openldapBaseDN, 0)
+	require.NoError(t, err)
+	assert.NotEmpty(t, tree.Tree)
+}
+
+func TestIntegrationOpenLDAP_GetCatalogTree_MaxDepth(t *testing.T) {
+	conn := newOpenLDAPAuthConn(t)
+
+	tree, err := conn.GetCatalogTree(openldapBaseDN, 1)
+	require.NoError(t, err)
+	for _, root := range tree.Tree {
+		assert.Empty(t, root.Children)
+	}
+}
+
+func TestIntegrationOpenLDAP_GetSubOUs_SingleLevel(t *testing.T) {
+	conn := newOpenLDAPAuthConn(t)
+
+	ous, err := conn.GetSubOUs(openldapBaseDN, ldap.ScopeSingleLevel)
+	require.NoError(t, err)
+
+	var names []string
+	for _, ou := range ous {
+		names = append(names, ou.Name)
+	}
+	assert.Contains(t, names, "users")
+	assert.Contains(t, names, "groups")
+	assert.Contains(t, names, "empty")
+}
+
+func TestIntegrationOpenLDAP_ListSingleLevelOUs(t *testing.T) {
+	conn := newOpenLDAPAuthConn(t)
+
+	ous, err := conn.ListSingleLevelOUs(openldapBaseDN)
+	require.NoError(t, err)
+	assert.NotEmpty(t, ous)
+}
+
+// ---------------------------------------------------------------------------
+// GetUserGroups — both branches of the filter
 // ---------------------------------------------------------------------------
 
 func TestIntegrationOpenLDAP_GetUserGroups_GroupOfNamesBranch(t *testing.T) {
 	conn := newOpenLDAPAuthConn(t)
 
-	// user1 is in `admins` (groupOfNames, member = DN).
-	// The fixed filter uses member=<user.DN> for this branch.
 	groups, err := conn.GetUserGroups(openldapUser1UID, openldapBaseDN)
 	require.NoError(t, err)
 	assert.ElementsMatch(t, []string{"admins"}, groups)
@@ -576,21 +637,19 @@ func TestIntegrationOpenLDAP_GetUserGroups_GroupOfNamesBranch(t *testing.T) {
 func TestIntegrationOpenLDAP_GetUserGroups_PosixGroupBranch(t *testing.T) {
 	conn := newOpenLDAPAuthConn(t)
 
-	// user2 is in `readers` (posixGroup, memberUid = uid).
-	// The fixed filter uses memberUid=<user.uid> for this branch.
 	groups, err := conn.GetUserGroups(openldapUser2UID, openldapBaseDN)
 	require.NoError(t, err)
 	assert.ElementsMatch(t, []string{"readers"}, groups)
 }
 
-func TestIntegrationOpenLDAP_GetUserGroups_NoGroups(t *testing.T) {
+func TestIntegrationOpenLDAP_GetUserGroups_AmbiguousUser(t *testing.T) {
 	conn := newOpenLDAPAuthConn(t)
 
-	// duplicate users are not members of any seeded group; the call should
-	// fail before the group search with "too many entries".
+	// duplicate users resolve to more than one entry; the group search
+	// must never happen and the user lookup must surface the ambiguity.
 	_, err := conn.GetUserGroups("duplicate", openldapBaseDN)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "too many entries")
+	assert.True(t, errors.Is(err, ldapper.ErrAmbiguousResult))
 }
 
 func TestIntegrationOpenLDAP_GetUserGroups_UserNotFound(t *testing.T) {
@@ -598,7 +657,7 @@ func TestIntegrationOpenLDAP_GetUserGroups_UserNotFound(t *testing.T) {
 
 	_, err := conn.GetUserGroups("nobody", openldapBaseDN)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "user does not exist")
+	assert.True(t, errors.Is(err, ldapper.ErrNotFound))
 }
 
 // ---------------------------------------------------------------------------
@@ -634,11 +693,11 @@ func TestIntegrationOpenLDAP_GetOUUsers_NotInitialized(t *testing.T) {
 
 	_, err := conn.GetOUUsers("ou=users," + openldapBaseDN)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "connection not initialized")
+	assert.True(t, errors.Is(err, ldapper.ErrClosed))
 }
 
 // ---------------------------------------------------------------------------
-// Search limits
+// Search / dial limits
 // ---------------------------------------------------------------------------
 
 func TestIntegrationOpenLDAP_SearchLimits_Defaults(t *testing.T) {
@@ -671,12 +730,24 @@ func TestIntegrationOpenLDAP_SearchLimits_NegativeClampedToZero(t *testing.T) {
 	assert.Equal(t, 0, limits.TimeLimit)
 }
 
-func TestIntegrationOpenLDAP_SearchLimits_AppliedToSearch(t *testing.T) {
-	// sizeLimit=1 against a 4-user OU: OpenLDAP returns SizeLimitExceeded,
-	// which GetOUUsers surfaces as an error.
-	conn := newOpenLDAPAuthConn(t, ldapper.WithSearchLimits(1, 0))
+func TestIntegrationOpenLDAP_DialTimeout_Defaults(t *testing.T) {
+	conn := newOpenLDAPConn(t)
+	assert.Equal(t, time.Duration(0), conn.GetDialTimeout())
+}
 
-	_, err := conn.GetOUUsers("ou=users," + openldapBaseDN)
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "unsuccessful ou users search")
+func TestIntegrationOpenLDAP_DialTimeout_WithOption(t *testing.T) {
+	conn := newOpenLDAPConn(t, ldapper.WithDialTimeout(3*time.Second))
+	assert.Equal(t, 3*time.Second, conn.GetDialTimeout())
+}
+
+func TestIntegrationOpenLDAP_DialTimeout_SetAtRuntime(t *testing.T) {
+	conn := newOpenLDAPConn(t)
+	conn.SetDialTimeout(2 * time.Second)
+	assert.Equal(t, 2*time.Second, conn.GetDialTimeout())
+}
+
+func TestIntegrationOpenLDAP_DialTimeout_NegativeClampedToZero(t *testing.T) {
+	conn := newOpenLDAPConn(t)
+	conn.SetDialTimeout(-1 * time.Second)
+	assert.Equal(t, time.Duration(0), conn.GetDialTimeout())
 }

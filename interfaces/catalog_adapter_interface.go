@@ -10,14 +10,19 @@ import (
 type CatalogAdapter interface {
 	// cast things
 	GetNormalizedUserInfo(ldapUser types.LDAPUser) *types.UserNormalizedInfo
-	OUInfoFromEntry(entry ldap.Entry) *types.OUInfo
+	GetNormalizedOUInfoFromEntry(entry ldap.Entry) *types.OUNormalizedInfo
 
 	// object type filters
 	UserObjectFilter() string
 	GroupObjectFilter() string
 	OUObjectFilter() string
 
-	// search filters
+	// Search filters
+	//
+	// Contract: templates use fmt-style verbs (%s or %[N]s). All arguments
+	// passed via SearchUserGroupsFilterTemplateArgs (or applied by LDAPper
+	// methods) are escaped with ldap.EscapeFilter before substitution, so
+	// implementers must return raw (unescaped) attribute values.
 	SearchUserFilterTemplate() string       // NB: 1 arg
 	SearchUserGroupsFilterTemplate() string // NB: N args, use with SearchUserGroupsFilterTemplateArgs unpacking
 	SearchUserGroupsFilterTemplateArgs(ldapUser types.LDAPUser) []any

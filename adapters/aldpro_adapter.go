@@ -11,15 +11,13 @@ import (
 NB: BE CAREFUL There are rbta-org-unit instead of (or together with) organizationalUnit in AldPro - so smth can work incorrectly
 */
 
-type ALDRPOAdapter struct{}
+type ALDPROAdapter struct{}
 
 // CAST
 
-func (a ALDRPOAdapter) GetNormalizedUserInfo(ldapUser types.LDAPUser) *types.UserNormalizedInfo {
-	// TODO: think what else we need in normalized user info
-
+func (a ALDPROAdapter) GetNormalizedUserInfo(ldapUser types.LDAPUser) *types.UserNormalizedInfo {
 	return &types.UserNormalizedInfo{
-		DistinguishedName: ldapUser.GetAttributeValue("dn"),
+		DistinguishedName: ldapUser.DN,
 		CommonName:        ldapUser.GetAttributeValue("cn"),
 		Mobile:            ldapUser.GetAttributeValue("mobile"),
 		Phone:             ldapUser.GetAttributeValue("telephoneNumber"),
@@ -28,7 +26,7 @@ func (a ALDRPOAdapter) GetNormalizedUserInfo(ldapUser types.LDAPUser) *types.Use
 		Title:             ldapUser.GetAttributeValue("title"),
 		Manager:           ldapUser.GetAttributeValue("manager"),
 		Photo:             ldapUser.GetAttributeValue("jpegPhoto"),
-		Company:           "",
+		Company:           ldapUser.GetAttributeValue("o"),
 		Country:           ldapUser.GetAttributeValue("co"),
 		Address:           ldapUser.GetAttributeValue("streetAddress"),
 		City:              ldapUser.GetAttributeValue("l"),
@@ -36,57 +34,55 @@ func (a ALDRPOAdapter) GetNormalizedUserInfo(ldapUser types.LDAPUser) *types.Use
 	}
 }
 
-func (a ALDRPOAdapter) OUInfoFromEntry(entry ldap.Entry) *types.OUInfo {
-	return &types.OUInfo{
+func (a ALDPROAdapter) GetNormalizedOUInfoFromEntry(entry ldap.Entry) *types.OUNormalizedInfo {
+	return &types.OUNormalizedInfo{
 		DN:       entry.DN,
-		Name:     entry.DN,
+		Name:     ouNameFromDN(entry.DN),
 		OU:       entry.GetAttributeValue("ou"),
-		Children: make([]*types.OUInfo, 0),
+		Children: make([]*types.OUNormalizedInfo, 0),
 	}
 }
 
 // TYPE FILTERS
 
-func (a ALDRPOAdapter) OUObjectFilter() string {
+func (a ALDPROAdapter) OUObjectFilter() string {
 	return "(|(objectClass=organizationalUnit)(objectClass=rbta-org-unit))"
 }
 
-func (a ALDRPOAdapter) GroupObjectFilter() string {
+func (a ALDPROAdapter) GroupObjectFilter() string {
 	return "(|(objectClass=groupOfNames)(objectClass=posixGroup)(objectClass=ipausergroup))"
 }
 
-func (a ALDRPOAdapter) UserObjectFilter() string {
+func (a ALDPROAdapter) UserObjectFilter() string {
 	return "(|(objectClass=posixAccount)(objectClass=inetOrgPerson)(objectClass=person))"
 }
 
 // SEARCH
 
-func (a ALDRPOAdapter) SearchUserFilterTemplate() string {
+func (a ALDPROAdapter) SearchUserFilterTemplate() string {
 	return "(&(|(objectClass=posixAccount)(objectClass=inetOrgPerson)(objectClass=person))(uid=%s))"
 }
 
-func (a ALDRPOAdapter) SearchUserGroupsFilterTemplate() string {
+func (a ALDPROAdapter) SearchUserGroupsFilterTemplate() string {
 	return "(|(&(|(objectClass=groupOfNames)(objectClass=ipausergroup)(objectClass=posixGroup))(member=%s))(&(objectClass=posixGroup)(memberUid=%s)))"
 }
 
-func (a ALDRPOAdapter) SearchUserGroupsFilterTemplateArgs(ldapUser types.LDAPUser) []any {
+func (a ALDPROAdapter) SearchUserGroupsFilterTemplateArgs(ldapUser types.LDAPUser) []any {
 	return []any{ldapUser.DN, ldapUser.GetAttributeValue("uid")}
 }
 
-func (a ALDRPOAdapter) SearchOUFilterTemplate() string {
+func (a ALDPROAdapter) SearchOUFilterTemplate() string {
 	return "(&(|(objectClass=organizationalUnit)(objectClass=rbta-org-unit))(ou=%s))"
 }
 
-func (a ALDRPOAdapter) SearchGroupFilterTemplate() string {
+func (a ALDPROAdapter) SearchGroupFilterTemplate() string {
 	return "(&(|(objectClass=groupOfNames)(objectClass=posixGroup)(objectClass=ipausergroup))(cn=%s))"
 }
 
 // ATTRS
 
-func (a ALDRPOAdapter) UserAttrs() []string {
+func (a ALDPROAdapter) UserAttrs() []string {
 	return []string{
-		"dn",
-
 		"uid",
 		"cn",
 		"givenName",
@@ -119,7 +115,7 @@ func (a ALDRPOAdapter) UserAttrs() []string {
 	}
 }
 
-func (a ALDRPOAdapter) OUAttrs() []string {
+func (a ALDPROAdapter) OUAttrs() []string {
 	return []string{
 		"dn",
 		"ou",
@@ -128,7 +124,7 @@ func (a ALDRPOAdapter) OUAttrs() []string {
 	}
 }
 
-func (a ALDRPOAdapter) GroupAttrs() []string {
+func (a ALDPROAdapter) GroupAttrs() []string {
 	return []string{
 		"cn",
 

@@ -2,7 +2,6 @@
 package adapters
 
 import (
-	"fmt"
 	"strings"
 	"testing"
 
@@ -17,27 +16,27 @@ import (
 func TestMSADAdapter_GetNormalizedUserInfo_FullAttributes(t *testing.T) {
 	adapter := MSADAdapter{}
 	user := newLDAPUser("cn=John Doe,ou=people,dc=example,dc=com", map[string][]string{
-		"distinguishedName": {"cn=John Doe,ou=people,dc=example,dc=com"},
-		"cn":                {"John Doe"},
-		"mobile":            {"+7-999-123-45-67"},
-		"telephoneNumber":   {"+7-495-123-45-67"},
-		"mail":              {"john.doe@example.com"},
-		"department":        {"IT"},
-		"title":             {"Engineer"},
-		"manager":           {"cn=Jane Boss,ou=people,dc=example,dc=com"},
-		"thumbnailPhoto":    {"thumb-bytes"},
-		"jpegPhoto":         {"jpeg-bytes"},
-		"company":           {"Example Inc."},
-		"co":                {"RU"},
-		"streetAddress":     {"Tverskaya 1"},
-		"l":                 {"Moscow"},
-		"postalCode":        {"101000"},
+		"cn":              {"John Doe"},
+		"mobile":          {"+7-999-123-45-67"},
+		"telephoneNumber": {"+7-495-123-45-67"},
+		"mail":            {"john.doe@example.com"},
+		"department":      {"IT"},
+		"title":           {"Engineer"},
+		"manager":         {"cn=Jane Boss,ou=people,dc=example,dc=com"},
+		"thumbnailPhoto":  {"thumb-bytes"},
+		"jpegPhoto":       {"jpeg-bytes"},
+		"company":         {"Example Inc."},
+		"co":              {"RU"},
+		"streetAddress":   {"Tverskaya 1"},
+		"l":               {"Moscow"},
+		"postalCode":      {"101000"},
 	})
 
 	info := adapter.GetNormalizedUserInfo(user)
 
 	assert.NotNil(t, info)
-	// MSAD reads DN from the "distinguishedName" attribute, not the struct field.
+	// NB: MSAD's GetNormalizedUserInfo uses the LDAPUser struct field for DN,
+	// NOT the "distinguishedName" attribute.
 	assert.Equal(t, "cn=John Doe,ou=people,dc=example,dc=com", info.DistinguishedName)
 	assert.Equal(t, "John Doe", info.CommonName)
 	assert.Equal(t, "+7-999-123-45-67", info.Mobile)
@@ -125,41 +124,47 @@ func TestMSADAdapter_GetNormalizedUserInfo_NilAttributesMap(t *testing.T) {
 	})
 }
 
-func TestMSADAdapter_GetNormalizedUserInfo_DistinguishedNameFromAttrOnly(t *testing.T) {
-	// DN comes from the "distinguishedName" attribute; the struct field is
-	// ignored.
-	user := newLDAPUser("cn=IGNORED,dc=x", map[string][]string{
-		"cn": {"John"},
+// TestMSADAdapter_GetNormalizedUserInfo_DistinguishedNameFromStructField
+// pins the DN source: the struct field wins over the "distinguishedName"
+// attribute value. This is a common point of confusion — MSAD *does* include
+// "distinguishedName" in UserAttrs, but the adapter's cast method never
+// reads it.
+func TestMSADAdapter_GetNormalizedUserInfo_DistinguishedNameFromStructField(t *testing.T) {
+	user := newLDAPUser("cn=from-struct,dc=x", map[string][]string{
+		"cn":                {"John"},
+		"distinguishedName": {"cn=from-attr,dc=x"},
 	})
 
 	info := MSADAdapter{}.GetNormalizedUserInfo(user)
 
-	assert.Empty(t, info.DistinguishedName,
-		"DistinguishedName must be filled only from the \"distinguishedName\" attribute")
+	assert.Equal(t, "cn=from-struct,dc=x", info.DistinguishedName,
+		"DistinguishedName must come from the struct field, not the distinguishedName attribute")
+	assert.NotEqual(t, "cn=from-attr,dc=x", info.DistinguishedName)
 }
 
-// ---------- OUInfoFromEntry ----------
+// ---------- GetNormalizedOUInfoFromEntry ----------
 
-func TestMSADAdapter_OUInfoFromEntry_FullAttributes(t *testing.T) {
+func TestMSADAdapter_GetNormalizedOUInfoFromEntry_FullAttributes(t *testing.T) {
 	entry := ldap.Entry{
 		DN: "ou=IT,ou=Departments,dc=example,dc=com",
 		Attributes: []*ldap.EntryAttribute{
-			{Name: "name", Values: []string{"IT"}},
+			{Name: "name", Values: []string{"IGNORED"}},
 		},
 	}
 
-	info := MSADAdapter{}.OUInfoFromEntry(entry)
+	info := MSADAdapter{}.GetNormalizedOUInfoFromEntry(entry)
 
 	assert.NotNil(t, info)
 	assert.Equal(t, "ou=IT,ou=Departments,dc=example,dc=com", info.DN)
-	// MSAD: Name comes from the "name" attribute.
+	// NB: Name comes from ouNameFromDN(entry.DN), not from the "name" attribute.
 	assert.Equal(t, "IT", info.Name)
-	// MSAD: OU is set to the entry DN, not the "ou" attribute.
+	// MSAD sets OU to the entry DN, not the "ou" attribute.
 	assert.Equal(t, "ou=IT,ou=Departments,dc=example,dc=com", info.OU)
 }
 
-func TestMSADAdapter_OUInfoFromEntry_MissingNameAttribute(t *testing.T) {
-	// If "name" is absent, Name stays empty; DN and OU keep their values.
+func TestMSADAdapter_GetNormalizedOUInfoFromEntry_MissingNameAttribute(t *testing.T) {
+	// Name is derived from the DN, so a missing "name" attribute must not
+	// change the outcome.
 	entry := ldap.Entry{
 		DN: "ou=IT,dc=example,dc=com",
 		Attributes: []*ldap.EntryAttribute{
@@ -167,30 +172,33 @@ func TestMSADAdapter_OUInfoFromEntry_MissingNameAttribute(t *testing.T) {
 		},
 	}
 
-	info := MSADAdapter{}.OUInfoFromEntry(entry)
+	info := MSADAdapter{}.GetNormalizedOUInfoFromEntry(entry)
 
 	assert.Equal(t, "ou=IT,dc=example,dc=com", info.DN)
-	assert.Empty(t, info.Name)
+	assert.Equal(t, "IT", info.Name, "Name comes from the DN, not the (missing) name attribute")
 	assert.Equal(t, "ou=IT,dc=example,dc=com", info.OU)
 }
 
-func TestMSADAdapter_OUInfoFromEntry_UsesFirstValueOfMultiValuedName(t *testing.T) {
-	// GetAttributeValue returns the first value of a multi-valued attribute.
+// TestMSADAdapter_GetNormalizedOUInfoFromEntry_NameFromDNFirstRDN verifies
+// that a multi-valued "name" attribute is irrelevant — Name comes from
+// ouNameFromDN(entry.DN).
+func TestMSADAdapter_GetNormalizedOUInfoFromEntry_NameFromDNFirstRDN(t *testing.T) {
 	entry := ldap.Entry{
 		DN: "ou=IT,dc=example,dc=com",
 		Attributes: []*ldap.EntryAttribute{
-			{Name: "name", Values: []string{"IT", "Information Technology"}},
+			{Name: "name", Values: []string{"IGNORED1", "IGNORED2"}},
 		},
 	}
 
-	info := MSADAdapter{}.OUInfoFromEntry(entry)
+	info := MSADAdapter{}.GetNormalizedOUInfoFromEntry(entry)
 
 	assert.Equal(t, "IT", info.Name)
+	assert.NotEqual(t, "IGNORED1", info.Name)
 }
 
-// TestMSADAdapter_OUInfoFromEntry_DegenerateInputs covers empty entries and
-// nil attributes; Children must always be a non-nil empty slice.
-func TestMSADAdapter_OUInfoFromEntry_DegenerateInputs(t *testing.T) {
+// TestMSADAdapter_GetNormalizedOUInfoFromEntry_DegenerateInputs covers empty
+// entries and nil attributes; Children must always be a non-nil empty slice.
+func TestMSADAdapter_GetNormalizedOUInfoFromEntry_DegenerateInputs(t *testing.T) {
 	tests := []struct {
 		name  string
 		entry ldap.Entry
@@ -201,7 +209,7 @@ func TestMSADAdapter_OUInfoFromEntry_DegenerateInputs(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			assert.NotPanics(t, func() {
-				info := MSADAdapter{}.OUInfoFromEntry(tc.entry)
+				info := MSADAdapter{}.GetNormalizedOUInfoFromEntry(tc.entry)
 				assert.NotNil(t, info)
 				assert.Equal(t, tc.entry.DN, info.DN)
 				assert.NotNil(t, info.Children)
@@ -211,12 +219,12 @@ func TestMSADAdapter_OUInfoFromEntry_DegenerateInputs(t *testing.T) {
 	}
 }
 
-func TestMSADAdapter_OUInfoFromEntry_ChildrenAppendable(t *testing.T) {
+func TestMSADAdapter_GetNormalizedOUInfoFromEntry_ChildrenAppendable(t *testing.T) {
 	// Pin the non-nil contract: callers must be able to append to Children.
-	info := MSADAdapter{}.OUInfoFromEntry(ldap.Entry{DN: "ou=IT,dc=x"})
+	info := MSADAdapter{}.GetNormalizedOUInfoFromEntry(ldap.Entry{DN: "ou=IT,dc=x"})
 
 	assert.NotPanics(t, func() {
-		info.Children = append(info.Children, &types.OUInfo{DN: "ou=Sub,ou=IT,dc=x"})
+		info.Children = append(info.Children, &types.OUNormalizedInfo{DN: "ou=Sub,ou=IT,dc=x"})
 	})
 	assert.Len(t, info.Children, 1)
 }
@@ -394,6 +402,3 @@ func TestMSADAdapter_GroupAttrs_NoDuplicates(t *testing.T) {
 		seen[attr] = struct{}{}
 	}
 }
-
-// Silence unused import when only compilation of fmt is needed elsewhere.
-var _ = fmt.Sprintf

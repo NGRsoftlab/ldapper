@@ -16,10 +16,8 @@ type FREEIPAAdapter struct{}
 // CAST
 
 func (a FREEIPAAdapter) GetNormalizedUserInfo(ldapUser types.LDAPUser) *types.UserNormalizedInfo {
-	// TODO: think what else we need in normalized user info
-
 	return &types.UserNormalizedInfo{
-		DistinguishedName: ldapUser.GetAttributeValue("dn"),
+		DistinguishedName: ldapUser.DN,
 		CommonName:        ldapUser.GetAttributeValue("cn"),
 		Mobile:            ldapUser.GetAttributeValue("mobile"),
 		Phone:             ldapUser.GetAttributeValue("telephoneNumber"),
@@ -28,7 +26,7 @@ func (a FREEIPAAdapter) GetNormalizedUserInfo(ldapUser types.LDAPUser) *types.Us
 		Title:             ldapUser.GetAttributeValue("title"),
 		Manager:           ldapUser.GetAttributeValue("manager"),
 		Photo:             ldapUser.GetAttributeValue("jpegPhoto"),
-		Company:           "",
+		Company:           ldapUser.GetAttributeValue("o"),
 		Country:           ldapUser.GetAttributeValue("co"),
 		Address:           ldapUser.GetAttributeValue("street"),
 		City:              ldapUser.GetAttributeValue("l"),
@@ -36,12 +34,12 @@ func (a FREEIPAAdapter) GetNormalizedUserInfo(ldapUser types.LDAPUser) *types.Us
 	}
 }
 
-func (a FREEIPAAdapter) OUInfoFromEntry(entry ldap.Entry) *types.OUInfo {
-	return &types.OUInfo{
+func (a FREEIPAAdapter) GetNormalizedOUInfoFromEntry(entry ldap.Entry) *types.OUNormalizedInfo {
+	return &types.OUNormalizedInfo{
 		DN:       entry.DN,
-		Name:     entry.DN,
+		Name:     ouNameFromDN(entry.DN),
 		OU:       entry.GetAttributeValue("ou"),
-		Children: make([]*types.OUInfo, 0),
+		Children: make([]*types.OUNormalizedInfo, 0),
 	}
 }
 
@@ -85,8 +83,6 @@ func (a FREEIPAAdapter) SearchGroupFilterTemplate() string {
 
 func (a FREEIPAAdapter) UserAttrs() []string {
 	return []string{
-		"dn",
-
 		"uid",
 		"cn",
 		"givenName",

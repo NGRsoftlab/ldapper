@@ -925,3 +925,32 @@ func TestIntegrationALDPro_AuthenticateConn_FailedBind_InvalidatesState(t *testi
 	require.Error(t, err)
 	assert.True(t, errors.Is(err, ldapper.ErrNotAuthenticated))
 }
+
+func TestIntegrationALDPro_Reconnect_RebindFailure_ClosesConnection(t *testing.T) {
+	conn := newALDProConn(t)
+	_, err := conn.AuthenticateConn(aldproSvcDN, aldproSvcPass, aldproBaseDN)
+	require.NoError(t, err)
+
+	rawConn, err := ldap.DialURL(fmt.Sprintf("ldap://%s:%d", aldproHost, aldproPort))
+	require.NoError(t, err)
+	defer rawConn.Close()
+	require.NoError(t, rawConn.Bind(aldproAdminDN, aldproAdminPass))
+
+	modify := ldap.NewModifyRequest(aldproSvcDN, nil)
+	modify.Replace("userPassword", []string{"temporary-during-test"})
+	require.NoError(t, rawConn.Modify(modify))
+
+	t.Cleanup(func() {
+		restore := ldap.NewModifyRequest(aldproSvcDN, nil)
+		restore.Replace("userPassword", []string{aldproSvcPass})
+		_ = rawConn.Modify(restore)
+	})
+
+	err = conn.Reconnect()
+	require.Error(t, err)
+	assert.True(t, errors.Is(err, ldapper.ErrInvalidCredentials))
+
+	if _, err := conn.GetUser(aldproUser1UID, aldproBaseDN); !errors.Is(err, ldapper.ErrClosed) {
+		t.Fatalf("expected ErrClosed after failed rebind, got %v", err)
+	}
+}

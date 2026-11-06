@@ -678,3 +678,37 @@ func TestIntegrationFreeIPA_AuthenticateConn_FailedBind_InvalidatesState(t *test
 	require.Error(t, err)
 	assert.True(t, errors.Is(err, ldapper.ErrNotAuthenticated))
 }
+
+func TestIntegrationFreeIPA_Reconnect_RebindFailure_ClosesConnection(t *testing.T) {
+	requireFreeIPAUsers(t)
+	conn := newFreeIPAConn(t)
+
+	_, err := conn.AuthenticateConn(freeipaUser1UID, freeipaUser1Pass, freeipaBaseDN)
+	require.NoError(t, err)
+
+	// Locate user1's DN via the current connection before we break anything.
+	user, err := conn.GetUser(freeipaUser1UID, freeipaBaseDN)
+	require.NoError(t, err)
+	require.NotEmpty(t, user.DN)
+
+	rawConn, err := ldap.DialURL(fmt.Sprintf("ldap://%s:%d", freeipaHost, freeipaPort))
+	require.NoError(t, err)
+	defer rawConn.Close()
+	require.NoError(t, rawConn.Bind(freeipaDM, freeipaAdminPass))
+
+	modify := ldap.NewModifyRequest(user.DN, nil)
+	modify.Replace("userPassword", []string{"{SSHA}temporary-test-hash"})
+	require.NoError(t, rawConn.Modify(modify))
+
+	// No reliable restore here: FreeIPA stores SSHA, restoring user1Pass
+	// requires re-running `ipa passwd`. If flakiness becomes a problem,
+	// create a dedicated svc-reconnect user in seedFreeIPA instead.
+
+	err = conn.Reconnect()
+	require.Error(t, err)
+	assert.True(t, errors.Is(err, ldapper.ErrInvalidCredentials))
+
+	if _, err := conn.GetUser(freeipaUser2UID, freeipaBaseDN); !errors.Is(err, ldapper.ErrClosed) {
+		t.Fatalf("expected ErrClosed after failed rebind, got %v", err)
+	}
+}

@@ -772,3 +772,45 @@ func TestIntegrationOpenLDAP_AuthenticateConn_FailedBind_InvalidatesState(t *tes
 	assert.True(t, errors.Is(err, ldapper.ErrNotAuthenticated),
 		"post-failed-bind connection must not be treated as authenticated")
 }
+
+func TestIntegrationOpenLDAP_Reconnect_RebindFailure_ClosesConnection(t *testing.T) {
+	// 1. Authenticate as user1.
+	conn := newOpenLDAPConn(t)
+	_, err := conn.AuthenticateConn(openldapUser1DN, openldapUser1Pass, openldapBaseDN)
+	require.NoError(t, err)
+
+	// 2. Change user1's password directly via go-ldap so the *next* rebind
+	//    inside Reconnect fails with InvalidCredentials.
+	rawConn, err := ldap.DialURL(fmt.Sprintf("ldap://%s:%d", openldapHost, openldapPort))
+	require.NoError(t, err)
+	defer rawConn.Close()
+	require.NoError(t, rawConn.Bind(openldapAdminDN, openldapAdminPass))
+
+	modify := ldap.NewModifyRequest(openldapUser1DN, nil)
+	modify.Replace("userPassword", []string{"new-password-during-test"})
+	require.NoError(t, rawConn.Modify(modify))
+
+	// Restore on cleanup so subsequent tests still see user1's original password.
+	t.Cleanup(func() {
+		restore := ldap.NewModifyRequest(openldapUser1DN, nil)
+		restore.Replace("userPassword", []string{openldapUser1Pass})
+		_ = rawConn.Modify(restore)
+	})
+
+	// 3. Reconnect must fail — rebind uses the *old* cached password.
+	err = conn.Reconnect()
+	require.Error(t, err)
+	assert.True(t, errors.Is(err, ldapper.ErrInvalidCredentials))
+
+	// 4. Connection must be nil. Subsequent operations must fail with ErrClosed
+	//    instead of silently running anonymously.
+	_, err = conn.GetUser(openldapUser2UID, openldapBaseDN)
+	require.Error(t, err)
+	assert.True(t, errors.Is(err, ldapper.ErrClosed),
+		"connection must not be usable after failed rebind")
+
+	// 5. Auth state cleared — CheckUserCredentials reports ErrNotAuthenticated.
+	_, err = conn.CheckUserCredentials(openldapUser2UID, openldapUser2Pass)
+	require.Error(t, err)
+	assert.True(t, errors.Is(err, ldapper.ErrNotAuthenticated))
+}

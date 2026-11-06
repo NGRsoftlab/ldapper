@@ -62,11 +62,15 @@ func (ldapper *LDAPper) authenticateConnLocked(username, password, baseDN string
 
 	user, err := ldapper.getUserLocked(username, baseDN)
 	if err != nil {
-		// Bind succeeded, but the post-bind lookup did not. The connection
-		// is now identified as an unverified principal, and any cached state
-		// from a previous AuthenticateConn describes a different session.
-		// Invalidate so callers cannot silently operate under an unexpected
-		// identity.
+		// Bind succeeded, so the live LDAP session is now identified as
+		// `username`. The verification lookup failed, which means we cannot
+		// establish the invariants of a service session. Close the connection
+		// to force explicit recovery: leaving it open would let subsequent
+		// operations (GetUser, CustomSearch, ...) run under an unverified
+		// identity, while invalidateAuthLocked() alone does not protect them
+		// because requireConnLocked() would still pass.
+		_ = ldapper.connection.Close()
+		ldapper.connection = nil
 		ldapper.invalidateAuthLocked()
 		return nil, err
 	}
@@ -106,14 +110,15 @@ func (ldapper *LDAPper) CheckUserCredentials(username, password string) (user *t
 	}
 
 	defer func() {
-		// NB: rebind back with the service user; the connection is anonymous
-		// until this succeeds.
 		errRebind := ldapper.connection.Bind(ldapper.bindUser, ldapper.bindPassword)
 		if errRebind == nil {
 			return
 		}
 		// Rebind failed — the session is no longer the verified service one.
-		// Invalidate cached credentials so subsequent operations fail closed.
+		// Close it so subsequent operations cannot run under an unverified
+		// identity (mirrors the A13 fix in AuthenticateConn).
+		_ = ldapper.connection.Close()
+		ldapper.connection = nil
 		ldapper.invalidateAuthLocked()
 
 		if err == nil {

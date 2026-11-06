@@ -271,6 +271,52 @@ func TestAuthenticateConn(t *testing.T) {
 			t.Fatalf("cached creds = %q/%q/%q", l.bindUser, l.bindPassword, l.bindDN)
 		}
 	})
+
+	t.Run("user not found after successful bind", func(t *testing.T) {
+		ac := newAuthConn(
+			func(_ int, _ *ldap.SearchRequest) (*ldap.SearchResult, error) {
+				return &ldap.SearchResult{}, nil // zero entries
+			},
+			nil, // bind succeeds
+		)
+		l := &LDAPper{
+			connection:      ac.mock,
+			catalogAdapter:  simpleUserAdapter(),
+			isAuthenticated: true,
+			bindUser:        "svc-reader",
+			bindPassword:    "svc-pass",
+			bindDN:          "dc=example,dc=com",
+		}
+
+		_, err := l.AuthenticateConn(user, pass, baseDN)
+		if !errors.Is(err, ErrNotFound) {
+			t.Fatalf("errors.Is(%v, ErrNotFound) = false", err)
+		}
+		if l.isAuthenticated {
+			t.Fatalf("isAuthenticated must be false after failed post-bind lookup")
+		}
+		if l.bindUser != "" || l.bindPassword != "" {
+			t.Fatalf("bind credentials must be cleared: user=%q pass=%q", l.bindUser, l.bindPassword)
+		}
+
+		// NEW: the connection itself must be closed — otherwise subsequent
+		// operations would run under the unverified `username` identity.
+		if l.connection != nil {
+			t.Fatalf("connection must be closed after failed post-bind lookup")
+		}
+
+		// NEW: subsequent operations must report ErrClosed, not attempt a Search.
+		ac.searchCalls = 0
+		ac.bindCalls = 0
+		_, err = l.GetUser("alice", baseDN)
+		if !errors.Is(err, ErrClosed) {
+			t.Fatalf("errors.Is(%v, ErrClosed) = false", err)
+		}
+		if ac.searchCalls != 0 || ac.bindCalls != 0 {
+			t.Fatalf("no I/O must be issued after post-bind lookup failure: search=%d bind=%d",
+				ac.searchCalls, ac.bindCalls)
+		}
+	})
 }
 
 // ---------- CheckUserCredentials ----------
@@ -500,6 +546,33 @@ func TestCheckUserCredentials(t *testing.T) {
 		}
 		if l.isAuthenticated {
 			t.Fatalf("isAuthenticated must be cleared when rebind fails")
+		}
+	})
+
+	t.Run("service rebind fails: connection closed", func(t *testing.T) {
+		ac := newAuthConn(
+			func(_ int, _ *ldap.SearchRequest) (*ldap.SearchResult, error) {
+				return &ldap.SearchResult{Entries: []*ldap.Entry{userEntry}}, nil
+			},
+			func(idx int, u, p string) error {
+				if idx == 0 {
+					return nil // user bind OK
+				}
+				return &ldap.Error{ResultCode: ldap.LDAPResultUnavailable, Err: errors.New("down")}
+			},
+		)
+		l := newAuthLDAPper(ac)
+
+		_, err := l.CheckUserCredentials("alice", "alice-pass")
+		if !errors.Is(err, ErrNotAuthenticated) {
+			t.Fatalf("errors.Is(%v, ErrNotAuthenticated) = false", err)
+		}
+		if l.connection != nil {
+			t.Fatalf("connection must be closed after rebind failure")
+		}
+		// Subsequent operation must fail with ErrClosed.
+		if _, err := l.GetUser("alice", baseDN); !errors.Is(err, ErrClosed) {
+			t.Fatalf("errors.Is(%v, ErrClosed) = false", err)
 		}
 	})
 }

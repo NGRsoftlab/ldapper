@@ -10,31 +10,41 @@ import (
 	"github.com/go-ldap/ldap/v3"
 
 	"github.com/NGRsoftlab/ldapper/constants"
+	"github.com/NGRsoftlab/ldapper/interfaces"
 )
 
 // connectLocked tries every configured host and stores the first successful
 // connection. Caller must hold opMu (or be inside the constructor, before
 // the object is published).
 func (ldapper *LDAPper) connectLocked() error {
-	var lastErr error
+	c, host, err := ldapper.dialAnyLocked()
+	if err != nil {
+		return err
+	}
+	ldapper.connection = c
+	ldapper.currentHost = host
+	return nil
+}
 
+// dialAnyLocked tries every configured host and returns the first successful
+// dial. The connection is NOT published on ldapper — the caller owns
+// publication. This lets reconnectLocked verify Bind (when required) before
+// exposing the connection to other methods.
+func (ldapper *LDAPper) dialAnyLocked() (interfaces.LDAPConn, string, error) {
+	var lastErr error
 	for _, host := range ldapper.hosts {
-		c, err := dialHost(host, ldapper.port, ldapper.useSSL, ldapper.skipTLS, ldapper.tlsCfg, ldapper.dialTimeout)
+		c, err := dialHost(host, ldapper.port, ldapper.useSSL, ldapper.skipTLS,
+			ldapper.tlsCfg, ldapper.dialTimeout)
 		if err != nil {
 			lastErr = err
 			continue
 		}
-
-		ldapper.connection = c
-		ldapper.currentHost = host
-		return nil
+		return c, host, nil
 	}
-
 	if lastErr == nil {
-		return fmt.Errorf("%w: no hosts available", ErrUnavailable)
+		return nil, "", fmt.Errorf("%w: no hosts available", ErrUnavailable)
 	}
-
-	return fmt.Errorf("%w: unsuccessful dial to any host: %w", ErrUnavailable, lastErr)
+	return nil, "", fmt.Errorf("%w: unsuccessful dial to any host: %w", ErrUnavailable, lastErr)
 }
 
 // dialHost establishes a single LDAP connection to the given host.
@@ -118,7 +128,10 @@ func (ldapper *LDAPper) isAliveLocked() bool {
 
 // Reconnect closes the current connection and tries to establish a new one
 // against any of the configured hosts. If the previous connection was
-// authenticated, the stored bind credentials are re-applied.
+// authenticated, the stored bind credentials are re-applied — and if the
+// rebind fails, the new connection is closed and the cached auth state is
+// invalidated (subsequent operations return ErrClosed until AuthenticateConn
+// is called again).
 func (ldapper *LDAPper) Reconnect() error {
 	ldapper.opMu.Lock()
 	defer ldapper.opMu.Unlock()
@@ -131,20 +144,24 @@ func (ldapper *LDAPper) reconnectLocked() error {
 		ldapper.connection = nil
 	}
 
-	if err := ldapper.connectLocked(); err != nil {
+	// Dial but DO NOT publish: the new connection is not yet known to be
+	// usable. Publication happens only after Bind (when required) succeeds.
+	c, host, err := ldapper.dialAnyLocked()
+	if err != nil {
 		return err
 	}
 
 	if ldapper.isAuthenticated {
-		if err := ldapper.connection.Bind(ldapper.bindUser, ldapper.bindPassword); err != nil {
-			// Rebind failure means the freshly-dialed connection cannot be
-			// treated as a service session — invalidate cached credentials.
+		if bindErr := c.Bind(ldapper.bindUser, ldapper.bindPassword); bindErr != nil {
+			_ = c.Close()
 			ldapper.invalidateAuthLocked()
-			// NB: do not wrap the raw error — it may contain credentials.
-			return classifySensitiveBindError(err)
+			return classifySensitiveBindError(bindErr)
 		}
 	}
 
+	// Every required step succeeded — publish.
+	ldapper.connection = c
+	ldapper.currentHost = host
 	return nil
 }
 

@@ -681,3 +681,27 @@ func TestIntegrationMSAD_AuthenticateConn_FailedBind_InvalidatesState(t *testing
 	require.Error(t, err)
 	assert.True(t, errors.Is(err, ldapper.ErrNotAuthenticated))
 }
+
+func TestIntegrationMSAD_Reconnect_RebindFailure_ClosesConnection(t *testing.T) {
+	conn := newMSADConn(t)
+	_, err := conn.AuthenticateConn(msadUser1SAM, msadUser1Pass, msadBaseDN)
+	require.NoError(t, err)
+
+	// Disable the user so the next Bind fails with "invalid credentials".
+	// Exec into the container via the testcontainers Container handle.
+	// (Requires storing the container in a package var in TestMain.)
+	// code, _, _ := msadContainer.Exec(ctx, []string{"samba-tool", "user", "disable", msadUser1SAM})
+	// require.Equal(t, 0, code)
+	//
+	// ... or simpler: change the password via samba-tool setpassword:
+	// samba-tool user setpassword msadUser1SAM --newpassword=...
+	//
+	// Then:
+	err = conn.Reconnect()
+	require.Error(t, err)
+	assert.True(t, errors.Is(err, ldapper.ErrInvalidCredentials))
+
+	if _, err := conn.GetUser(msadUser2SAM, msadBaseDN); !errors.Is(err, ldapper.ErrClosed) {
+		t.Fatalf("expected ErrClosed after failed rebind, got %v", err)
+	}
+}

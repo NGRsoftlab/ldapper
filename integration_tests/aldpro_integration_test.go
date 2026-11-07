@@ -254,14 +254,17 @@ func TestMain(m *testing.M) {
 			"LDAP_TLS":                       "false",
 			"LDAP_REMOVE_CONFIG_AFTER_SETUP": "false",
 			"DISABLE_CHOWN":                  "true",
+			// Entrypoint copies *.schema from this directory into the
+			// internal bootstrap schema directory and loads them. This is
+			// the officially recommended path for CI/CD where the working
+			// directory is mounted into the container.
+			"LDAP_SEED_INTERNAL_SCHEMA_PATH": "/seed/schema",
 		},
 		Mounts: testcontainers.ContainerMounts{
 			{
 				Source: testcontainers.GenericBindMountSource{HostPath: schemaDir},
-				Target: testcontainers.ContainerMountTarget(
-					"/container/service/slapd/assets/config/bootstrap/schema/custom",
-				),
-				ReadOnly: true,
+				Target: testcontainers.ContainerMountTarget("/seed/schema"),
+				// writable: entrypoint copies files out of here
 			},
 		},
 		WaitingFor: wait.ForListeningPort("389/tcp").WithStartupTimeout(120 * time.Second),

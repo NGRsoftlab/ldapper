@@ -175,14 +175,23 @@ func TestMain(m *testing.M) {
 	}
 	defer os.RemoveAll(tmpDir)
 
-	schemaPath := filepath.Join(tmpDir, "99-aldpro.schema")
-	if err := os.WriteFile(schemaPath, []byte(aldproSchema), 0o644); err != nil {
-		fmt.Fprintf(os.Stderr, "cannot write schema: %v\n", err)
+	// ── два подкаталога: ldif и schema ──────────────────────────────
+	ldifDir := filepath.Join(tmpDir, "ldif")
+	schemaDir := filepath.Join(tmpDir, "schema")
+	if err := os.MkdirAll(ldifDir, 0o755); err != nil {
+		fmt.Fprintf(os.Stderr, "cannot create ldif dir: %v\n", err)
+		os.Exit(1)
+	}
+	if err := os.MkdirAll(schemaDir, 0o755); err != nil {
+		fmt.Fprintf(os.Stderr, "cannot create schema dir: %v\n", err)
 		os.Exit(1)
 	}
 
-	ldifPath := filepath.Join(tmpDir, "50-aldpro.ldif")
-	if err := os.WriteFile(ldifPath, []byte(aldproBootstrapLDIF), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(schemaDir, "99-aldpro.schema"), []byte(aldproSchema), 0o644); err != nil {
+		fmt.Fprintf(os.Stderr, "cannot write schema: %v\n", err)
+		os.Exit(1)
+	}
+	if err := os.WriteFile(filepath.Join(ldifDir, "50-aldpro.ldif"), []byte(aldproBootstrapLDIF), 0o644); err != nil {
 		fmt.Fprintf(os.Stderr, "cannot write LDIF: %v\n", err)
 		os.Exit(1)
 	}
@@ -198,13 +207,15 @@ func TestMain(m *testing.M) {
 			"DISABLE_CHOWN":                  "true",
 			"LDAP_REMOVE_CONFIG_AFTER_SETUP": "false",
 			"LDAP_TLS":                       "false",
+			// ── ключевые переменные ─────────────────────────────────
 			"LDAP_SEED_INTERNAL_LDIF_PATH":   "/seed/ldif",
 			"LDAP_SEED_INTERNAL_SCHEMA_PATH": "/seed/schema",
 		},
 		Mounts: testcontainers.ContainerMounts{
-			testcontainers.ContainerMount{
+			{
 				Source: testcontainers.GenericBindMountSource{HostPath: tmpDir},
-				Target: "/seed",
+				Target: testcontainers.ContainerMountTarget("/seed"),
+				// без ReadOnly — entrypoint копирует файлы из /seed
 			},
 		},
 		WaitingFor: wait.ForLog("slapd starting").WithStartupTimeout(120 * time.Second),

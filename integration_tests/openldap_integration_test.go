@@ -121,18 +121,17 @@ var (
 func TestMain(m *testing.M) {
 	ctx := context.Background()
 
-	ldifDir, err := os.MkdirTemp("", "ldapper-openldap-*")
+	tmpDir, err := os.MkdirTemp("", "ldapper-openldap-*")
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "cannot create temp dir: %v\n", err)
 		os.Exit(1)
 	}
 	defer os.RemoveAll(ldifDir)
 
-	ldifPath := filepath.Join(ldifDir, "50-bootstrap.ldif")
-	if err := os.WriteFile(ldifPath, []byte(openldapBootstrapLDIF), 0o644); err != nil {
-		fmt.Fprintf(os.Stderr, "cannot write LDIF: %v\n", err)
-		os.Exit(1)
+	ldifDir := filepath.Join(tmpDir, "ldif")
+	if err := os.MkdirAll(ldifDir, 0o755); err != nil { /* ... */
 	}
+	os.WriteFile(filepath.Join(ldifDir, "50-bootstrap.ldif"), []byte(openldapBootstrapLDIF), 0o644)
 
 	req := testcontainers.ContainerRequest{
 		Image:        "osixia/openldap:1.5.0",
@@ -145,14 +144,12 @@ func TestMain(m *testing.M) {
 			"DISABLE_CHOWN":                  "true",
 			"LDAP_REMOVE_CONFIG_AFTER_SETUP": "false",
 			"LDAP_TLS":                       "false",
+			"LDAP_SEED_INTERNAL_LDIF_PATH":   "/seed/ldif",
 		},
 		Mounts: testcontainers.ContainerMounts{
-			testcontainers.ContainerMount{
-				Source: testcontainers.GenericBindMountSource{HostPath: ldifPath},
-				Target: testcontainers.ContainerMountTarget(
-					"/container/service/slapd/assets/config/bootstrap/ldif/custom/50-bootstrap.ldif",
-				),
-				ReadOnly: true,
+			{
+				Source: testcontainers.GenericBindMountSource{HostPath: tmpDir},
+				Target: testcontainers.ContainerMountTarget("/seed"),
 			},
 		},
 		WaitingFor: wait.ForLog("slapd starting").WithStartupTimeout(90 * time.Second),

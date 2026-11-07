@@ -93,13 +93,10 @@ objectclass ( 1.3.6.1.4.1.99999.2.1
     STRUCTURAL
     MAY ( rbtadp $ description ) )
 
-# Auxiliary extension for user entries: rbtadp is only allowed on
-# objectClasses that explicitly MAY it. rbta-org-unit is structural and
-# cannot be combined with inetOrgPerson, so user entries need this
-# auxiliary class instead.
 objectclass ( 1.3.6.1.4.1.99999.2.2
     NAME 'rbta-user'
     DESC 'ALDPro user extensions'
+    SUP top
     AUXILIARY
     MAY ( rbtadp ) )
 `

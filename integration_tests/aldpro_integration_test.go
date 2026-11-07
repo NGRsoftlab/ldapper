@@ -244,7 +244,6 @@ func TestMain(m *testing.M) {
 	req := testcontainers.ContainerRequest{
 		Image:        "osixia/openldap:1.5.0",
 		ExposedPorts: []string{"389/tcp"},
-		Cmd:          []string{"--copy-service"},
 		Env: map[string]string{
 			"LDAP_ORGANISATION":              "ALDPro Test",
 			"LDAP_DOMAIN":                    "aldpro.test",
@@ -255,16 +254,18 @@ func TestMain(m *testing.M) {
 		},
 		Mounts: testcontainers.ContainerMounts{
 			{
-				Source: testcontainers.GenericBindMountSource{
-					HostPath: filepath.Join(schemaDir, "99-aldpro.schema"),
-				},
+				Source: testcontainers.GenericBindMountSource{HostPath: schemaDir},
 				Target: testcontainers.ContainerMountTarget(
-					"/container/service/slapd/assets/config/bootstrap/schema/custom/99-aldpro.schema",
+					"/container/service/slapd/assets/config/bootstrap/schema/custom",
 				),
-				ReadOnly: true,
 			},
 		},
-		WaitingFor: wait.ForListeningPort("389/tcp").WithStartupTimeout(120 * time.Second),
+		// wait.ForLog alone can match the bootstrap-phase "slapd starting".
+		// The real guard against the race is waitForALDProSchema below.
+		WaitingFor: wait.ForAll(
+			wait.ForListeningPort("389/tcp"),
+			wait.ForLog("slapd starting"),
+		).WithStartupTimeout(120 * time.Second),
 	}
 
 	container, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
@@ -297,6 +298,15 @@ func TestMain(m *testing.M) {
 		os.Exit(1)
 	}
 
+	// The schema is loaded asynchronously (bootstrap slapd is stopped and
+	// restarted with the custom schema). Poll for rbta-org-unit before
+	// seeding, otherwise ou=departments fails with "Invalid Attribute Syntax".
+	if !waitForALDProSchema(aldproHost, aldproPort, 60*time.Second) {
+		_ = container.Terminate(ctx)
+		fmt.Fprintln(os.Stderr, "rbta-org-unit not present in subschema after 60s")
+		os.Exit(1)
+	}
+
 	if err := seedALDProLDIF(aldproHost, aldproPort); err != nil {
 		_ = container.Terminate(ctx)
 		fmt.Fprintf(os.Stderr, "cannot seed LDAP data: %v\n", err)
@@ -306,6 +316,41 @@ func TestMain(m *testing.M) {
 	code := m.Run()
 	_ = container.Terminate(ctx)
 	os.Exit(code)
+}
+
+// waitForALDProSchema polls the subschema until rbta-org-unit is present.
+// This is the deterministic replacement for relying on wait strategy
+// timing: entrypoint loads custom schema asynchronously (stop slapd →
+// ldapadd to cn=config → restart slapd), and the port is open before
+// the reload finishes. Polling for the class name removes the race.
+func waitForALDProSchema(host string, port uint, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		c, err := ldap.DialURL(fmt.Sprintf("ldap://%s:%d", host, port))
+		if err == nil {
+			if bindErr := c.Bind(aldproAdminDN, aldproAdminPass); bindErr == nil {
+				req := ldap.NewSearchRequest(
+					"cn=Subschema", ldap.ScopeBaseObject, ldap.NeverDerefAliases,
+					1, 0, false, "(objectClass=subschema)",
+					[]string{"objectClasses"}, nil,
+				)
+				res, searchErr := c.Search(req)
+				_ = c.Close()
+				if searchErr == nil && len(res.Entries) > 0 {
+					for _, cls := range res.Entries[0].GetAttributeValues("objectClasses") {
+						if strings.Contains(cls, "rbta-org-unit") ||
+							strings.Contains(cls, "1.3.6.1.4.1.99999.2.1") {
+							return true
+						}
+					}
+				}
+			} else {
+				_ = c.Close()
+			}
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	return false
 }
 
 func waitForALDProReady(host string, port uint, timeout time.Duration) bool {

@@ -1,0 +1,53 @@
+name: Integration tests
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 3 * * *'   # nightly
+  pull_request:
+    paths:
+      - 'adapters/**'
+      - '**/*_integration_test.go'
+      - 'go.mod'
+      - 'go.sum'
+      - '.github/workflows/integration.yml'
+
+jobs:
+  openldap:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go test -tags=integration_openldap -count=1 ./...
+
+  aldpro:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go test -tags=integration_aldpro -count=1 ./...
+
+  msad:
+    runs-on: ubuntu-latest
+    # Heavy Samba container — run only on schedule/manual triggers.
+    if: github.event_name != 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go test -tags=integration_msad -count=1 ./...
+
+  freeipa:
+    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go test -tags=integration_freeipa -count=1 ./...

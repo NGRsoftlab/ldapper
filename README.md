@@ -1,6 +1,12 @@
 # LDAPper
 
 [![Go Reference](https://pkg.go.dev/badge/github.com/NGRsoftlab/ldapper.svg)](https://pkg.go.dev/github.com/NGRsoftlab/ldapper)
+[![Go Report Card](https://goreportcard.com/badge/github.com/NGRsoftlab/ldapper)](https://goreportcard.com/report/github.com/NGRsoftlab/ldapper)
+[![Tests](https://github.com/NGRsoftlab/ldapper/actions/workflows/test.yml/badge.svg)](https://github.com/NGRsoftlab/ldapper/actions/workflows/test.yml)
+[![Integration tests](https://github.com/NGRsoftlab/ldapper/actions/workflows/integration.yml/badge.svg)](https://github.com/NGRsoftlab/ldapper/actions/workflows/integration.yml)
+[![Coverage](https://codecov.io/gh/NGRsoftlab/ldapper/branch/main/graph/badge.svg)](https://codecov.io/gh/NGRsoftlab/ldapper)
+[![Go version](https://img.shields.io/github/go-mod/go-version/NGRsoftlab/ldapper)](go.mod)
+[![License](https://img.shields.io/badge/License-See%20LICENSE-blue.svg)](LICENSE)
 
 A lightweight, adapter-based LDAP client for Go. LDAPper wraps
 [`go-ldap/ldap`](https://github.com/go-ldap/ldap) with:
@@ -25,6 +31,26 @@ A lightweight, adapter-based LDAP client for Go. LDAPper wraps
   FreeIPA, and OpenLDAP-with-ALDPro-schema).
 
 ---
+
+## Test status
+
+| Layer                       | Where it runs                                        | Build tag                | Notes |
+|-----------------------------|------------------------------------------------------|--------------------------|-------|
+| Unit tests                  | `go test -race ./...` (GitHub Actions, every push)    | —                        | No external dependencies; includes the race detector. |
+| Integration — OpenLDAP      | `go test -tags=integration_openldap ./...`            | `integration_openldap`   | Spins up `osixia/openldap:1.5.0` via testcontainers. |
+| Integration — MS AD         | `go test -tags=integration_msad ./...`                | `integration_msad`       | Spins up a Samba 4 AD DC; gracefully skips if Docker is unavailable. |
+| Integration — FreeIPA       | `go test -tags=integration_freeipa ./...`             | `integration_freeipa`    | Spins up a FreeIPA server; heavy image, gracefully skips on failure. |
+| Integration — ALDPro        | `go test -tags=integration_aldpro ./...`              | `integration_aldpro`     | OpenLDAP + custom ALDPro schema. |
+
+Coverage is measured with `go test -coverprofile=coverage.out ./...` and
+uploaded to Codecov on every push to `main` and on pull requests. The
+current coverage report is available at
+[codecov.io/gh/NGRsoftlab/ldapper](https://codecov.io/gh/NGRsoftlab/ldapper).
+
+The default `go test ./...` is intentionally fast and Docker-free: all
+integration suites live behind build tags so they do not compile into
+the default test binary (Go allows only one `TestMain` per package, so
+the tags are also what keeps the four suites from colliding).
 
 ## Table of contents
 
@@ -1179,5 +1205,36 @@ so message rewording does not break them.
 
 ## License
 
-Copyright © 2020–2026 NGR Softlab. See the `LICENSE` file in the
-repository root for the full license text.
+**Distributed under the terms specified in the [`LICENSE`](LICENSE) file
+at the repository root.** The file is the authoritative source — this
+section is only a pointer.
+
+Copyright © 2020–2026 [NGR Softlab](https://ngrsoftlab.ru). All rights
+reserved.
+
+### Using LDAPper in your project
+
+Before adding LDAPper as a dependency, check the `LICENSE` file for the
+exact terms (permission to use, redistribute, modify, sublicense,
+commercial use, warranty disclaimers, etc.). If your use case is not
+covered by the file (e.g. redistribution in a closed-source product,
+SaaS deployment with non-standard terms), contact NGR Softlab for a
+commercial agreement.
+
+### Third-party dependencies
+
+LDAPper itself is small; the bulk of the dependency tree comes from
+`testcontainers-go`, and only the `go-ldap/ldap/v3` dependency is pulled
+in at **build time** for production code. Test-only dependencies do not
+ship in binaries that import LDAPper.
+
+| Dependency                                              | Role        | License     |
+|---------------------------------------------------------|-------------|-------------|
+| `github.com/go-ldap/ldap/v3`                            | runtime     | MIT         |
+| `github.com/stretchr/testify`                           | tests only  | MIT         |
+| `github.com/testcontainers/testcontainers-go` + indirect | tests only  | MIT (various) |
+
+Transitive dependencies are listed in `go.mod`; their licenses are
+declared in their respective `LICENSE` files. Run
+`go run github.com/google/go-licenses@latest report ./...` for an
+up-to-date, machine-generated inventory.

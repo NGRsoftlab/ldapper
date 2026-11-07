@@ -238,10 +238,11 @@ func TestMain(m *testing.M) {
 		Image:        "osixia/openldap:1.5.0",
 		ExposedPorts: []string{"389/tcp"},
 		Env: map[string]string{
-			"LDAP_ORGANISATION":   "ALDPro Test",
-			"LDAP_DOMAIN":         "aldpro.test",
-			"LDAP_ADMIN_PASSWORD": aldproAdminPass,
-			"LDAP_TLS":            "false",
+			"LDAP_ORGANISATION":              "ALDPro Test",
+			"LDAP_DOMAIN":                    "aldpro.test",
+			"LDAP_ADMIN_PASSWORD":            aldproAdminPass,
+			"LDAP_TLS":                       "false",
+			"LDAP_REMOVE_CONFIG_AFTER_SETUP": "false",
 		},
 		Mounts: testcontainers.ContainerMounts{
 			{

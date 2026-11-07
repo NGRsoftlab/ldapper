@@ -127,7 +127,8 @@ func TestMain(m *testing.M) {
 	}
 	defer os.RemoveAll(tmpDir)
 
-	if err := os.WriteFile(tmpDir, []byte(openldapBootstrapLDIF), 0o644); err != nil {
+	ldifPath := filepath.Join(tmpDir, "50-bootstrap.ldif")
+	if err := os.WriteFile(ldifPath, []byte(openldapBootstrapLDIF), 0o644); err != nil {
 		fmt.Fprintf(os.Stderr, "cannot write LDIF: %v\n", err)
 		os.Exit(1)
 	}
@@ -144,7 +145,7 @@ func TestMain(m *testing.M) {
 		},
 		Mounts: testcontainers.ContainerMounts{
 			{
-				Source: testcontainers.GenericBindMountSource{HostPath: tmpDir},
+				Source: testcontainers.GenericBindMountSource{HostPath: ldifPath},
 				Target: testcontainers.ContainerMountTarget(
 					"/container/service/slapd/assets/config/bootstrap/ldif/custom/50-bootstrap.ldif",
 				),

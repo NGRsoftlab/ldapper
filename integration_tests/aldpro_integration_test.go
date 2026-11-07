@@ -190,11 +190,13 @@ func TestMain(m *testing.M) {
 	req := testcontainers.ContainerRequest{
 		Image:        "osixia/openldap:1.5.0",
 		ExposedPorts: []string{"389/tcp"},
+		Cmd:          []string{"--copy-service"},
 		Env: map[string]string{
-			"LDAP_ORGANISATION":   "ALDPro Test",
-			"LDAP_DOMAIN":         "aldpro.test",
-			"LDAP_ADMIN_PASSWORD": aldproAdminPass,
-			"DISABLE_CHOWN":       "true",
+			"LDAP_ORGANISATION":              "ALDPro Test",
+			"LDAP_DOMAIN":                    "aldpro.test",
+			"LDAP_ADMIN_PASSWORD":            aldproAdminPass,
+			"DISABLE_CHOWN":                  "true",
+			"LDAP_REMOVE_CONFIG_AFTER_SETUP": "false",
 		},
 		Mounts: testcontainers.ContainerMounts{
 			testcontainers.ContainerMount{

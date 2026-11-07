@@ -260,16 +260,13 @@ func TestMain(m *testing.M) {
 				),
 			},
 		},
-		// osixia starts slapd TWICE: once during bootstrap (writes to a
-		// temporary mdb), once as the final serving instance. The custom
-		// schema is loaded into the bootstrap slapd, so waiting for either
-		// "slapd starting" or "port 389" alone fires during bootstrap and
-		// any data seeded at that moment is lost when the final slapd
-		// reinitialises the mdb. The second "slapd starting" is the only
-		// reliable signal that the serving instance is up.
-		WaitingFor: wait.ForLog("slapd starting").
-			WithOccurrence(2).
-			WithStartupTimeout(120 * time.Second),
+		// In the log, "slapd starting" appears exactly once, and only after
+		// "First start is done..." — i.e. it's the FINAL serving slapd, not the
+		// bootstrap instance (which prints "Start OpenLDAP..." instead).
+		// So plain wait.ForLog is the correct signal: it guarantees that the
+		// final slapd is up and the mdb we're about to seed is the one tests
+		// will read.
+		WaitingFor: wait.ForLog("slapd starting").WithStartupTimeout(120 * time.Second),
 	}
 
 	container, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{

@@ -177,9 +177,7 @@ func TestMain(m *testing.M) {
 			"LDAP_ADMIN_PASSWORD": openldapAdminPass,
 			"LDAP_TLS":            "false",
 		},
-		WaitingFor: wait.ForLog("slapd starting").
-			WithOccurrence(2).
-			WithStartupTimeout(120 * time.Second),
+		WaitingFor: wait.ForLog("slapd starting").WithStartupTimeout(120 * time.Second),
 	}
 
 	container, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{

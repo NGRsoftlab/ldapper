@@ -58,6 +58,10 @@ type CatalogAdapter interface {
 
 // PrimaryGroupResolver is implemented by adapters that need custom logic
 // to resolve a user's primary group (e.g., Active Directory).
+//
+// Implementations MUST use only the provided LDAPConn and MUST NOT call
+// LDAPper methods: the resolver is invoked while opMu is already held, so
+// any re-entry into LDAPper would deadlock.
 type PrimaryGroupResolver interface {
 	// ResolvePrimaryGroupDN takes a user entry and returns the DN of the user's
 	// primary group. The ldapConn is provided for any extra LDAP searches needed.

@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"net"
 	"strconv"
-	"sync/atomic"
 	"time"
 
 	"github.com/go-ldap/ldap/v3"
@@ -57,7 +56,6 @@ func (ldapper *LDAPper) withCtx(ctx context.Context, opTimeout time.Duration, fn
 	}
 
 	var (
-		cancelled atomic.Bool
 		stopWatch chan struct{}
 		watchDone chan struct{}
 	)
@@ -68,7 +66,6 @@ func (ldapper *LDAPper) withCtx(ctx context.Context, opTimeout time.Duration, fn
 			defer close(watchDone)
 			select {
 			case <-ctx.Done():
-				cancelled.Store(true)
 				_ = conn.Close() // unblocks pending read
 			case <-stopWatch:
 			}
@@ -85,14 +82,24 @@ func (ldapper *LDAPper) withCtx(ctx context.Context, opTimeout time.Duration, fn
 		conn.SetTimeout(0)
 	}
 
-	if cancelled.Load() {
+	// Use ctx.Err() as the source of truth for "was the operation
+	// aborted". The watchdog goroutine may not have run yet when fn
+	// returns, so relying on a flag it sets is racy. ctx.Err() is set
+	// synchronously by cancel()/deadline and cannot lag.
+	if ctxErr := ctx.Err(); ctxErr != nil {
 		if ldapper.connection == conn {
+			// Close is idempotent; the watchdog may or may not have
+			// already closed the connection depending on timing.
+			_ = conn.Close()
 			ldapper.connection = nil
 			ldapper.invalidateAuthLocked()
 		}
 		if err != nil {
-			return fmt.Errorf("%w: %w", ctx.Err(), err)
+			return fmt.Errorf("%w: %w", ctxErr, err)
 		}
+		// fn reported success, but ctx was cancelled. Do not let the
+		// caller see a false success for an aborted operation.
+		return ctxErr
 	}
 	return err
 }
@@ -124,7 +131,6 @@ func (ldapper *LDAPper) withCtxResult(ctx context.Context, opTimeout time.Durati
 	}
 
 	var (
-		cancelled atomic.Bool
 		stopWatch chan struct{}
 		watchDone chan struct{}
 	)
@@ -135,7 +141,6 @@ func (ldapper *LDAPper) withCtxResult(ctx context.Context, opTimeout time.Durati
 			defer close(watchDone)
 			select {
 			case <-ctx.Done():
-				cancelled.Store(true)
 				_ = conn.Close() // unblocks pending read
 			case <-stopWatch:
 			}
@@ -152,16 +157,21 @@ func (ldapper *LDAPper) withCtxResult(ctx context.Context, opTimeout time.Durati
 		conn.SetTimeout(0)
 	}
 
-	if cancelled.Load() {
+	if ctxErr := ctx.Err(); ctxErr != nil {
 		if ldapper.connection == conn {
+			_ = conn.Close()
 			ldapper.connection = nil
 			ldapper.invalidateAuthLocked()
 		}
 		if err != nil {
-			return nil, fmt.Errorf("%w: %w", ctx.Err(), err)
+			return nil, fmt.Errorf("%w: %w", ctxErr, err)
 		}
+		// Discard the result: the operation was aborted. Accumulation
+		// of entries across pages is the caller's job (searchPaged),
+		// which keeps results from previous completed iterations but
+		// drops the aborted one.
+		return nil, ctxErr
 	}
-
 	return res, err
 }
 
@@ -228,8 +238,9 @@ func dialHost(ctx context.Context, host string, port uint,
 		return conn, nil
 	}
 
-	// StartTLS: same hybrid approach as withCtx, but the conn is not yet
-	// published, so closing on cancel is safe.
+	// StartTLS: same watchdog pattern as withCtx, but the connection is
+	// not yet published, so closing on cancel cannot affect other
+	// operations.
 	tlsTimeout := timeout
 	if tlsTimeout <= 0 {
 		tlsTimeout = constants.DefaultStartTLSTimeout
@@ -245,27 +256,44 @@ func dialHost(ctx context.Context, host string, port uint,
 		}
 	}
 
-	stopWatch := make(chan struct{})
-	watchDone := make(chan struct{})
-	var cancelled atomic.Bool
-	go func() {
-		defer close(watchDone)
-		select {
-		case <-ctx.Done():
-			cancelled.Store(true)
-			_ = conn.Close()
-		case <-stopWatch:
-		}
-	}()
+	var (
+		stopWatch chan struct{}
+		watchDone chan struct{}
+	)
+	if ctx.Done() != nil {
+		stopWatch = make(chan struct{})
+		watchDone = make(chan struct{})
+		go func() {
+			defer close(watchDone)
+			select {
+			case <-ctx.Done():
+				_ = conn.Close() // unblocks pending read
+			case <-stopWatch:
+			}
+		}()
+	}
 
 	conn.SetTimeout(tlsTimeout)
 	err = conn.StartTLS(tlsCfg)
-	close(stopWatch)
-	<-watchDone
+	if stopWatch != nil {
+		close(stopWatch)
+		<-watchDone
+	}
 	conn.SetTimeout(0)
 
-	if cancelled.Load() {
-		return nil, fmt.Errorf("%w: start tls cancelled", ctx.Err())
+	// ctx.Err() is the source of truth for cancellation: the watchdog
+	// goroutine may not have run yet when StartTLS returns, so a flag
+	// it writes would be racy. ctx.Err() is set synchronously by
+	// cancel()/deadline and cannot lag.
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		// Close is idempotent. This also covers the case where StartTLS
+		// returned success while the watchdog did not fire — without
+		// this close the connection would leak.
+		_ = conn.Close()
+		if err != nil {
+			return nil, fmt.Errorf("%w: start tls: %w", ctxErr, err)
+		}
+		return nil, fmt.Errorf("%w: start tls cancelled", ctxErr)
 	}
 	if err != nil {
 		_ = conn.Close()
@@ -349,7 +377,7 @@ func (ldapper *LDAPper) reconnectLocked(ctx context.Context) error {
 	if ldapper.isAuthenticated {
 		bindTimeout := ldapper.opTimeouts.Bind
 		if bindTimeout <= 0 {
-			bindTimeout = constants.DefaultDialTimeout // или отдельная константа
+			bindTimeout = constants.DefaultDialTimeout
 		}
 		if dl, ok := ctx.Deadline(); ok {
 			remaining := time.Until(dl)
@@ -363,36 +391,43 @@ func (ldapper *LDAPper) reconnectLocked(ctx context.Context) error {
 			}
 		}
 
-		stopWatch := make(chan struct{})
-		watchDone := make(chan struct{})
-		var cancelled atomic.Bool
+		var (
+			stopWatch chan struct{}
+			watchDone chan struct{}
+		)
 		if ctx.Done() != nil {
+			stopWatch = make(chan struct{})
+			watchDone = make(chan struct{})
 			go func() {
 				defer close(watchDone)
 				select {
 				case <-ctx.Done():
-					cancelled.Store(true)
-					_ = c.Close()
+					_ = c.Close() // unblocks pending Bind
 				case <-stopWatch:
 				}
 			}()
 		}
 
 		c.SetTimeout(bindTimeout)
-		err := c.Bind(ldapper.bindUser, ldapper.bindPassword)
+		bindErr := c.Bind(ldapper.bindUser, ldapper.bindPassword)
 		c.SetTimeout(0)
-		if ctx.Done() != nil {
+		if stopWatch != nil {
 			close(stopWatch)
 			<-watchDone
 		}
 
-		if cancelled.Load() || err != nil {
+		// ctx.Err() is authoritative, not any flag written by the
+		// watchdog (that write races with fn returning). A successful
+		// Bind on a cancelled context still means the caller aborted:
+		// publishing the connection would run subsequent operations
+		// under a principal the caller no longer wants to be bound as.
+		if ctxErr := ctx.Err(); ctxErr != nil || bindErr != nil {
 			_ = c.Close()
 			ldapper.invalidateAuthLocked()
-			if cancelled.Load() {
-				return ctx.Err()
+			if ctxErr != nil {
+				return ctxErr
 			}
-			return classifySensitiveBindError(err)
+			return classifySensitiveBindError(bindErr)
 		}
 	}
 

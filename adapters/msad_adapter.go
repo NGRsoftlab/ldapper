@@ -194,19 +194,25 @@ func (a MSADAdapter) ResolvePrimaryGroupDN(ctx context.Context, user types.LDAPU
 	// 1. Extract the domain DN from the user's DN.
 	userDN, err := ldap.ParseDN(user.DN)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("invalid DN %q: %w", user.DN, err)
 	}
 
 	if len(userDN.RDNs) < 2 {
 		return "", fmt.Errorf("invalid user DN (need at least 2 RDNs for domain extraction): %s", user.DN)
 	}
 
-	// Find the deepest ancestor entry with objectClass=domainDNS.
-	// The user's actual domain is the nearest domain ancestor.
 	var domainDNStr string
 	var domainSidBytes []byte
 
-	for i := len(userDN.RDNs) - 1; i >= 0; i-- {
+	// Find the nearest (deepest) domainDNS ancestor of the user.
+	//
+	// RDNs are ordered leaf → root, so RDNs[0] is the user's own RDN and
+	// RDNs[1:] is the immediate parent. Walking i=1..len-1 checks ancestors
+	// from nearest to farthest, which matters in multi-domain forests: the
+	// user's primaryGroupID is a RID in the user's own domain, not in the
+	// forest root domain. Walking from the root would pick the outermost
+	// domainDNS and produce a wrong SID prefix.
+	for i := 1; i < len(userDN.RDNs); i++ {
 		if err := ctx.Err(); err != nil {
 			return "", err
 		}
@@ -233,7 +239,11 @@ func (a MSADAdapter) ResolvePrimaryGroupDN(ctx context.Context, user types.LDAPU
 		if len(res.Entries) > 0 {
 			domainDNStr = candidate.String()
 			domainSidBytes = res.Entries[0].GetRawAttributeValue("objectSid")
-			if domainSidBytes == nil {
+			// NB: GetRawAttributeValue may return a non-nil empty slice for a
+			// missing attribute; check the length, not only nil. "no objectSid"
+			// (schema/ACL problem) and "SID too short" (corrupt data) are
+			// different diagnoses and must not be conflated.
+			if len(domainSidBytes) == 0 {
 				return "", fmt.Errorf("domain %s has no objectSid", domainDNStr)
 			}
 			break

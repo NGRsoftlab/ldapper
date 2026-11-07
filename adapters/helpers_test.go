@@ -74,9 +74,14 @@ func attrMap(m map[string]string) map[string][]string {
 func newLDAPEntry(dn string, attrs map[string][]string) ldap.Entry {
 	entry := ldap.Entry{DN: dn}
 	for name, values := range attrs {
+		byteValues := make([][]byte, len(values))
+		for i, v := range values {
+			byteValues[i] = []byte(v)
+		}
 		entry.Attributes = append(entry.Attributes, &ldap.EntryAttribute{
-			Name:   name,
-			Values: values,
+			Name:       name,
+			Values:     values,
+			ByteValues: byteValues,
 		})
 	}
 	return entry

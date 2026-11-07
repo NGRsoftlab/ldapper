@@ -66,15 +66,20 @@ func (a FREEIPAAdapter) BindIdentity(login, baseDN string) (string, error) {
 	if baseDN == "" {
 		return "", fmt.Errorf("baseDN required for short-form bind")
 	}
-	users, err := appendRDN("cn", "users", baseDN)
+	// appendRDN prepends, so build the chain from the deepest container
+	// outward: cn=accounts sits directly under baseDN, cn=users sits
+	// under cn=accounts, uid sits under cn=users. Reversing this order
+	// produces uid=<login>,cn=accounts,cn=users,<baseDN> — a well-formed
+	// DN that no FreeIPA server would ever match.
+	accounts, err := appendRDN("cn", "accounts", baseDN)
 	if err != nil {
 		return "", err
 	}
-	accounts, err := appendRDN("cn", "accounts", users)
+	users, err := appendRDN("cn", "users", accounts)
 	if err != nil {
 		return "", err
 	}
-	return appendRDN("uid", login, accounts)
+	return appendRDN("uid", login, users)
 }
 
 // TYPE FILTERS

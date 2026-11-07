@@ -166,9 +166,6 @@ func (ldapper *LDAPper) searchPaged(
 			// server returns a size-limit error, preserve what we already
 			// fetched so callers can decide how to proceed.
 			if ldap.IsErrorWithCode(err, ldap.LDAPResultSizeLimitExceeded) {
-				if len(allEntries) > 0 {
-					return allEntries, fmt.Errorf("%w: %w", ErrPartialResult, err)
-				}
 				return allEntries, fmt.Errorf("%w: %w", ErrPartialResult, err)
 			}
 			return allEntries, err

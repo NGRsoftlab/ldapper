@@ -3,8 +3,6 @@ package ldapper
 
 import (
 	"github.com/go-ldap/ldap/v3"
-
-	"github.com/NGRsoftlab/ldapper/mocks"
 )
 
 // ---------- helpers for tests ----------
@@ -16,17 +14,15 @@ import (
 func newLDAPEntry(dn string, attrs map[string][]string) *ldap.Entry {
 	entry := &ldap.Entry{DN: dn}
 	for name, values := range attrs {
-		entry.Attributes = append(entry.Attributes, &ldap.EntryAttribute{Name: name, Values: values})
+		byteValues := make([][]byte, len(values))
+		for i, v := range values {
+			byteValues[i] = []byte(v)
+		}
+		entry.Attributes = append(entry.Attributes, &ldap.EntryAttribute{
+			Name:       name,
+			Values:     values,
+			ByteValues: byteValues,
+		})
 	}
 	return entry
-}
-
-// mockOUs returns a mock connection whose SearchFunc returns the given entries
-// with no paging controls. Suitable for single-page tree-building tests.
-func mockOUs(entries ...*ldap.Entry) *mocks.MockLDAPConn {
-	return &mocks.MockLDAPConn{
-		SearchFunc: func(*ldap.SearchRequest) (*ldap.SearchResult, error) {
-			return &ldap.SearchResult{Entries: entries}, nil
-		},
-	}
 }

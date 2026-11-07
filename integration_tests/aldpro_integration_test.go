@@ -7,44 +7,36 @@ package ldapper_test
 //
 // ALDPro is a commercial Russian directory service built on FreeIPA/389ds
 // with schema extensions (rbta-org-unit, rbtadp). No public Docker image
-// exists, so this suite runs against stock osixia/openldap augmented with a
-// custom schema that mirrors the ALDPro-specific pieces exercised by
-// ALDROAdapter:
+// exists, so this suite runs against stock osixia/openldap augmented with
+// a custom schema that mirrors the ALDPro-specific pieces exercised by
+// ALDPROAdapter:
 //   - objectClass rbta-org-unit  (used by OUObjectFilter / SearchOUFilterTemplate)
-//   - attribute  rbtadp          (used as department attribute in UserAttrs)
+//   - attribute   rbtadp         (used as department attribute in UserAttrs)
 //
-// Adapter status (current):
+// ALDPROAdapter group filter (two positional args, member + memberIndirect +
+// memberUid — mirroring OPENLDAP but with ipaUserGroup and memberIndirect):
+//   (|(&(|(objectClass=groupOfNames)(objectClass=ipaUserGroup)(objectClass=posixGroup))
+//       (|(member=%[1]s)(memberIndirect=%[1]s)))
+//     (&(objectClass=posixGroup)(memberUid=%[2]s)))
+// args = [user.DN, user.uid].
 //
-//   SearchUserGroupsFilterTemplate =
-//     (|(&(|(objectClass=groupOfNames)(objectClass=ipausergroup)(objectClass=posixGroup))(member=%s))
-//       (&(objectClass=posixGroup)(memberUid=%s)))
-//
-//   SearchUserGroupsFilterTemplateArgs = [ user.DN, user.GetAttributeValue("uid") ]
-//
-// This mirrors OPENLDAPAdapter: both group flavours are supported:
-//   - groupOfNames / ipausergroup  -> member    (DN-valued)  -> args[0] = DN
-//   - posixGroup                   -> memberUid (uid-valued) -> args[1] = uid
-//
-// GetUserGroups tests below are POSITIVE for both branches:
-//   - user1 -> ["admins"]  (groupOfNames,  member   = DN)
-//   - user2 -> ["readers"] (posixGroup,    memberUid = uid)
+// ALDROAdapter does NOT implement PrimaryGroupResolver — GetUserGroups
+// returns only membership-based groups.
 //
 // Auth-path note:
-//   CheckUserCredentials(username, password) has only two args. The base DN
-//   for the internal GetUser comes from conn.bindDN stored by the prior
-//   AuthenticateConn call. Error assertions use errors.Is against exported
-//   sentinels (ErrInvalidCredentials, ErrNotFound, ...) instead of matching
-//   error text — the sentinel contract is stable, the text is not.
+//   ALDPROAdapter.BindIdentity is pass-through (like MSAD), so binding by
+//   full DN works. The osixia admin is a simpleSecurityObject that does not
+//   match UserFilter; tests use a dedicated svc-reader inetOrgPerson.
 //
 // Run with:
 //   go test -tags=integration_aldpro ./...
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -56,11 +48,12 @@ import (
 
 	"github.com/NGRsoftlab/ldapper"
 	"github.com/NGRsoftlab/ldapper/adapters"
+	"github.com/NGRsoftlab/ldapper/constants"
 	"github.com/NGRsoftlab/ldapper/types"
 )
 
 // ---------------------------------------------------------------------------
-// ALDPro test fixtures
+// Fixtures
 // ---------------------------------------------------------------------------
 
 const (
@@ -76,20 +69,16 @@ const (
 	aldproUser2UID  = "user2"
 	aldproUser2Pass = "password2"
 
-	// aldproSvcUID is a real inetOrgPerson used for tests that need an
-	// authenticated bind with a person-like account (the osixia admin is a
-	// simpleSecurityObject, which the adapter's SearchUserFilterTemplate
-	// does not match).
+	// svc-reader is a real inetOrgPerson used for authenticated binds — the
+	// osixia admin is a simpleSecurityObject that UserFilter does not match.
 	aldproSvcUID  = "svc-reader"
 	aldproSvcPass = "svcpassword"
 	aldproSvcDN   = "cn=svc-reader,ou=users,dc=aldpro,dc=test"
 )
 
-// aldproSchema mirrors ALDPro-specific schema extensions.
-//
-// OIDs use the private enterprise placeholder (1.3.6.1.4.1.99999.*); they only
-// need to be unique inside the ephemeral test OpenLDAP instance and do NOT
-// correspond to the real ALDPro OIDs.
+// aldproSchema mirrors ALDPro-specific schema extensions. OIDs use the
+// private enterprise placeholder; they need only to be unique inside the
+// ephemeral test instance, not to match real ALDPro OIDs.
 const aldproSchema = `attributetype ( 1.3.6.1.4.1.99999.1.1
     NAME 'rbtadp'
     DESC 'ALDPro department attribute'
@@ -105,12 +94,6 @@ objectclass ( 1.3.6.1.4.1.99999.2.1
     MAY ( rbtadp $ description ) )
 `
 
-// aldproBootstrapLDIF seeds:
-//   - ou=users as a standard organizationalUnit with two users plus a
-//     service account used for authenticated admin-like tests
-//   - ou=departments as an ALDPro-specific rbta-org-unit (tests the schema)
-//   - ou=groups with a groupOfNames (admins, member=user1 DN) and a
-//     posixGroup (readers, memberUid=user2)
 const aldproBootstrapLDIF = `dn: ou=users,dc=aldpro,dc=test
 objectClass: organizationalUnit
 ou: users
@@ -179,7 +162,7 @@ memberUid: user2
 var (
 	aldproHost string
 	aldproPort uint
-	aldproAdpt = adapters.ALDROAdapter{}
+	aldproAdpt = adapters.ALDPROAdapter{}
 )
 
 func TestMain(m *testing.M) {
@@ -243,14 +226,14 @@ func TestMain(m *testing.M) {
 	aldproHost, err = container.Host(ctx)
 	if err != nil {
 		_ = container.Terminate(ctx)
-		fmt.Fprintf(os.Stderr, "cannot resolve container host: %v\n", err)
+		fmt.Fprintf(os.Stderr, "cannot resolve host: %v\n", err)
 		os.Exit(1)
 	}
 
 	mappedPort, err := container.MappedPort(ctx, "389")
 	if err != nil {
 		_ = container.Terminate(ctx)
-		fmt.Fprintf(os.Stderr, "cannot resolve mapped port: %v\n", err)
+		fmt.Fprintf(os.Stderr, "cannot resolve port: %v\n", err)
 		os.Exit(1)
 	}
 	aldproPort = uint(mappedPort.Num())
@@ -292,15 +275,22 @@ func waitForALDProReady(host string, port uint, timeout time.Duration) bool {
 	return false
 }
 
-// newALDProConn returns an unauthenticated connection.
+func containsDN(groups []string, needle string) bool {
+	needle = strings.ToLower(needle)
+	for _, g := range groups {
+		if strings.Contains(strings.ToLower(g), needle) {
+			return true
+		}
+	}
+	return false
+}
+
 func newALDProConn(t *testing.T, opts ...ldapper.Option) *ldapper.LDAPper {
 	t.Helper()
 	conn, err := ldapper.NewLDAPper(
-		[]string{aldproHost},
-		aldproPort,
-		false, // useSSL
-		true,  // skipTLS
-		nil,
+		context.Background(),
+		[]string{aldproHost}, aldproPort,
+		false, true, nil,
 		aldproAdpt,
 		opts...,
 	)
@@ -309,21 +299,13 @@ func newALDProConn(t *testing.T, opts ...ldapper.Option) *ldapper.LDAPper {
 	return conn
 }
 
-// newALDProAuthConn returns a connection authenticated as the dedicated
-// service account (a real inetOrgPerson). The osixia admin is a
-// simpleSecurityObject and does not match the adapter's
-// SearchUserFilterTemplate, so AuthenticateConn against the admin DN would
-// fail on the post-bind GetUser. Using svc-reader keeps the tests valid
-// under the current adapter.
 func newALDProAuthConn(t *testing.T, opts ...ldapper.Option) *ldapper.LDAPper {
 	t.Helper()
 	conn, _, err := ldapper.NewAuthenticatedLDAPper(
+		context.Background(),
 		aldproSvcDN, aldproSvcPass, aldproBaseDN,
-		[]string{aldproHost},
-		aldproPort,
-		false,
-		true,
-		nil,
+		[]string{aldproHost}, aldproPort,
+		false, true, nil,
 		aldproAdpt,
 		opts...,
 	)
@@ -332,16 +314,23 @@ func newALDProAuthConn(t *testing.T, opts ...ldapper.Option) *ldapper.LDAPper {
 	return conn
 }
 
-// ---------------------------------------------------------------------------
-// Adapter contract tests (no server needed)
-// ---------------------------------------------------------------------------
+// ================== adapter contract (no server needed) ==================
 
-func TestIntegrationALDPro_SearchUserGroupsFilterTemplate_PostFix(t *testing.T) {
+// ALDROAdapter group template uses TWO positional args:
+// member/memberIndirect (%[1]s = DN) and memberUid (%[2]s = uid).
+// The previous test expected a single %s — that was wrong and would have
+// failed against the current adapter.
+func TestIntegrationALDPro_SearchUserGroupsFilterTemplate_TwoArgs(t *testing.T) {
 	tmpl := aldproAdpt.SearchUserGroupsFilterTemplate()
-	assert.NotContains(t, tmpl, "member=uid=")
-	assert.Contains(t, tmpl, "(member=%s)")
-	assert.Contains(t, tmpl, "(memberUid=%s)")
-	assert.Equal(t, 2, strings.Count(tmpl, "%s"))
+
+	assert.Contains(t, tmpl, "member=%[1]s")
+	assert.Contains(t, tmpl, "memberIndirect=%[1]s",
+		"ALDPro supports nested group membership via memberIndirect")
+	assert.Contains(t, tmpl, "memberUid=%[2]s")
+	assert.NotContains(t, tmpl, "member=uid=",
+		"filter must not hard-code uid= prefix on member")
+	assert.NotContains(t, tmpl, "%[3]s",
+		"only two positional arguments are supported")
 }
 
 func TestIntegrationALDPro_SearchUserGroupsFilterTemplateArgs_ReturnsDNThenUID(t *testing.T) {
@@ -352,68 +341,85 @@ func TestIntegrationALDPro_SearchUserGroupsFilterTemplateArgs_ReturnsDNThenUID(t
 	}
 	args := aldproAdpt.SearchUserGroupsFilterTemplateArgs(user)
 	require.Len(t, args, 2)
-	require.Equal(t, dn, args[0])
-	require.Equal(t, "user1", args[1])
+	require.Equal(t, dn, args[0], "arg 0 (DN) feeds member/memberIndirect")
+	require.Equal(t, "user1", args[1], "arg 1 (uid) feeds memberUid")
 }
 
-// ---------------------------------------------------------------------------
-// NewConnection / NewAuthenticatedConnection — constructor validation
-// ---------------------------------------------------------------------------
+// ALDROAdapter must not implement PrimaryGroupResolver: there is no
+// primaryGroupID concept in the ALDPro schema.
+var _ = func() any {
+	var c any = adapters.ALDPROAdapter{}
+	if _, ok := c.(interface {
+		ResolvePrimaryGroupDN(context.Context, types.LDAPUser, any) (string, error)
+	}); ok {
+		panic("ALDPROAdapter must not implement PrimaryGroupResolver")
+	}
+	return nil
+}()
+
+// ================== constructor validation ==================
 
 func TestIntegrationALDPro_NewConnection_Success(t *testing.T) {
 	conn := newALDProConn(t)
-	require.NotNil(t, conn)
-	assert.True(t, conn.IsAlive())
+	assert.True(t, conn.IsAlive(context.Background()))
 }
 
 func TestIntegrationALDPro_NewConnection_EmptyHosts(t *testing.T) {
-	_, err := ldapper.NewLDAPper(nil, 389, false, true, nil, aldproAdpt)
+	_, err := ldapper.NewLDAPper(context.Background(),
+		nil, 389, false, true, nil, aldproAdpt)
 	require.Error(t, err)
-	assert.True(t, errors.Is(err, ldapper.ErrInvalidArgument))
+	assert.ErrorIs(t, err, ldapper.ErrInvalidArgument)
 }
 
 func TestIntegrationALDPro_NewConnection_TooManyHosts(t *testing.T) {
-	hosts := make([]string, 100)
+	hosts := make([]string, constants.DefaultMaxHostsLength+1)
 	for i := range hosts {
 		hosts[i] = fmt.Sprintf("host%d", i)
 	}
-	_, err := ldapper.NewLDAPper(hosts, 389, false, true, nil, aldproAdpt)
+	_, err := ldapper.NewLDAPper(context.Background(),
+		hosts, 389, false, true, nil, aldproAdpt)
 	require.Error(t, err)
-	assert.True(t, errors.Is(err, ldapper.ErrInvalidArgument))
+	assert.ErrorIs(t, err, ldapper.ErrInvalidArgument)
 }
 
 func TestIntegrationALDPro_NewConnection_NilTLSConfigWhenRequired(t *testing.T) {
-	_, err := ldapper.NewLDAPper([]string{aldproHost}, aldproPort, false, false, nil, aldproAdpt)
+	_, err := ldapper.NewLDAPper(context.Background(),
+		[]string{aldproHost}, aldproPort, false, false, nil, aldproAdpt)
 	require.Error(t, err)
-	assert.True(t, errors.Is(err, ldapper.ErrInvalidArgument))
+	assert.ErrorIs(t, err, ldapper.ErrInvalidArgument)
 }
 
 func TestIntegrationALDPro_NewConnection_NilCatalogAdapter(t *testing.T) {
-	_, err := ldapper.NewLDAPper([]string{aldproHost}, aldproPort, false, true, nil, nil)
+	_, err := ldapper.NewLDAPper(context.Background(),
+		[]string{aldproHost}, aldproPort, false, true, nil, nil)
 	require.Error(t, err)
-	assert.True(t, errors.Is(err, ldapper.ErrInvalidArgument))
+	assert.ErrorIs(t, err, ldapper.ErrInvalidArgument)
 }
 
 func TestIntegrationALDPro_NewConnection_InvalidPort(t *testing.T) {
-	_, err := ldapper.NewLDAPper([]string{aldproHost}, 0, false, true, nil, aldproAdpt)
+	_, err := ldapper.NewLDAPper(context.Background(),
+		[]string{aldproHost}, 0, false, true, nil, aldproAdpt)
 	require.Error(t, err)
-	assert.True(t, errors.Is(err, ldapper.ErrInvalidArgument))
+	assert.ErrorIs(t, err, ldapper.ErrInvalidArgument)
 }
 
 func TestIntegrationALDPro_NewConnection_SSLWithSkipTLSRejected(t *testing.T) {
-	_, err := ldapper.NewLDAPper([]string{aldproHost}, 636, true, true, nil, aldproAdpt)
+	_, err := ldapper.NewLDAPper(context.Background(),
+		[]string{aldproHost}, 636, true, true, nil, aldproAdpt)
 	require.Error(t, err)
-	assert.True(t, errors.Is(err, ldapper.ErrInvalidArgument))
+	assert.ErrorIs(t, err, ldapper.ErrInvalidArgument)
 }
 
 func TestIntegrationALDPro_NewConnection_UnreachableHost(t *testing.T) {
-	_, err := ldapper.NewLDAPper([]string{"127.0.0.1"}, 1, false, true, nil, aldproAdpt)
+	_, err := ldapper.NewLDAPper(context.Background(),
+		[]string{"127.0.0.1"}, 1, false, true, nil, aldproAdpt)
 	require.Error(t, err)
-	assert.True(t, errors.Is(err, ldapper.ErrUnavailable))
+	assert.ErrorIs(t, err, ldapper.ErrUnavailable)
 }
 
 func TestIntegrationALDPro_NewAuthenticatedConnection_Success(t *testing.T) {
 	conn, user, err := ldapper.NewAuthenticatedLDAPper(
+		context.Background(),
 		aldproSvcDN, aldproSvcPass, aldproBaseDN,
 		[]string{aldproHost}, aldproPort, false, true, nil, aldproAdpt,
 	)
@@ -427,30 +433,30 @@ func TestIntegrationALDPro_NewAuthenticatedConnection_Success(t *testing.T) {
 
 func TestIntegrationALDPro_NewAuthenticatedConnection_EmptyCredentials(t *testing.T) {
 	_, _, err := ldapper.NewAuthenticatedLDAPper(
-		"", "", aldproBaseDN,
+		context.Background(), "", "", aldproBaseDN,
 		[]string{aldproHost}, aldproPort, false, true, nil, aldproAdpt,
 	)
 	require.Error(t, err)
-	assert.True(t, errors.Is(err, ldapper.ErrInvalidArgument))
+	assert.ErrorIs(t, err, ldapper.ErrInvalidArgument)
 }
 
 func TestIntegrationALDPro_NewAuthenticatedConnection_WrongPassword(t *testing.T) {
 	_, _, err := ldapper.NewAuthenticatedLDAPper(
+		context.Background(),
 		aldproSvcDN, "wrong-password", aldproBaseDN,
 		[]string{aldproHost}, aldproPort, false, true, nil, aldproAdpt,
 	)
 	require.Error(t, err)
-	assert.True(t, errors.Is(err, ldapper.ErrInvalidCredentials))
+	assert.ErrorIs(t, err, ldapper.ErrInvalidCredentials)
 }
 
-// ---------------------------------------------------------------------------
-// AuthenticateConn
-// ---------------------------------------------------------------------------
+// ================== AuthenticateConn ==================
 
 func TestIntegrationALDPro_AuthenticateConn_Success(t *testing.T) {
 	conn := newALDProConn(t)
 
-	user, err := conn.AuthenticateConn(aldproSvcDN, aldproSvcPass, aldproBaseDN)
+	user, err := conn.AuthenticateConn(context.Background(),
+		aldproSvcDN, aldproSvcPass, aldproBaseDN)
 	require.NoError(t, err)
 	require.NotNil(t, user)
 	assert.Equal(t, aldproSvcDN, user.DN)
@@ -458,41 +464,34 @@ func TestIntegrationALDPro_AuthenticateConn_Success(t *testing.T) {
 
 func TestIntegrationALDPro_AuthenticateConn_EmptyCredentials(t *testing.T) {
 	conn := newALDProConn(t)
-	_, err := conn.AuthenticateConn("", "", aldproBaseDN)
+	_, err := conn.AuthenticateConn(context.Background(), "", "", aldproBaseDN)
 	require.Error(t, err)
-	assert.True(t, errors.Is(err, ldapper.ErrInvalidArgument))
+	assert.ErrorIs(t, err, ldapper.ErrInvalidArgument)
 }
 
 func TestIntegrationALDPro_AuthenticateConn_WrongPassword(t *testing.T) {
 	conn := newALDProConn(t)
-	_, err := conn.AuthenticateConn(aldproSvcDN, "bad-password", aldproBaseDN)
+	_, err := conn.AuthenticateConn(context.Background(),
+		aldproSvcDN, "bad-password", aldproBaseDN)
 	require.Error(t, err)
-	// classifySensitiveBindError returns the sentinel without leaking raw text.
-	assert.True(t, errors.Is(err, ldapper.ErrInvalidCredentials))
-	assert.NotContains(t, err.Error(), "bad-password")
+	assert.ErrorIs(t, err, ldapper.ErrInvalidCredentials)
+	assert.NotContains(t, err.Error(), "bad-password",
+		"submitted credentials must not echo back")
 }
 
 func TestIntegrationALDPro_AuthenticateConn_NonExistentUser(t *testing.T) {
 	conn := newALDProConn(t)
-	_, err := conn.AuthenticateConn(
-		"cn=ghost,ou=users,"+aldproBaseDN, "whatever", aldproBaseDN,
-	)
+	_, err := conn.AuthenticateConn(context.Background(),
+		"cn=ghost,ou=users,"+aldproBaseDN, "whatever", aldproBaseDN)
 	require.Error(t, err)
 }
 
-// ---------------------------------------------------------------------------
-// CheckUserCredentials — 2-arg signature; base DN from conn.bindDN.
-// Failure modes:
-//   - missing user     -> ErrInvalidCredentials (masked for enumeration)
-//   - wrong password   -> ErrInvalidCredentials
-//   - success          -> non-nil user, no error
-// On any failure the returned user MUST be nil.
-// ---------------------------------------------------------------------------
+// ================== CheckUserCredentials ==================
 
 func TestIntegrationALDPro_CheckUserCredentials_Success(t *testing.T) {
 	conn := newALDProAuthConn(t)
 
-	user, err := conn.CheckUserCredentials(aldproUser1UID, aldproUser1Pass)
+	user, err := conn.CheckUserCredentials(context.Background(), aldproUser1UID, aldproUser1Pass)
 	require.NoError(t, err)
 	require.NotNil(t, user)
 	assert.Equal(t, aldproUser1UID, user.GetAttributeValue("uid"))
@@ -501,85 +500,80 @@ func TestIntegrationALDPro_CheckUserCredentials_Success(t *testing.T) {
 func TestIntegrationALDPro_CheckUserCredentials_WrongPassword(t *testing.T) {
 	conn := newALDProAuthConn(t)
 
-	user, err := conn.CheckUserCredentials(aldproUser1UID, "bad")
+	user, err := conn.CheckUserCredentials(context.Background(), aldproUser1UID, "bad")
 	require.Error(t, err)
-	assert.True(t, errors.Is(err, ldapper.ErrInvalidCredentials))
-	// NB: user must be nil — returning the found user alongside an auth
-	// failure invites mis-use ("if user != nil { authenticated }").
+	assert.ErrorIs(t, err, ldapper.ErrInvalidCredentials)
 	assert.Nil(t, user)
 }
 
 func TestIntegrationALDPro_CheckUserCredentials_NonExistentUser(t *testing.T) {
 	conn := newALDProAuthConn(t)
 
-	user, err := conn.CheckUserCredentials("ghost-user", "whatever")
+	user, err := conn.CheckUserCredentials(context.Background(), "ghost-user", "whatever")
 	require.Error(t, err)
-	// Enumeration protection: missing user and wrong password must be
-	// indistinguishable to the caller.
-	assert.True(t, errors.Is(err, ldapper.ErrInvalidCredentials))
+	assert.ErrorIs(t, err, ldapper.ErrInvalidCredentials,
+		"missing user must be masked as invalid credentials (enumeration protection)")
 	assert.Nil(t, user)
 }
 
 func TestIntegrationALDPro_CheckUserCredentials_NotAuthenticated(t *testing.T) {
 	conn := newALDProConn(t)
-	_, err := conn.CheckUserCredentials(aldproUser1UID, aldproUser1Pass)
+	_, err := conn.CheckUserCredentials(context.Background(), aldproUser1UID, aldproUser1Pass)
 	require.Error(t, err)
-	assert.True(t, errors.Is(err, ldapper.ErrNotAuthenticated))
+	assert.ErrorIs(t, err, ldapper.ErrNotAuthenticated)
 }
 
 func TestIntegrationALDPro_CheckUserCredentials_EmptyCredentials(t *testing.T) {
 	conn := newALDProAuthConn(t)
-	_, err := conn.CheckUserCredentials("", "")
+	_, err := conn.CheckUserCredentials(context.Background(), "", "")
 	require.Error(t, err)
-	assert.True(t, errors.Is(err, ldapper.ErrInvalidArgument))
+	assert.ErrorIs(t, err, ldapper.ErrInvalidArgument)
 }
 
-// ---------------------------------------------------------------------------
-// IsAlive / Reconnect / EnsureAlive / Close
-// ---------------------------------------------------------------------------
+// ================== IsAlive / Reconnect / EnsureAlive / Close ==================
 
 func TestIntegrationALDPro_IsAlive_ActiveConnection(t *testing.T) {
 	conn := newALDProConn(t)
-	assert.True(t, conn.IsAlive())
+	assert.True(t, conn.IsAlive(context.Background()))
 }
 
 func TestIntegrationALDPro_IsAlive_AfterClose(t *testing.T) {
 	conn := newALDProConn(t)
 	conn.Close()
-	assert.False(t, conn.IsAlive())
+	assert.False(t, conn.IsAlive(context.Background()))
 }
 
 func TestIntegrationALDPro_Reconnect_Unauthenticated(t *testing.T) {
 	conn := newALDProConn(t)
-	require.True(t, conn.IsAlive())
-	require.NoError(t, conn.Reconnect())
-	assert.True(t, conn.IsAlive())
+	require.True(t, conn.IsAlive(context.Background()))
+	require.NoError(t, conn.Reconnect(context.Background()))
+	assert.True(t, conn.IsAlive(context.Background()))
 }
 
 func TestIntegrationALDPro_Reconnect_PreservesAuthentication(t *testing.T) {
 	conn := newALDProAuthConn(t)
-	require.NoError(t, conn.Reconnect())
+	require.NoError(t, conn.Reconnect(context.Background()))
 
-	_, err := conn.CheckUserCredentials(aldproUser1UID, aldproUser1Pass)
+	_, err := conn.CheckUserCredentials(context.Background(), aldproUser1UID, aldproUser1Pass)
 	require.NoError(t, err)
 }
 
 func TestIntegrationALDPro_EnsureAlive_NoopWhenAlive(t *testing.T) {
 	conn := newALDProConn(t)
-	require.NoError(t, conn.EnsureAlive())
-	assert.True(t, conn.IsAlive())
+	require.NoError(t, conn.EnsureAlive(context.Background()))
+	assert.True(t, conn.IsAlive(context.Background()))
 }
 
-func TestIntegrationALDPro_EnsureAlive_ReconnectsAfterClose(t *testing.T) {
+// After Close the client is terminal: EnsureAlive reports ErrClosed instead
+// of silently reconnecting.
+func TestIntegrationALDPro_EnsureAlive_ClosedClient_ReturnsErrClosed(t *testing.T) {
 	conn := newALDProAuthConn(t)
 	conn.Close()
-	require.False(t, conn.IsAlive())
+	require.False(t, conn.IsAlive(context.Background()))
 
-	require.NoError(t, conn.EnsureAlive())
-	assert.True(t, conn.IsAlive())
-
-	_, err := conn.CheckUserCredentials(aldproUser1UID, aldproUser1Pass)
-	require.NoError(t, err)
+	err := conn.EnsureAlive(context.Background())
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ldapper.ErrClosed)
 }
 
 func TestIntegrationALDPro_Close_Idempotent(t *testing.T) {
@@ -587,27 +581,24 @@ func TestIntegrationALDPro_Close_Idempotent(t *testing.T) {
 	conn.Close()
 	conn.Close() // must not panic
 
-	_, err := conn.GetUser(aldproUser1UID, aldproBaseDN)
+	_, err := conn.GetUser(context.Background(), aldproUser1UID, aldproBaseDN)
 	require.Error(t, err)
-	assert.True(t, errors.Is(err, ldapper.ErrClosed))
+	assert.ErrorIs(t, err, ldapper.ErrClosed)
 }
 
-// ---------------------------------------------------------------------------
-// CustomSearch
-// ---------------------------------------------------------------------------
+// ================== CustomSearch ==================
 
 func TestIntegrationALDPro_CustomSearch_UserLookup(t *testing.T) {
 	conn := newALDProAuthConn(t)
 
 	req := ldap.NewSearchRequest(
 		aldproBaseDN, ldap.ScopeWholeSubtree, ldap.NeverDerefAliases,
-		0, 0, false,
-		"(uid=user1)",
+		0, 0, false, "(uid=user1)",
 		[]string{"cn", "mail", "rbtadp"},
 		nil,
 	)
 
-	res, err := conn.CustomSearch(req)
+	res, err := conn.CustomSearch(context.Background(), req)
 	require.NoError(t, err)
 	require.Len(t, res.Entries, 1)
 	assert.Equal(t, aldproUser1DN, res.Entries[0].DN)
@@ -625,7 +616,7 @@ func TestIntegrationALDPro_CustomSearch_OUFilterMatchesBothTypes(t *testing.T) {
 		nil,
 	)
 
-	res, err := conn.CustomSearch(req)
+	res, err := conn.CustomSearch(context.Background(), req)
 	require.NoError(t, err)
 
 	ous := make([]string, 0, len(res.Entries))
@@ -633,7 +624,8 @@ func TestIntegrationALDPro_CustomSearch_OUFilterMatchesBothTypes(t *testing.T) {
 		ous = append(ous, e.GetAttributeValue("ou"))
 	}
 	assert.Contains(t, ous, "users")
-	assert.Contains(t, ous, "departments")
+	assert.Contains(t, ous, "departments",
+		"rbta-org-unit must match OUObjectFilter")
 	assert.Contains(t, ous, "groups")
 }
 
@@ -645,19 +637,17 @@ func TestIntegrationALDPro_CustomSearch_NotInitialized(t *testing.T) {
 		aldproBaseDN, ldap.ScopeBaseObject, ldap.NeverDerefAliases,
 		0, 0, false, "(objectClass=*)", nil, nil,
 	)
-	_, err := conn.CustomSearch(req)
+	_, err := conn.CustomSearch(context.Background(), req)
 	require.Error(t, err)
-	assert.True(t, errors.Is(err, ldapper.ErrClosed))
+	assert.ErrorIs(t, err, ldapper.ErrClosed)
 }
 
-// ---------------------------------------------------------------------------
-// GetUser
-// ---------------------------------------------------------------------------
+// ================== GetUser ==================
 
 func TestIntegrationALDPro_GetUser_ByUID(t *testing.T) {
 	conn := newALDProAuthConn(t)
 
-	user, err := conn.GetUser(aldproUser1UID, aldproBaseDN)
+	user, err := conn.GetUser(context.Background(), aldproUser1UID, aldproBaseDN)
 	require.NoError(t, err)
 	assert.Equal(t, aldproUser1DN, user.DN)
 	assert.Equal(t, "Engineering", user.GetAttributeValue("rbtadp"))
@@ -665,93 +655,99 @@ func TestIntegrationALDPro_GetUser_ByUID(t *testing.T) {
 
 func TestIntegrationALDPro_GetUser_NotFound(t *testing.T) {
 	conn := newALDProAuthConn(t)
-	_, err := conn.GetUser("does-not-exist", aldproBaseDN)
+	_, err := conn.GetUser(context.Background(), "does-not-exist", aldproBaseDN)
 	require.Error(t, err)
-	assert.True(t, errors.Is(err, ldapper.ErrNotFound))
+	assert.ErrorIs(t, err, ldapper.ErrNotFoundOrNotVisible)
 }
 
 func TestIntegrationALDPro_GetUser_EmptyUsername(t *testing.T) {
 	conn := newALDProAuthConn(t)
-	_, err := conn.GetUser("", aldproBaseDN)
+	_, err := conn.GetUser(context.Background(), "", aldproBaseDN)
 	require.Error(t, err)
-	assert.True(t, errors.Is(err, ldapper.ErrInvalidArgument))
+	assert.ErrorIs(t, err, ldapper.ErrInvalidArgument)
 }
 
 func TestIntegrationALDPro_GetUser_EmptyBaseDN(t *testing.T) {
 	conn := newALDProAuthConn(t)
-	_, err := conn.GetUser(aldproUser1UID, "")
+	_, err := conn.GetUser(context.Background(), aldproUser1UID, "")
 	require.Error(t, err)
-	assert.True(t, errors.Is(err, ldapper.ErrInvalidArgument))
+	assert.ErrorIs(t, err, ldapper.ErrInvalidArgument)
 }
 
-// ---------------------------------------------------------------------------
-// GetGroup / GetOU — new single-object lookups
-// ---------------------------------------------------------------------------
+// ================== GetGroup / GetOU ==================
 
 func TestIntegrationALDPro_GetGroup_Success(t *testing.T) {
 	conn := newALDProAuthConn(t)
 
-	group, err := conn.GetGroup("admins", aldproBaseDN)
+	group, err := conn.GetGroup(context.Background(), "admins", aldproBaseDN)
 	require.NoError(t, err)
 	require.NotNil(t, group)
-	assert.Contains(t, group.DN, "cn=admins")
 	assert.Equal(t, "admins", group.GetAttributeValue("cn"))
 }
 
 func TestIntegrationALDPro_GetGroup_NotFound(t *testing.T) {
 	conn := newALDProAuthConn(t)
-	_, err := conn.GetGroup("does-not-exist", aldproBaseDN)
+	_, err := conn.GetGroup(context.Background(), "does-not-exist", aldproBaseDN)
 	require.Error(t, err)
-	assert.True(t, errors.Is(err, ldapper.ErrNotFound))
+	assert.ErrorIs(t, err, ldapper.ErrNotFoundOrNotVisible)
 }
 
-func TestIntegrationALDPro_GetOU_Success(t *testing.T) {
+func TestIntegrationALDPro_GetOU_StandardOU(t *testing.T) {
 	conn := newALDProAuthConn(t)
 
-	ou, err := conn.GetOU("users", aldproBaseDN)
+	ou, err := conn.GetOU(context.Background(), "users", aldproBaseDN)
 	require.NoError(t, err)
 	require.NotNil(t, ou)
-	assert.Contains(t, ou.DN, "ou=users")
 	assert.Equal(t, "users", ou.GetAttributeValue("ou"))
+}
+
+func TestIntegrationALDPro_GetOU_ALDProOU(t *testing.T) {
+	conn := newALDProAuthConn(t)
+
+	// departments is an rbta-org-unit — SearchOUFilterTemplate matches on
+	// cn= (since rbta-org-unit has no ou attribute), and the adapter's
+	// GetNormalizedOUInfoFromEntry falls back to cn when ou is absent.
+	ou, err := conn.GetOU(context.Background(), "departments", aldproBaseDN)
+	require.NoError(t, err)
+	require.NotNil(t, ou)
+	assert.Contains(t, strings.ToLower(ou.DN), "cn=departments")
 }
 
 func TestIntegrationALDPro_GetOU_NotFound(t *testing.T) {
 	conn := newALDProAuthConn(t)
-	_, err := conn.GetOU("does-not-exist", aldproBaseDN)
+	_, err := conn.GetOU(context.Background(), "does-not-exist", aldproBaseDN)
 	require.Error(t, err)
-	assert.True(t, errors.Is(err, ldapper.ErrNotFound))
+	assert.ErrorIs(t, err, ldapper.ErrNotFoundOrNotVisible)
 }
 
-// ---------------------------------------------------------------------------
-// GetCatalogTree / GetSubOUs — new tree discovery
-// ---------------------------------------------------------------------------
+// ================== GetCatalogTree / GetSubOUs ==================
 
 func TestIntegrationALDPro_GetCatalogTree_Success(t *testing.T) {
 	conn := newALDProAuthConn(t)
 
-	tree, err := conn.GetCatalogTree(aldproBaseDN, 0)
+	tree, err := conn.GetCatalogTree(context.Background(), aldproBaseDN, 0)
 	require.NoError(t, err)
 
-	// Both standard organizationalUnit and rbta-org-unit must be present.
 	var names []string
-	var collect func(nodes []*types.OUNormalizedInfo)
-	collect = func(nodes []*types.OUNormalizedInfo) {
+	var walk func(nodes []*types.OUNormalizedInfo)
+	walk = func(nodes []*types.OUNormalizedInfo) {
 		for _, n := range nodes {
-			names = append(names, n.Name)
-			collect(n.Children)
+			names = append(names, strings.ToLower(n.Name))
+			walk(n.Children)
 		}
 	}
-	collect(tree.Tree)
+	walk(tree.Tree)
 
 	assert.Contains(t, names, "users")
-	assert.Contains(t, names, "departments", "rbta-org-unit is discovered")
+	assert.Contains(t, names, "departments",
+		"rbta-org-unit must be discovered as a tree node")
 	assert.Contains(t, names, "groups")
 }
 
 func TestIntegrationALDPro_GetCatalogTree_MaxDepth(t *testing.T) {
 	conn := newALDProAuthConn(t)
 
-	tree, err := conn.GetCatalogTree(aldproBaseDN, 1)
+	tree, err := conn.GetCatalogTree(context.Background(), aldproBaseDN, 1)
 	require.NoError(t, err)
 	for _, root := range tree.Tree {
 		assert.Empty(t, root.Children, "maxDepth=1 must trim children")
@@ -761,7 +757,7 @@ func TestIntegrationALDPro_GetCatalogTree_MaxDepth(t *testing.T) {
 func TestIntegrationALDPro_GetSubOUs_SingleLevel(t *testing.T) {
 	conn := newALDProAuthConn(t)
 
-	ous, err := conn.GetSubOUs(aldproBaseDN, ldap.ScopeSingleLevel)
+	ous, err := conn.GetSubOUs(context.Background(), aldproBaseDN, ldap.ScopeSingleLevel)
 	require.NoError(t, err)
 
 	var names []string
@@ -775,59 +771,61 @@ func TestIntegrationALDPro_GetSubOUs_SingleLevel(t *testing.T) {
 func TestIntegrationALDPro_ListSingleLevelOUs(t *testing.T) {
 	conn := newALDProAuthConn(t)
 
-	ous, err := conn.ListSingleLevelOUs(aldproBaseDN)
+	ous, err := conn.ListSingleLevelOUs(context.Background(), aldproBaseDN)
 	require.NoError(t, err)
 	assert.NotEmpty(t, ous)
 }
 
-// ---------------------------------------------------------------------------
-// GetUserGroups — positive for BOTH branches of the fixed filter
-// ---------------------------------------------------------------------------
+// ================== GetUserGroups ==================
 
+// GetUserGroups returns DNs; assertions use containsDN (case-insensitive
+// substring) because DN attribute-type case may vary.
 func TestIntegrationALDPro_GetUserGroups_GroupOfNamesBranch(t *testing.T) {
 	conn := newALDProAuthConn(t)
 
-	groups, err := conn.GetUserGroups(aldproUser1UID, aldproBaseDN)
+	groups, err := conn.GetUserGroups(context.Background(), aldproUser1UID, aldproBaseDN)
 	require.NoError(t, err)
-	assert.ElementsMatch(t, []string{"admins"}, groups)
+	assert.True(t, containsDN(groups, "cn=admins"),
+		"expected an admins group DN in %v", groups)
 }
 
 func TestIntegrationALDPro_GetUserGroups_PosixGroupBranch(t *testing.T) {
 	conn := newALDProAuthConn(t)
 
-	groups, err := conn.GetUserGroups(aldproUser2UID, aldproBaseDN)
+	groups, err := conn.GetUserGroups(context.Background(), aldproUser2UID, aldproBaseDN)
 	require.NoError(t, err)
-	assert.ElementsMatch(t, []string{"readers"}, groups)
+	assert.True(t, containsDN(groups, "cn=readers"),
+		"expected a readers group DN in %v", groups)
 }
 
 func TestIntegrationALDPro_GetUserGroups_NoCrossContamination(t *testing.T) {
 	conn := newALDProAuthConn(t)
 
-	groups1, err := conn.GetUserGroups(aldproUser1UID, aldproBaseDN)
+	groups1, err := conn.GetUserGroups(context.Background(), aldproUser1UID, aldproBaseDN)
 	require.NoError(t, err)
-	assert.NotContains(t, groups1, "readers")
+	assert.False(t, containsDN(groups1, "cn=readers"),
+		"user1 must not be in readers, got %v", groups1)
 
-	groups2, err := conn.GetUserGroups(aldproUser2UID, aldproBaseDN)
+	groups2, err := conn.GetUserGroups(context.Background(), aldproUser2UID, aldproBaseDN)
 	require.NoError(t, err)
-	assert.NotContains(t, groups2, "admins")
+	assert.False(t, containsDN(groups2, "cn=admins"),
+		"user2 must not be in admins, got %v", groups2)
 }
 
 func TestIntegrationALDPro_GetUserGroups_UserNotFound(t *testing.T) {
 	conn := newALDProAuthConn(t)
 
-	_, err := conn.GetUserGroups("nobody", aldproBaseDN)
+	_, err := conn.GetUserGroups(context.Background(), "nobody", aldproBaseDN)
 	require.Error(t, err)
-	assert.True(t, errors.Is(err, ldapper.ErrNotFound))
+	assert.ErrorIs(t, err, ldapper.ErrNotFoundOrNotVisible)
 }
 
-// ---------------------------------------------------------------------------
-// GetOUUsers
-// ---------------------------------------------------------------------------
+// ================== GetOUUsers ==================
 
 func TestIntegrationALDPro_GetOUUsers_StandardOU(t *testing.T) {
 	conn := newALDProAuthConn(t)
 
-	users, err := conn.GetOUUsers("ou=users," + aldproBaseDN)
+	users, err := conn.GetOUUsers(context.Background(), "ou=users,"+aldproBaseDN)
 	require.NoError(t, err)
 	require.Len(t, users, 3) // user1, user2, svc-reader
 
@@ -835,63 +833,74 @@ func TestIntegrationALDPro_GetOUUsers_StandardOU(t *testing.T) {
 	for _, u := range users {
 		uids = append(uids, u.GetAttributeValue("uid"))
 	}
-	assert.ElementsMatch(t, []string{aldproUser1UID, aldproUser2UID, aldproSvcUID}, uids)
+	assert.ElementsMatch(t,
+		[]string{aldproUser1UID, aldproUser2UID, aldproSvcUID},
+		uids)
 }
 
 func TestIntegrationALDPro_GetOUUsers_ALDProOU(t *testing.T) {
 	conn := newALDProAuthConn(t)
 
-	users, err := conn.GetOUUsers("ou=departments," + aldproBaseDN)
+	users, err := conn.GetOUUsers(context.Background(), "ou=departments,"+aldproBaseDN)
 	require.NoError(t, err)
-	assert.Empty(t, users)
+	assert.Empty(t, users, "departments contains no users")
 }
 
 func TestIntegrationALDPro_GetOUUsers_NotInitialized(t *testing.T) {
 	conn := newALDProConn(t)
 	conn.Close()
 
-	_, err := conn.GetOUUsers("ou=users," + aldproBaseDN)
+	_, err := conn.GetOUUsers(context.Background(), "ou=users,"+aldproBaseDN)
 	require.Error(t, err)
-	assert.True(t, errors.Is(err, ldapper.ErrClosed))
+	assert.ErrorIs(t, err, ldapper.ErrClosed)
 }
 
-// ---------------------------------------------------------------------------
-// Search / dial limits
-// ---------------------------------------------------------------------------
+// ================== SearchLimits / DialTimeout / OperationTimeouts ==================
 
 func TestIntegrationALDPro_SearchLimits_Defaults(t *testing.T) {
 	conn := newALDProConn(t)
 	limits := conn.GetSearchLimits()
 	assert.Equal(t, 0, limits.SizeLimit)
 	assert.Equal(t, 30, limits.TimeLimit)
+	assert.True(t, limits.RequirePaging)
 }
 
 func TestIntegrationALDPro_SearchLimits_WithOption(t *testing.T) {
-	conn := newALDProConn(t, ldapper.WithSearchLimits(5, 10))
-	limits := conn.GetSearchLimits()
-	assert.Equal(t, 5, limits.SizeLimit)
-	assert.Equal(t, 10, limits.TimeLimit)
+	limits := ldapper.DefaultSearchLimits()
+	limits.SizeLimit = 5
+	limits.TimeLimit = 10
+
+	conn := newALDProConn(t, ldapper.WithSearchLimits(limits))
+
+	got := conn.GetSearchLimits()
+	assert.Equal(t, 5, got.SizeLimit)
+	assert.Equal(t, 10, got.TimeLimit)
 }
 
 func TestIntegrationALDPro_SearchLimits_SetAtRuntime(t *testing.T) {
 	conn := newALDProConn(t)
-	conn.SetSearchLimits(7, 11)
+
 	limits := conn.GetSearchLimits()
-	assert.Equal(t, 7, limits.SizeLimit)
-	assert.Equal(t, 11, limits.TimeLimit)
+	limits.SizeLimit = 7
+	limits.TimeLimit = 11
+	conn.SetSearchLimits(limits)
+
+	got := conn.GetSearchLimits()
+	assert.Equal(t, 7, got.SizeLimit)
+	assert.Equal(t, 11, got.TimeLimit)
 }
 
 func TestIntegrationALDPro_SearchLimits_NegativeClampedToZero(t *testing.T) {
 	conn := newALDProConn(t)
-	conn.SetSearchLimits(-1, -5)
-	limits := conn.GetSearchLimits()
-	assert.Equal(t, 0, limits.SizeLimit)
-	assert.Equal(t, 0, limits.TimeLimit)
+	conn.SetSearchLimits(ldapper.SearchLimits{SizeLimit: -1, TimeLimit: -5})
+	got := conn.GetSearchLimits()
+	assert.Equal(t, 0, got.SizeLimit)
+	assert.Equal(t, 0, got.TimeLimit)
 }
 
 func TestIntegrationALDPro_DialTimeout_Defaults(t *testing.T) {
 	conn := newALDProConn(t)
-	assert.Equal(t, time.Duration(0), conn.GetDialTimeout())
+	assert.Equal(t, constants.DefaultDialTimeout, conn.GetDialTimeout())
 }
 
 func TestIntegrationALDPro_DialTimeout_WithOption(t *testing.T) {
@@ -911,24 +920,46 @@ func TestIntegrationALDPro_DialTimeout_NegativeClampedToZero(t *testing.T) {
 	assert.Equal(t, time.Duration(0), conn.GetDialTimeout())
 }
 
+func TestIntegrationALDPro_OperationTimeout_WithOption(t *testing.T) {
+	conn := newALDProAuthConn(t, ldapper.WithOperationTimeout(ldapper.OperationTimeouts{
+		Bind:   5 * time.Second,
+		Search: 5 * time.Second,
+	}))
+
+	got := conn.GetOperationTimeout()
+	assert.Equal(t, 5*time.Second, got.Bind)
+	assert.Equal(t, 5*time.Second, got.Search)
+
+	_, err := conn.GetUser(context.Background(), aldproUser1UID, aldproBaseDN)
+	require.NoError(t, err)
+}
+
+// ================== Failure paths ==================
+
 func TestIntegrationALDPro_AuthenticateConn_FailedBind_InvalidatesState(t *testing.T) {
 	conn := newALDProConn(t)
 
-	_, err := conn.AuthenticateConn(aldproSvcDN, aldproSvcPass, aldproBaseDN)
+	_, err := conn.AuthenticateConn(context.Background(),
+		aldproSvcDN, aldproSvcPass, aldproBaseDN)
 	require.NoError(t, err)
 
-	_, err = conn.AuthenticateConn(aldproSvcDN, "wrong-password", aldproBaseDN)
+	_, err = conn.AuthenticateConn(context.Background(),
+		aldproSvcDN, "wrong-password", aldproBaseDN)
 	require.Error(t, err)
-	assert.True(t, errors.Is(err, ldapper.ErrInvalidCredentials))
+	assert.ErrorIs(t, err, ldapper.ErrInvalidCredentials)
 
-	_, err = conn.CheckUserCredentials(aldproUser1UID, aldproUser1Pass)
+	_, err = conn.CheckUserCredentials(context.Background(), aldproUser1UID, aldproUser1Pass)
 	require.Error(t, err)
-	assert.True(t, errors.Is(err, ldapper.ErrNotAuthenticated))
+	assert.ErrorIs(t, err, ldapper.ErrNotAuthenticated)
 }
 
+// Breaks svc-reader's password via direct LDAP Modify, then verifies that
+// Reconnect — which uses the stale cached password — fails and leaves the
+// client unusable (ErrClosed) instead of falling back to anonymous.
 func TestIntegrationALDPro_Reconnect_RebindFailure_ClosesConnection(t *testing.T) {
 	conn := newALDProConn(t)
-	_, err := conn.AuthenticateConn(aldproSvcDN, aldproSvcPass, aldproBaseDN)
+	_, err := conn.AuthenticateConn(context.Background(),
+		aldproSvcDN, aldproSvcPass, aldproBaseDN)
 	require.NoError(t, err)
 
 	rawConn, err := ldap.DialURL(fmt.Sprintf("ldap://%s:%d", aldproHost, aldproPort))
@@ -946,11 +977,17 @@ func TestIntegrationALDPro_Reconnect_RebindFailure_ClosesConnection(t *testing.T
 		_ = rawConn.Modify(restore)
 	})
 
-	err = conn.Reconnect()
+	err = conn.Reconnect(context.Background())
 	require.Error(t, err)
-	assert.True(t, errors.Is(err, ldapper.ErrInvalidCredentials))
+	assert.ErrorIs(t, err, ldapper.ErrInvalidCredentials)
 
-	if _, err := conn.GetUser(aldproUser1UID, aldproBaseDN); !errors.Is(err, ldapper.ErrClosed) {
-		t.Fatalf("expected ErrClosed after failed rebind, got %v", err)
-	}
+	_, err = conn.GetUser(context.Background(), aldproUser1UID, aldproBaseDN)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ldapper.ErrClosed,
+		"connection must not be usable after a failed rebind")
+
+	_, err = conn.CheckUserCredentials(context.Background(), aldproUser1UID, aldproUser1Pass)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ldapper.ErrClosed,
+		"connection is nil after failed rebind; requireConnLocked wins over requireAuthLocked")
 }

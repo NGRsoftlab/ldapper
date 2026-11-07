@@ -9,7 +9,11 @@ func attrValue(attrs map[string][]string, name string) string {
 	return ""
 }
 
-// firstAttrValue returns the first non-empty value of the named attribute, or ""
+// firstAttrValue returns the first value of the first named attribute
+// whose v[0] is non-empty, or "". It inspects only the leading value
+// of each attribute; an attribute whose first value is empty is
+// treated as "not set" and the search moves to the next alternative.
+// Within a single attribute's slice it does not skip empties.
 func firstAttrValue(attrs map[string][]string, names []string) string {
 	for _, n := range names {
 		if v := attrs[n]; len(v) > 0 && v[0] != "" {
@@ -29,8 +33,11 @@ func attrRawValue(attrs map[string][]string, name string) []byte {
 	return nil
 }
 
-// firstAttrRawValue returns the first non-empty raw value from the given
-// attribute alternatives, or nil if none.
+// firstAttrRawValue returns the first value of the first named attribute
+// whose v[0] is non-empty, or nil. It inspects only the leading value
+// of each attribute; an attribute whose first value is empty is
+// treated as "not set" and the search moves to the next alternative.
+// Within a single attribute's slice it does not skip empties.
 func firstAttrRawValue(attrs map[string][]string, names []string) []byte {
 	for _, n := range names {
 		if v := attrs[n]; len(v) > 0 && v[0] != "" {

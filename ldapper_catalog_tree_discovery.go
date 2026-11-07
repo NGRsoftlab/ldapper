@@ -2,6 +2,7 @@
 package ldapper
 
 import (
+	"context"
 	"fmt"
 
 	"github.com/go-ldap/ldap/v3"
@@ -28,19 +29,21 @@ import (
 // begins because LDAP does not expose a server-side depth parameter. To
 // bound memory for very large catalogs, set SearchLimits.MaxEntries.
 func (ldapper *LDAPper) WalkCatalogTree(
+	ctx context.Context,
 	baseDN string,
 	maxDepth int,
-	fn func(depth int, node *types.OUNormalizedInfo) error,
+	fn func(ctx context.Context, depth int, node *types.OUNormalizedInfo) error,
 ) error {
 	ldapper.opMu.Lock()
 	defer ldapper.opMu.Unlock()
-	return ldapper.walkCatalogTreeLocked(baseDN, maxDepth, fn)
+	return ldapper.walkCatalogTreeLocked(ctx, baseDN, maxDepth, fn)
 }
 
 func (ldapper *LDAPper) walkCatalogTreeLocked(
+	ctx context.Context,
 	baseDN string,
 	maxDepth int,
-	fn func(depth int, node *types.OUNormalizedInfo) error,
+	fn func(ctx context.Context, depth int, node *types.OUNormalizedInfo) error,
 ) error {
 	if fn == nil {
 		return fmt.Errorf("%w: nil callback", ErrInvalidArgument)
@@ -58,10 +61,11 @@ func (ldapper *LDAPper) walkCatalogTreeLocked(
 	// avoids reading the subtree. LDAP has no depth parameter, so for
 	// maxDepth > 1 the full subtree is fetched regardless.
 	if maxDepth == 1 {
-		return ldapper.walkSingleLevelLocked(dn, fn)
+		return ldapper.walkSingleLevelLocked(ctx, dn, fn)
 	}
 
 	entries, err := ldapper.searchPaged(
+		ctx,
 		dn.String(), ldap.ScopeWholeSubtree, ldap.NeverDerefAliases, false,
 		ldapper.catalogAdapter.OUObjectFilter(),
 		ldapper.catalogAdapter.OUAttrs(), nil)
@@ -74,7 +78,13 @@ func (ldapper *LDAPper) walkCatalogTreeLocked(
 	byDN := make(map[string]*types.OUNormalizedInfo, len(entries))
 	order := make([]string, 0, len(entries))
 
-	for _, e := range entries {
+	for i, e := range entries {
+		if i%256 == 0 { // avoid atomic load per iteration
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+		}
+
 		info := ldapper.catalogAdapter.GetNormalizedOUInfoFromEntry(*e)
 		if info == nil || info.DN == "" {
 			continue
@@ -98,7 +108,13 @@ func (ldapper *LDAPper) walkCatalogTreeLocked(
 
 	children := make(map[string][]string, len(byDN))
 	roots := make([]string, 0, len(byDN))
-	for _, key := range order {
+	for i, key := range order {
+		if i%256 == 0 {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+		}
+
 		info := byDN[key]
 		parentKey := canonicalDN(parentDNOf(info.DN))
 		if _, ok := byDN[parentKey]; ok {
@@ -114,7 +130,10 @@ func (ldapper *LDAPper) walkCatalogTreeLocked(
 			return nil
 		}
 		for _, key := range keys {
-			if err := fn(depth, byDN[key]); err != nil {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			if err := fn(ctx, depth, byDN[key]); err != nil {
 				return err
 			}
 			if err := walk(children[key], depth+1); err != nil {
@@ -131,10 +150,12 @@ func (ldapper *LDAPper) walkCatalogTreeLocked(
 // The server returns only the direct children of dn, so no parent-child
 // index is needed.
 func (ldapper *LDAPper) walkSingleLevelLocked(
+	ctx context.Context,
 	dn *ldap.DN,
-	fn func(depth int, node *types.OUNormalizedInfo) error,
+	fn func(ctx context.Context, depth int, node *types.OUNormalizedInfo) error,
 ) error {
 	entries, err := ldapper.searchPaged(
+		ctx,
 		dn.String(), ldap.ScopeSingleLevel, ldap.NeverDerefAliases, false,
 		ldapper.catalogAdapter.OUObjectFilter(),
 		ldapper.catalogAdapter.OUAttrs(), nil)
@@ -143,24 +164,34 @@ func (ldapper *LDAPper) walkSingleLevelLocked(
 	}
 
 	seen := make(map[string]struct{}, len(entries))
-	for _, e := range entries {
+	for i, e := range entries {
+		if i%256 == 0 {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+		}
+
 		info := ldapper.catalogAdapter.GetNormalizedOUInfoFromEntry(*e)
 		if info == nil || info.DN == "" {
 			continue
 		}
+
 		parsed, err := ldap.ParseDN(info.DN)
 		if err != nil {
 			continue
 		}
+
 		if !dn.AncestorOfFold(parsed) {
 			continue
 		}
+
 		key := canonicalDN(info.DN)
 		if _, dup := seen[key]; dup {
 			continue
 		}
+
 		seen[key] = struct{}{}
-		if err := fn(0, info); err != nil {
+		if err := fn(ctx, 0, info); err != nil {
 			return err
 		}
 	}
@@ -180,14 +211,14 @@ func (ldapper *LDAPper) walkSingleLevelLocked(
 // Nodes whose direct parent is not in the fetched set (e.g., entries
 // filtered out by the server due to ACL) are promoted to roots of the
 // result.
-func (ldapper *LDAPper) GetCatalogTree(baseDN string, maxDepth int) (types.CatalogTree, error) {
+func (ldapper *LDAPper) GetCatalogTree(ctx context.Context, baseDN string, maxDepth int) (types.CatalogTree, error) {
 	ldapper.opMu.Lock()
 	defer ldapper.opMu.Unlock()
 
-	return ldapper.getCatalogTreeLocked(baseDN, maxDepth)
+	return ldapper.getCatalogTreeLocked(ctx, baseDN, maxDepth)
 }
 
-func (ldapper *LDAPper) getCatalogTreeLocked(baseDN string, maxDepth int) (types.CatalogTree, error) {
+func (ldapper *LDAPper) getCatalogTreeLocked(ctx context.Context, baseDN string, maxDepth int) (types.CatalogTree, error) {
 	res := types.CatalogTree{Tree: make([]*types.OUNormalizedInfo, 0)}
 
 	// path[d] is the ancestor at depth d of the node currently being
@@ -196,8 +227,8 @@ func (ldapper *LDAPper) getCatalogTreeLocked(baseDN string, maxDepth int) (types
 	// current root down to the node's parent.
 	var path []*types.OUNormalizedInfo
 
-	err := ldapper.walkCatalogTreeLocked(baseDN, maxDepth,
-		func(depth int, node *types.OUNormalizedInfo) error {
+	err := ldapper.walkCatalogTreeLocked(ctx, baseDN, maxDepth,
+		func(ctx context.Context, depth int, node *types.OUNormalizedInfo) error {
 			if depth > len(path) {
 				// Internal invariant: walk delivers nodes in DFS order, so
 				// a node at depth D always has D ancestors already pushed.
@@ -235,17 +266,17 @@ func (ldapper *LDAPper) getCatalogTreeLocked(baseDN string, maxDepth int) (types
 	return res, nil
 }
 
-func (ldapper *LDAPper) ListSingleLevelOUs(rootDN string) ([]*types.OUNormalizedInfo, error) {
-	return ldapper.GetSubOUs(rootDN, ldap.ScopeSingleLevel)
+func (ldapper *LDAPper) ListSingleLevelOUs(ctx context.Context, rootDN string) ([]*types.OUNormalizedInfo, error) {
+	return ldapper.GetSubOUs(ctx, rootDN, ldap.ScopeSingleLevel)
 }
 
-func (ldapper *LDAPper) GetSubOUs(parentDN string, scope int) ([]*types.OUNormalizedInfo, error) {
+func (ldapper *LDAPper) GetSubOUs(ctx context.Context, parentDN string, scope int) ([]*types.OUNormalizedInfo, error) {
 	ldapper.opMu.Lock()
 	defer ldapper.opMu.Unlock()
-	return ldapper.getSubOUsLocked(parentDN, scope)
+	return ldapper.getSubOUsLocked(ctx, parentDN, scope)
 }
 
-func (ldapper *LDAPper) getSubOUsLocked(parentDN string, scope int) ([]*types.OUNormalizedInfo, error) {
+func (ldapper *LDAPper) getSubOUsLocked(ctx context.Context, parentDN string, scope int) ([]*types.OUNormalizedInfo, error) {
 	if err := ldapper.requireConnLocked(); err != nil {
 		return nil, err
 	}
@@ -265,6 +296,7 @@ func (ldapper *LDAPper) getSubOUsLocked(parentDN string, scope int) ([]*types.OU
 	parentKey := canonicalDN(parentDN) // canonicalDN parses internally
 
 	entries, err := ldapper.searchPaged(
+		ctx,
 		parentParsed.String(), scope, ldap.NeverDerefAliases, false,
 		ldapper.catalogAdapter.OUObjectFilter(),
 		ldapper.catalogAdapter.OUAttrs(), nil,
@@ -275,7 +307,14 @@ func (ldapper *LDAPper) getSubOUsLocked(parentDN string, scope int) ([]*types.OU
 
 	res := make([]*types.OUNormalizedInfo, 0, len(entries))
 	seen := make(map[string]struct{}, len(entries))
-	for _, entry := range entries {
+
+	for i, entry := range entries {
+		if i%256 == 0 {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+		}
+
 		info := ldapper.catalogAdapter.GetNormalizedOUInfoFromEntry(*entry)
 		if info == nil {
 			continue

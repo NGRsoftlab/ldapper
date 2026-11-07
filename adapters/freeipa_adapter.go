@@ -108,7 +108,7 @@ func (a FREEIPAAdapter) SearchUserGroupsFilterTemplateArgs(ldapUser types.LDAPUs
 }
 
 func (a FREEIPAAdapter) SearchOUFilterTemplate() string {
-	return "(&(|(objectClass=organizationalUnit)(objectClass=nsContainer))(ou=%[1]s))"
+	return "(&(|(objectClass=organizationalUnit)(objectClass=nsContainer))(|(ou=%[1]s)(cn=%[1]s)))"
 }
 
 func (a FREEIPAAdapter) SearchGroupFilterTemplate() string {

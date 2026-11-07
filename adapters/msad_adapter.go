@@ -2,6 +2,7 @@
 package adapters
 
 import (
+	"context"
 	"fmt"
 	"strings"
 
@@ -180,7 +181,11 @@ func (a MSADAdapter) GroupAttrs() []string {
 // ResolvePrimaryGroupDN resolves the DN of the primary group for an AD user.
 // It reads the domain objectSid, combines it with the user's primaryGroupID,
 // and searches for a group with the resulting objectSid.
-func (a MSADAdapter) ResolvePrimaryGroupDN(user types.LDAPUser, conn interfaces.LDAPConn) (string, error) {
+func (a MSADAdapter) ResolvePrimaryGroupDN(ctx context.Context, user types.LDAPUser, conn interfaces.LDAPConn) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+
 	pgidStr := user.GetAttributeValue("primaryGroupID")
 	if pgidStr == "" {
 		return "", nil // No primary group set, nothing to do.
@@ -202,6 +207,10 @@ func (a MSADAdapter) ResolvePrimaryGroupDN(user types.LDAPUser, conn interfaces.
 	var domainSidBytes []byte
 
 	for i := len(userDN.RDNs) - 1; i >= 0; i-- {
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
+
 		candidate := &ldap.DN{RDNs: userDN.RDNs[i:]}
 		req := ldap.NewSearchRequest(
 			candidate.String(),
@@ -212,6 +221,7 @@ func (a MSADAdapter) ResolvePrimaryGroupDN(user types.LDAPUser, conn interfaces.
 			[]string{"objectSid"},
 			nil,
 		)
+
 		res, err := conn.Search(req)
 		if err != nil {
 			// Network/server error — propagate immediately; the connection

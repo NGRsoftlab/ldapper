@@ -2,6 +2,7 @@
 package ldapper
 
 import (
+	"context"
 	"fmt"
 
 	"github.com/go-ldap/ldap/v3"
@@ -24,6 +25,7 @@ const (
 // validates inputs, builds the filter from the adapter template, and enforces
 // the 0 / 1 / >1 contract using SizeLimit=2. Caller must hold opMu.
 func (ldapper *LDAPper) searchSingleEntryLocked(
+	ctx context.Context,
 	kind lookupKind,
 	name, baseDN, filterTemplate string,
 	attributes []string,
@@ -49,7 +51,7 @@ func (ldapper *LDAPper) searchSingleEntryLocked(
 	)
 
 	// searchSingleEntryLocked — around the Search call:
-	res, err := ldapper.withTimeoutResult(ldapper.opTimeouts.Search, func() (*ldap.SearchResult, error) {
+	res, err := ldapper.withCtxResult(ctx, ldapper.opTimeouts.Search, func() (*ldap.SearchResult, error) {
 		return ldapper.connection.Search(req)
 	})
 	if err != nil {
@@ -110,6 +112,7 @@ func (ldapper *LDAPper) newSearchRequest(
 //   - RequirePaging   makes a missing paging control fatal (ErrPartialResult).
 //   - Repeated non-empty cookies are treated as a runaway server.
 func (ldapper *LDAPper) searchPaged(
+	ctx context.Context,
 	baseDN string,
 	scope int,
 	derefAliases int,
@@ -141,7 +144,12 @@ func (ldapper *LDAPper) searchPaged(
 	)
 
 	for {
+		if err := ctx.Err(); err != nil {
+			return allEntries, err
+		}
+
 		pageCount++
+
 		if maximum := ldapper.searchLimits.MaxPages; maximum > 0 && pageCount > maximum {
 			return allEntries, fmt.Errorf("%w: page budget exceeded (%d pages)",
 				ErrPartialResult, pageCount-1)
@@ -150,7 +158,7 @@ func (ldapper *LDAPper) searchPaged(
 		req := ldapper.newSearchRequest(baseDN, scope, derefAliases, typesOnly,
 			filter, attributes, pageControls)
 
-		result, err := ldapper.withTimeoutResult(ldapper.opTimeouts.Search, func() (*ldap.SearchResult, error) {
+		result, err := ldapper.withCtxResult(ctx, ldapper.opTimeouts.Search, func() (*ldap.SearchResult, error) {
 			return ldapper.connection.Search(req)
 		})
 		if err != nil {
@@ -161,9 +169,9 @@ func (ldapper *LDAPper) searchPaged(
 				if len(allEntries) > 0 {
 					return allEntries, fmt.Errorf("%w: %w", ErrPartialResult, err)
 				}
-				return nil, fmt.Errorf("%w: %w", ErrPartialResult, err)
+				return allEntries, fmt.Errorf("%w: %w", ErrPartialResult, err)
 			}
-			return nil, err
+			return allEntries, err
 		}
 
 		allEntries = append(allEntries, result.Entries...)
@@ -218,7 +226,7 @@ func (ldapper *LDAPper) searchPaged(
 // pre-built ldap.SearchRequest. Automatic paging is applied on top of the
 // request's controls.
 // NB: just public proxy-method for ldapper.searchPaged call with *ldap.SearchRequest param, automatic paging
-func (ldapper *LDAPper) CustomSearchPaged(searchRequest *ldap.SearchRequest) ([]*ldap.Entry, error) {
+func (ldapper *LDAPper) CustomSearchPaged(ctx context.Context, searchRequest *ldap.SearchRequest) ([]*ldap.Entry, error) {
 	if searchRequest == nil {
 		return nil, fmt.Errorf("%w: nil search request", ErrInvalidArgument)
 	}
@@ -227,6 +235,7 @@ func (ldapper *LDAPper) CustomSearchPaged(searchRequest *ldap.SearchRequest) ([]
 	defer ldapper.opMu.Unlock()
 
 	return ldapper.searchPaged(
+		ctx,
 		searchRequest.BaseDN,
 		searchRequest.Scope,
 		searchRequest.DerefAliases,
@@ -240,7 +249,7 @@ func (ldapper *LDAPper) CustomSearchPaged(searchRequest *ldap.SearchRequest) ([]
 // No paging, no search-limit overrides, no DN validation are applied —
 // the caller is responsible for the request semantics.
 // Use CustomSearchPaged if you want automatic paging.
-func (ldapper *LDAPper) CustomSearch(searchRequest *ldap.SearchRequest) (*ldap.SearchResult, error) {
+func (ldapper *LDAPper) CustomSearch(ctx context.Context, searchRequest *ldap.SearchRequest) (*ldap.SearchResult, error) {
 	ldapper.opMu.Lock()
 	defer ldapper.opMu.Unlock()
 
@@ -252,7 +261,7 @@ func (ldapper *LDAPper) CustomSearch(searchRequest *ldap.SearchRequest) (*ldap.S
 		return nil, fmt.Errorf("%w: nil search request", ErrInvalidArgument)
 	}
 
-	res, err := ldapper.withTimeoutResult(ldapper.opTimeouts.Search, func() (*ldap.SearchResult, error) {
+	res, err := ldapper.withCtxResult(ctx, ldapper.opTimeouts.Search, func() (*ldap.SearchResult, error) {
 		return ldapper.connection.Search(searchRequest)
 	})
 	if err != nil {

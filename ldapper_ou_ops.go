@@ -2,6 +2,8 @@
 package ldapper
 
 import (
+	"context"
+
 	"github.com/NGRsoftlab/ldapper/types"
 )
 
@@ -9,16 +11,17 @@ import (
 // Returns ErrNotFoundOrNotVisible if no entry matches — the object may
 // either not exist or be hidden by ACL. Returns ErrAmbiguousResult if
 // more than one matches.
-func (ldapper *LDAPper) GetOU(ou, baseDN string) (*types.LDAPOU, error) {
+func (ldapper *LDAPper) GetOU(ctx context.Context, ou, baseDN string) (*types.LDAPOU, error) {
 	ldapper.opMu.Lock()
 	defer ldapper.opMu.Unlock()
-	return ldapper.getOULocked(ou, baseDN)
+	return ldapper.getOULocked(ctx, ou, baseDN)
 }
 
-func (ldapper *LDAPper) getOULocked(ou, baseDN string) (*types.LDAPOU, error) {
+func (ldapper *LDAPper) getOULocked(ctx context.Context, ou, baseDN string) (*types.LDAPOU, error) {
 	attrs := ldapper.catalogAdapter.OUAttrs()
 
 	entry, err := ldapper.searchSingleEntryLocked(
+		ctx,
 		kindOU, ou, baseDN,
 		ldapper.catalogAdapter.SearchOUFilterTemplate(), attrs,
 	)

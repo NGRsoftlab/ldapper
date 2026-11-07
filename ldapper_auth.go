@@ -2,6 +2,7 @@
 package ldapper
 
 import (
+	"context"
 	"errors"
 	"fmt"
 
@@ -31,16 +32,23 @@ func (ldapper *LDAPper) invalidateAuthLocked() {
 // failure it closes the connection and invalidates auth state so that no
 // subsequent operation runs under an unverified identity. Returns nil on
 // success.
-func (ldapper *LDAPper) restoreServiceBindLocked() error {
-	err := ldapper.withTimeout(ldapper.opTimeouts.Bind, func() error {
+func (ldapper *LDAPper) restoreServiceBindLocked(ctx context.Context) error {
+	err := ldapper.withCtx(ctx, ldapper.opTimeouts.Bind, func() error {
 		return ldapper.connection.Bind(ldapper.bindUser, ldapper.bindPassword)
 	})
 	if err == nil {
 		return nil
 	}
-	_ = ldapper.connection.Close()
-	ldapper.connection = nil
+	if ldapper.connection != nil {
+		_ = ldapper.connection.Close()
+		ldapper.connection = nil
+	}
 	ldapper.invalidateAuthLocked()
+
+	if errors.Is(err, ErrClosed) {
+		return ErrNotAuthenticated
+	}
+
 	return classifySensitiveBindError(err)
 }
 
@@ -48,13 +56,13 @@ func (ldapper *LDAPper) restoreServiceBindLocked() error {
 // later reconnect and per-user checks. See CheckUserCredentials for verifying
 // an arbitrary user without disturbing the service session.
 // NB: if you need connection for futher catalog reading - pass read access granted user credentials here
-func (ldapper *LDAPper) AuthenticateConn(username, password, baseDN string) (*types.LDAPUser, error) {
+func (ldapper *LDAPper) AuthenticateConn(ctx context.Context, username, password, baseDN string) (*types.LDAPUser, error) {
 	ldapper.opMu.Lock()
 	defer ldapper.opMu.Unlock()
-	return ldapper.authenticateConnLocked(username, password, baseDN)
+	return ldapper.authenticateConnLocked(ctx, username, password, baseDN)
 }
 
-func (ldapper *LDAPper) authenticateConnLocked(username, password, baseDN string) (*types.LDAPUser, error) {
+func (ldapper *LDAPper) authenticateConnLocked(ctx context.Context, username, password, baseDN string) (*types.LDAPUser, error) {
 	if err := ldapper.requireConnLocked(); err != nil {
 		return nil, err
 	}
@@ -77,9 +85,13 @@ func (ldapper *LDAPper) authenticateConnLocked(username, password, baseDN string
 
 	// Bind with the adapter-supplied principal. A failed Bind invalidates
 	// cached state; a failed post-bind lookup closes the connection.
-	if err := ldapper.withTimeout(ldapper.opTimeouts.Bind, func() error {
+	if err := ldapper.withCtx(ctx, ldapper.opTimeouts.Bind, func() error {
 		return ldapper.connection.Bind(bindUsername, password)
 	}); err != nil {
+		if ldapper.connection != nil {
+			_ = ldapper.connection.Close()
+			ldapper.connection = nil
+		}
 		ldapper.invalidateAuthLocked()
 		return nil, classifySensitiveBindError(err)
 	}
@@ -87,10 +99,12 @@ func (ldapper *LDAPper) authenticateConnLocked(username, password, baseDN string
 	// Verify the bind principal by applying the adapter's user filter to
 	// the ORIGINAL login. The adapter's SearchUserFilterTemplate must
 	// accept every form it accepts in BindIdentity (see shipped adapters).
-	user, err := ldapper.getUserLocked(username, baseDN)
+	user, err := ldapper.getUserLocked(ctx, username, baseDN)
 	if err != nil {
-		_ = ldapper.connection.Close()
-		ldapper.connection = nil
+		if ldapper.connection != nil {
+			_ = ldapper.connection.Close()
+			ldapper.connection = nil
+		}
 		ldapper.invalidateAuthLocked()
 		return nil, err
 	}
@@ -109,7 +123,7 @@ func (ldapper *LDAPper) authenticateConnLocked(username, password, baseDN string
 // then restoring the service bind. Can only be used on an authenticated
 // connection whose bind user has read access to the directory.
 // NB: can not be used with non-authenticated conn or with non-read-access-granted bindUser in conn cfg
-func (ldapper *LDAPper) CheckUserCredentials(username, password string) (*types.LDAPUser, error) {
+func (ldapper *LDAPper) CheckUserCredentials(ctx context.Context, username, password string) (*types.LDAPUser, error) {
 	ldapper.opMu.Lock()
 	defer ldapper.opMu.Unlock()
 
@@ -120,7 +134,7 @@ func (ldapper *LDAPper) CheckUserCredentials(username, password string) (*types.
 		return nil, fmt.Errorf("%w: empty username/password", ErrInvalidArgument)
 	}
 
-	user, err := ldapper.getUserLocked(username, ldapper.bindDN)
+	user, err := ldapper.getUserLocked(ctx, username, ldapper.bindDN)
 	if err != nil {
 		if errors.Is(err, ErrNotFoundOrNotVisible) {
 			// Hide user existence — missing user must look like a wrong password.
@@ -129,15 +143,19 @@ func (ldapper *LDAPper) CheckUserCredentials(username, password string) (*types.
 		return nil, err
 	}
 
-	bindErr := ldapper.withTimeout(ldapper.opTimeouts.Bind, func() error {
+	bindErr := ldapper.withCtx(ctx, ldapper.opTimeouts.Bind, func() error {
 		return ldapper.connection.Bind(user.DN, password)
 	})
 
 	// Restore service session regardless of the user-bind outcome.
-	restoreErr := ldapper.restoreServiceBindLocked()
+	restoreErr := ldapper.restoreServiceBindLocked(ctx)
 
 	switch {
 	case bindErr != nil && restoreErr != nil:
+		if errors.Is(bindErr, context.Canceled) {
+			return nil, bindErr // cancel — not credential failure
+		}
+
 		// Both failed. Preserve the credential failure as primary (masking),
 		// note the rebind failure for diagnostics.
 		return nil, fmt.Errorf("%w (additionally: %v)",

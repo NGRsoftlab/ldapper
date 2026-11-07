@@ -2,6 +2,8 @@
 package interfaces
 
 import (
+	"context"
+
 	"github.com/go-ldap/ldap/v3"
 
 	"github.com/NGRsoftlab/ldapper/types"
@@ -59,5 +61,5 @@ type CatalogAdapter interface {
 type PrimaryGroupResolver interface {
 	// ResolvePrimaryGroupDN takes a user entry and returns the DN of the user's
 	// primary group. The ldapConn is provided for any extra LDAP searches needed.
-	ResolvePrimaryGroupDN(user types.LDAPUser, ldapConn LDAPConn) (string, error)
+	ResolvePrimaryGroupDN(ctx context.Context, user types.LDAPUser, ldapConn LDAPConn) (string, error)
 }

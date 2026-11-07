@@ -94,7 +94,7 @@ func (a ALDPROAdapter) SearchUserGroupsFilterTemplateArgs(ldapUser types.LDAPUse
 }
 
 func (a ALDPROAdapter) SearchOUFilterTemplate() string {
-	return "(&(|(objectClass=organizationalUnit)(objectClass=rbta-org-unit))(ou=%[1]s))"
+	return "(&(|(objectClass=organizationalUnit)(objectClass=rbta-org-unit))(|(ou=%[1]s)(cn=%[1]s)))"
 }
 
 func (a ALDPROAdapter) SearchGroupFilterTemplate() string {
@@ -142,6 +142,7 @@ func (a ALDPROAdapter) OUAttrs() []string {
 		"dn",
 		"ou",
 		"cn",
+		"objectClass",
 		"description",
 		"manager",
 	}
@@ -150,6 +151,7 @@ func (a ALDPROAdapter) OUAttrs() []string {
 func (a ALDPROAdapter) GroupAttrs() []string {
 	return []string{
 		"cn",
+		"objectClass",
 
 		"entrydn",
 		"description",

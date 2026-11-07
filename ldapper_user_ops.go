@@ -2,6 +2,7 @@
 package ldapper
 
 import (
+	"context"
 	"fmt"
 
 	"github.com/go-ldap/ldap/v3"
@@ -14,17 +15,18 @@ import (
 // Returns ErrNotFoundOrNotVisible if no entry matches — the user may
 // either not exist or be hidden by ACL. Never infer "user does not
 // exist" from this error in security-sensitive code.
-func (ldapper *LDAPper) GetUser(username, baseDN string) (*types.LDAPUser, error) {
+func (ldapper *LDAPper) GetUser(ctx context.Context, username, baseDN string) (*types.LDAPUser, error) {
 	ldapper.opMu.Lock()
 	defer ldapper.opMu.Unlock()
-	return ldapper.getUserLocked(username, baseDN)
+	return ldapper.getUserLocked(ctx, username, baseDN)
 }
 
 // getUserLocked searches for a single user by login. Caller must hold opMu.
-func (ldapper *LDAPper) getUserLocked(username, baseDN string) (*types.LDAPUser, error) {
+func (ldapper *LDAPper) getUserLocked(ctx context.Context, username, baseDN string) (*types.LDAPUser, error) {
 	attrs := ldapper.catalogAdapter.UserAttrs()
 
 	entry, err := ldapper.searchSingleEntryLocked(
+		ctx,
 		kindUser, username, baseDN,
 		ldapper.catalogAdapter.SearchUserFilterTemplate(), attrs,
 	)
@@ -53,15 +55,15 @@ func (ldapper *LDAPper) getUserLocked(username, baseDN string) (*types.LDAPUser,
 // consider caching at the caller level.
 // Returns ErrNotFoundOrNotVisible if the user lookup yields no entries
 // (not present or not visible to the bind identity).
-func (ldapper *LDAPper) GetUserGroups(username, baseDN string) ([]string, error) {
+func (ldapper *LDAPper) GetUserGroups(ctx context.Context, username, baseDN string) ([]string, error) {
 	ldapper.opMu.Lock()
 	defer ldapper.opMu.Unlock()
-	return ldapper.getUserGroupsLocked(username, baseDN)
+	return ldapper.getUserGroupsLocked(ctx, username, baseDN)
 }
 
 // NB: return list of user groups DNs
-func (ldapper *LDAPper) getUserGroupsLocked(username, baseDN string) ([]string, error) {
-	user, err := ldapper.getUserLocked(username, baseDN)
+func (ldapper *LDAPper) getUserGroupsLocked(ctx context.Context, username, baseDN string) ([]string, error) {
+	user, err := ldapper.getUserLocked(ctx, username, baseDN)
 	if err != nil {
 		return nil, err
 	}
@@ -73,6 +75,7 @@ func (ldapper *LDAPper) getUserGroupsLocked(username, baseDN string) ([]string, 
 
 	// NB: "1.1" tells the server to return only the DN; all we need here.
 	entries, err := ldapper.searchPaged(
+		ctx,
 		baseDN, ldap.ScopeWholeSubtree, ldap.NeverDerefAliases, false,
 		filter, []string{"1.1"}, nil,
 	)
@@ -94,9 +97,9 @@ func (ldapper *LDAPper) getUserGroupsLocked(username, baseDN string) ([]string, 
 	if resolver, ok := ldapper.catalogAdapter.(interfaces.PrimaryGroupResolver); ok {
 		var primaryGroupDN string
 
-		resolveErr := ldapper.withTimeout(ldapper.opTimeouts.Search, func() error {
+		resolveErr := ldapper.withCtx(ctx, ldapper.opTimeouts.Search, func() error {
 			var err error
-			primaryGroupDN, err = resolver.ResolvePrimaryGroupDN(*user, ldapper.connection)
+			primaryGroupDN, err = resolver.ResolvePrimaryGroupDN(ctx, *user, ldapper.connection)
 			return err
 		})
 
@@ -114,13 +117,13 @@ func (ldapper *LDAPper) getUserGroupsLocked(username, baseDN string) ([]string, 
 	return groups, nil
 }
 
-func (ldapper *LDAPper) GetOUUsers(ouDN string) ([]*types.LDAPUser, error) {
+func (ldapper *LDAPper) GetOUUsers(ctx context.Context, ouDN string) ([]*types.LDAPUser, error) {
 	ldapper.opMu.Lock()
 	defer ldapper.opMu.Unlock()
-	return ldapper.getOUUsersLocked(ouDN)
+	return ldapper.getOUUsersLocked(ctx, ouDN)
 }
 
-func (ldapper *LDAPper) getOUUsersLocked(ouDN string) ([]*types.LDAPUser, error) {
+func (ldapper *LDAPper) getOUUsersLocked(ctx context.Context, ouDN string) ([]*types.LDAPUser, error) {
 	if err := ldapper.requireConnLocked(); err != nil {
 		return nil, err
 	}
@@ -133,6 +136,7 @@ func (ldapper *LDAPper) getOUUsersLocked(ouDN string) ([]*types.LDAPUser, error)
 	}
 
 	entries, err := ldapper.searchPaged(
+		ctx,
 		ouDN, ldap.ScopeWholeSubtree, ldap.NeverDerefAliases, false,
 		filter, attributes, nil,
 	)

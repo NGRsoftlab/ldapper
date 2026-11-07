@@ -129,9 +129,17 @@ func classifyLDAPError(err error) error {
 		return fmt.Errorf("%w: %w", ErrNotFound, err)
 	}
 
+	// context.Canceled is safe to surface: it carries no credentials.
+	if errors.Is(err, context.Canceled) {
+		return err
+	}
+
+	// Handle net.ErrClosed before the general transport check so callers can
+	// distinguish "connection was closed" from "connection failed".
 	if errors.Is(err, net.ErrClosed) {
 		return fmt.Errorf("%w: %w", ErrClosed, err)
 	}
+
 	if isTransportError(err) {
 		if isTimeoutError(err) {
 			return fmt.Errorf("%w: %w", ErrTimeout, err)
@@ -162,6 +170,11 @@ func classifySensitiveBindError(err error) error {
 		return ErrUnavailable
 	case ldap.IsErrorWithCode(err, ldap.LDAPResultInsufficientAccessRights):
 		return ErrInsufficientAccess
+	}
+
+	// context.Canceled is safe to surface: it carries no credentials.
+	if errors.Is(err, context.Canceled) {
+		return err
 	}
 
 	// Handle net.ErrClosed before the general transport check so callers can

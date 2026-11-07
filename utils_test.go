@@ -2,8 +2,6 @@
 package ldapper
 
 import (
-	"testing"
-
 	"github.com/go-ldap/ldap/v3"
 
 	"github.com/NGRsoftlab/ldapper/mocks"
@@ -21,15 +19,6 @@ func newLDAPEntry(dn string, attrs map[string][]string) *ldap.Entry {
 		entry.Attributes = append(entry.Attributes, &ldap.EntryAttribute{Name: name, Values: values})
 	}
 	return entry
-}
-
-// withMockDialURL temporarily replaces the package-level dialURL with fn and
-// restores the original value when the test finishes.
-func withMockDialURL(t *testing.T, fn func(uri string, opts ...ldap.DialOpt) (*ldap.Conn, error)) {
-	t.Helper()
-	original := dialURL
-	dialURL = fn
-	t.Cleanup(func() { dialURL = original })
 }
 
 // mockOUs returns a mock connection whose SearchFunc returns the given entries

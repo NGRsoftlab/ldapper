@@ -4,19 +4,16 @@
 package ldapper
 
 import (
+	"context"
 	"crypto/tls"
 	"fmt"
 	"sync"
 	"time"
 
-	"github.com/go-ldap/ldap/v3"
-
 	"github.com/NGRsoftlab/ldapper/constants"
 	"github.com/NGRsoftlab/ldapper/interfaces"
 	"github.com/NGRsoftlab/ldapper/types"
 )
-
-var dialURL = ldap.DialURL
 
 type LDAPper struct {
 	opMu sync.Mutex // serializes all operations touching the LDAP connection
@@ -56,6 +53,7 @@ type LDAPper struct {
 // For LDAPS (useSSL=true) the flag has no effect.
 // NB: use useSSL=false with skipTLS=true only for dev/test purposes, not production
 func NewLDAPper(
+	ctx context.Context,
 	hosts []string,
 	port uint,
 	useSSL bool,
@@ -121,7 +119,7 @@ func NewLDAPper(
 	}
 
 	// NB: object is not published yet — no concurrent access is possible.
-	if err := ldapper.connectLocked(); err != nil {
+	if err := ldapper.connectLocked(ctx); err != nil {
 		return nil, err
 	}
 
@@ -135,6 +133,7 @@ func NewLDAPper(
 // NB: use WithDialTimeout(...) to override default dial timeout for connect/reconnect.
 // NB: use useSSL=false with skipTLS=true only for dev/test purposes, not production
 func NewAuthenticatedLDAPper(
+	ctx context.Context,
 	username, password, baseDN string,
 	hosts []string,
 	port uint,
@@ -148,12 +147,12 @@ func NewAuthenticatedLDAPper(
 		return nil, nil, fmt.Errorf("%w: empty bind username/password", ErrInvalidArgument)
 	}
 
-	ldapper, err := NewLDAPper(hosts, port, useSSL, skipTLS, tlsCfg, catalogAdapter, opts...)
+	ldapper, err := NewLDAPper(ctx, hosts, port, useSSL, skipTLS, tlsCfg, catalogAdapter, opts...)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	user, err := ldapper.AuthenticateConn(username, password, baseDN)
+	user, err := ldapper.AuthenticateConn(ctx, username, password, baseDN)
 	if err != nil {
 		ldapper.Close()
 		return nil, nil, err

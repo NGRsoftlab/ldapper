@@ -3,6 +3,7 @@ package mocks
 
 import (
 	"crypto/tls"
+	"sync"
 	"time"
 
 	"github.com/go-ldap/ldap/v3"
@@ -16,6 +17,7 @@ type MockLDAPConn struct {
 	CloseFunc      func() error
 	IsClosingFunc  func() bool
 	StartTLSFunc   func(config *tls.Config) error
+	closeOnce      sync.Once
 }
 
 func (m *MockLDAPConn) SetTimeout(d time.Duration) {
@@ -39,10 +41,13 @@ func (m *MockLDAPConn) Search(req *ldap.SearchRequest) (*ldap.SearchResult, erro
 }
 
 func (m *MockLDAPConn) Close() error {
-	if m.CloseFunc != nil {
-		return m.CloseFunc()
-	}
-	return nil
+	var err error
+	m.closeOnce.Do(func() {
+		if m.CloseFunc != nil {
+			err = m.CloseFunc()
+		}
+	})
+	return err
 }
 
 func (m *MockLDAPConn) IsClosing() bool {

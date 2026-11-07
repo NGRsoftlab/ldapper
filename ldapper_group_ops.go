@@ -2,6 +2,8 @@
 package ldapper
 
 import (
+	"context"
+
 	"github.com/NGRsoftlab/ldapper/types"
 )
 
@@ -9,16 +11,17 @@ import (
 // Returns ErrNotFoundOrNotVisible if no entry matches (the object may
 // either not exist or be hidden by ACL — LDAP cannot distinguish these),
 // and ErrAmbiguousResult if more than one does.
-func (ldapper *LDAPper) GetGroup(cn, baseDN string) (*types.LDAPGroup, error) {
+func (ldapper *LDAPper) GetGroup(ctx context.Context, cn, baseDN string) (*types.LDAPGroup, error) {
 	ldapper.opMu.Lock()
 	defer ldapper.opMu.Unlock()
-	return ldapper.getGroupLocked(cn, baseDN)
+	return ldapper.getGroupLocked(ctx, cn, baseDN)
 }
 
-func (ldapper *LDAPper) getGroupLocked(cn, baseDN string) (*types.LDAPGroup, error) {
+func (ldapper *LDAPper) getGroupLocked(ctx context.Context, cn, baseDN string) (*types.LDAPGroup, error) {
 	attrs := ldapper.catalogAdapter.GroupAttrs()
 
 	entry, err := ldapper.searchSingleEntryLocked(
+		ctx,
 		kindGroup, cn, baseDN,
 		ldapper.catalogAdapter.SearchGroupFilterTemplate(), attrs,
 	)

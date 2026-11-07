@@ -308,7 +308,7 @@ func TestMain(m *testing.M) {
 		os.Exit(1)
 	}
 
-	if err := seedALDProLDIF(aldproHost, aldproPort); err != nil {
+	if err := seedALDProWithRetry(aldproHost, aldproPort, 60*time.Second); err != nil {
 		_ = container.Terminate(ctx)
 		fmt.Fprintf(os.Stderr, "cannot seed LDAP data: %v\n", err)
 		os.Exit(1)
@@ -317,6 +317,60 @@ func TestMain(m *testing.M) {
 	code := m.Run()
 	_ = container.Terminate(ctx)
 	os.Exit(code)
+}
+
+// seedALDProLDIF as a safety net: if slapd restarts after seeding (which
+// osixia does in some builds), the mdb may be reinitialised and the seed
+// is lost. Detecting this and retrying the seed is cheaper than
+// understanding which internal restart point wait.ForLog matched.
+func waitForALDProData(host string, port uint, dn string, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		c, err := ldap.DialURL(fmt.Sprintf("ldap://%s:%d", host, port))
+		if err == nil {
+			if bindErr := c.Bind(aldproAdminDN, aldproAdminPass); bindErr == nil {
+				_, searchErr := c.Search(ldap.NewSearchRequest(
+					dn, ldap.ScopeBaseObject, ldap.NeverDerefAliases,
+					1, 0, false, "(objectClass=*)", []string{"1.1"}, nil))
+				_ = c.Close()
+				if searchErr == nil {
+					return true
+				}
+			} else {
+				_ = c.Close()
+			}
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	return false
+}
+
+// seedALDProWithRetry seeds the test fixtures and verifies that at least
+// one seeded entry is visible. If the entry disappears between the seed
+// and the verification (observed on osixia/openldap 1.5.0 when slapd
+// restarts and reinitialises the mdb), seed again — seedALDProLDIF is
+// idempotent, so this is safe and converges within a few iterations.
+func seedALDProWithRetry(host string, port uint, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	var lastErr error
+	for time.Now().Before(deadline) {
+		if err := seedALDProLDIF(host, port); err != nil {
+			lastErr = err
+			time.Sleep(500 * time.Millisecond)
+			continue
+		}
+		// cn=readers is the last entry in aldproSeedEntries, so its
+		// visibility implies every earlier entry was also written.
+		if waitForALDProData(host, port, "cn=readers,ou=groups,"+aldproBaseDN, 3*time.Second) {
+			return nil
+		}
+		lastErr = fmt.Errorf("seedALDProLDIF returned nil but cn=readers not visible")
+		time.Sleep(500 * time.Millisecond)
+	}
+	if lastErr != nil {
+		return lastErr
+	}
+	return fmt.Errorf("seed never became visible within %s", timeout)
 }
 
 // waitForALDProSchema polls the subschema until rbta-org-unit is present.

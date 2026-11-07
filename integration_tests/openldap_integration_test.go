@@ -17,7 +17,6 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -48,69 +47,113 @@ const (
 	openldapUser2Pass = "password2"
 )
 
-const openldapBootstrapLDIF = `dn: ou=users,dc=example,dc=org
-objectClass: organizationalUnit
-ou: users
+// openldapSeedEntries returns the entries the integration tests depend on.
+// Seeding is done from Go (not via osixia's bootstrap-LDIF loader) so the
+// timing is deterministic on CI runners, where the entrypoint's
+// "slapd starting" is logged before custom LDIFs are fully applied.
+func openldapSeedEntries() []struct {
+	dn    string
+	attrs map[string][]string
+} {
+	return []struct {
+		dn    string
+		attrs map[string][]string
+	}{
+		{"ou=users," + openldapBaseDN, map[string][]string{
+			"objectClass": {"organizationalUnit"},
+			"ou":          {"users"},
+		}},
+		{"ou=empty," + openldapBaseDN, map[string][]string{
+			"objectClass": {"organizationalUnit"},
+			"ou":          {"empty"},
+		}},
+		{"ou=groups," + openldapBaseDN, map[string][]string{
+			"objectClass": {"organizationalUnit"},
+			"ou":          {"groups"},
+		}},
+		{openldapUser1DN, map[string][]string{
+			"objectClass":   {"inetOrgPerson", "posixAccount"},
+			"cn":            {"user1"},
+			"sn":            {"User"},
+			"uid":           {"user1"},
+			"uidNumber":     {"1001"},
+			"gidNumber":     {"1001"},
+			"homeDirectory": {"/home/user1"},
+			"userPassword":  {openldapUser1Pass},
+			"mail":          {"user1@example.org"},
+			"displayName":   {"User One"},
+		}},
+		{openldapUser2DN, map[string][]string{
+			"objectClass":   {"inetOrgPerson", "posixAccount"},
+			"cn":            {"user2"},
+			"sn":            {"User"},
+			"uid":           {"user2"},
+			"uidNumber":     {"1002"},
+			"gidNumber":     {"1002"},
+			"homeDirectory": {"/home/user2"},
+			"userPassword":  {openldapUser2Pass},
+			"mail":          {"user2@example.org"},
+			"displayName":   {"User Two"},
+		}},
+		{"cn=dup1,ou=users," + openldapBaseDN, map[string][]string{
+			"objectClass":  {"inetOrgPerson"},
+			"cn":           {"dup1"},
+			"sn":           {"Dup"},
+			"uid":          {"duplicate"},
+			"userPassword": {"dup1pass"},
+		}},
+		{"cn=dup2,ou=users," + openldapBaseDN, map[string][]string{
+			"objectClass":  {"inetOrgPerson"},
+			"cn":           {"dup2"},
+			"sn":           {"Dup"},
+			"uid":          {"duplicate"},
+			"userPassword": {"dup2pass"},
+		}},
+		{"cn=admins,ou=groups," + openldapBaseDN, map[string][]string{
+			"objectClass": {"groupOfNames"},
+			"cn":          {"admins"},
+			"member":      {openldapUser1DN},
+		}},
+		{"cn=readers,ou=groups," + openldapBaseDN, map[string][]string{
+			"objectClass": {"posixGroup"},
+			"cn":          {"readers"},
+			"gidNumber":   {"2001"},
+			"memberUid":   {"user2"},
+		}},
+	}
+}
 
-dn: ou=empty,dc=example,dc=org
-objectClass: organizationalUnit
-ou: empty
-
-dn: ou=groups,dc=example,dc=org
-objectClass: organizationalUnit
-ou: groups
-
-dn: cn=user1,ou=users,dc=example,dc=org
-objectClass: inetOrgPerson
-objectClass: posixAccount
-cn: user1
-sn: User
-uid: user1
-uidNumber: 1001
-gidNumber: 1001
-homeDirectory: /home/user1
-userPassword: password1
-mail: user1@example.org
-displayName: User One
-
-dn: cn=user2,ou=users,dc=example,dc=org
-objectClass: inetOrgPerson
-objectClass: posixAccount
-cn: user2
-sn: User
-uid: user2
-uidNumber: 1002
-gidNumber: 1002
-homeDirectory: /home/user2
-userPassword: password2
-mail: user2@example.org
-displayName: User Two
-
-dn: cn=dup1,ou=users,dc=example,dc=org
-objectClass: inetOrgPerson
-cn: dup1
-sn: Dup
-uid: duplicate
-userPassword: dup1pass
-
-dn: cn=dup2,ou=users,dc=example,dc=org
-objectClass: inetOrgPerson
-cn: dup2
-sn: Dup
-uid: duplicate
-userPassword: dup2pass
-
-dn: cn=admins,ou=groups,dc=example,dc=org
-objectClass: groupOfNames
-cn: admins
-member: cn=user1,ou=users,dc=example,dc=org
-
-dn: cn=readers,ou=groups,dc=example,dc=org
-objectClass: posixGroup
-cn: readers
-gidNumber: 2001
-memberUid: user2
-`
+// seedOpenLDAPLDIF creates the LDAP entries required by the integration
+// tests. Idempotent: entries that already exist are skipped.
+func seedOpenLDAPLDIF(host string, port uint) error {
+	c, err := ldap.DialURL(fmt.Sprintf("ldap://%s:%d", host, port))
+	if err != nil {
+		return fmt.Errorf("dial: %w", err)
+	}
+	defer c.Close()
+	if err := c.Bind(openldapAdminDN, openldapAdminPass); err != nil {
+		return fmt.Errorf("bind: %w", err)
+	}
+	for _, e := range openldapSeedEntries() {
+		_, err := c.Search(ldap.NewSearchRequest(
+			e.dn, ldap.ScopeBaseObject, ldap.NeverDerefAliases,
+			1, 0, false, "(objectClass=*)", []string{"1.1"}, nil))
+		if err == nil {
+			continue // already present
+		}
+		if !ldap.IsErrorWithCode(err, ldap.LDAPResultNoSuchObject) {
+			return fmt.Errorf("search %s: %w", e.dn, err)
+		}
+		req := ldap.NewAddRequest(e.dn, nil)
+		for name, values := range e.attrs {
+			req.Attribute(name, values)
+		}
+		if err := c.Add(req); err != nil {
+			return fmt.Errorf("add %s: %w", e.dn, err)
+		}
+	}
+	return nil
+}
 
 var (
 	openldapHost string
@@ -121,39 +164,20 @@ var (
 func TestMain(m *testing.M) {
 	ctx := context.Background()
 
-	tmpDir, err := os.MkdirTemp("", "ldapper-openldap-*")
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "cannot create temp dir: %v\n", err)
-		os.Exit(1)
-	}
-	defer os.RemoveAll(tmpDir)
-
-	ldifPath := filepath.Join(tmpDir, "50-bootstrap.ldif")
-	if err := os.WriteFile(ldifPath, []byte(openldapBootstrapLDIF), 0o644); err != nil {
-		fmt.Fprintf(os.Stderr, "cannot write LDIF: %v\n", err)
-		os.Exit(1)
-	}
-
+	// No LDIF is mounted: the entrypoint's bootstrap loader is unreliable
+	// on CI (double-processing, early "slapd starting", etc.). Instead we
+	// seed entries from Go after the container is up — see
+	// seedOpenLDAPLDIF. This matches the ALDPro suite's approach.
 	req := testcontainers.ContainerRequest{
 		Image:        "osixia/openldap:1.5.0",
 		ExposedPorts: []string{"389/tcp"},
-		Cmd:          []string{"--copy-service"},
 		Env: map[string]string{
 			"LDAP_ORGANISATION":   "Example Org",
 			"LDAP_DOMAIN":         "example.org",
 			"LDAP_ADMIN_PASSWORD": openldapAdminPass,
 			"LDAP_TLS":            "false",
 		},
-		Mounts: testcontainers.ContainerMounts{
-			{
-				Source: testcontainers.GenericBindMountSource{HostPath: ldifPath},
-				Target: testcontainers.ContainerMountTarget(
-					"/container/service/slapd/assets/config/bootstrap/ldif/custom/50-bootstrap.ldif",
-				),
-				ReadOnly: true,
-			},
-		},
-		WaitingFor: wait.ForLog("slapd starting").WithStartupTimeout(90 * time.Second),
+		WaitingFor: wait.ForLog("slapd starting").WithStartupTimeout(120 * time.Second),
 	}
 
 	container, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
@@ -186,6 +210,12 @@ func TestMain(m *testing.M) {
 		os.Exit(1)
 	}
 
+	if err := seedOpenLDAPLDIF(openldapHost, openldapPort); err != nil {
+		_ = container.Terminate(ctx)
+		fmt.Fprintf(os.Stderr, "cannot seed LDAP data: %v\n", err)
+		os.Exit(1)
+	}
+
 	code := m.Run()
 	_ = container.Terminate(ctx)
 	os.Exit(code)
@@ -196,9 +226,9 @@ func waitForOpenLDAPReady(host string, port uint, timeout time.Duration) bool {
 	for time.Now().Before(deadline) {
 		c, err := ldap.DialURL(fmt.Sprintf("ldap://%s:%d", host, port))
 		if err == nil {
-			err = c.Bind(openldapAdminDN, openldapAdminPass)
+			bindErr := c.Bind(openldapAdminDN, openldapAdminPass)
 			_ = c.Close()
-			if err == nil {
+			if bindErr == nil {
 				return true
 			}
 		}

@@ -237,12 +237,14 @@ func TestMain(m *testing.M) {
 	req := testcontainers.ContainerRequest{
 		Image:        "osixia/openldap:1.5.0",
 		ExposedPorts: []string{"389/tcp"},
+		Cmd:          []string{"--copy-service"},
 		Env: map[string]string{
 			"LDAP_ORGANISATION":              "ALDPro Test",
 			"LDAP_DOMAIN":                    "aldpro.test",
 			"LDAP_ADMIN_PASSWORD":            aldproAdminPass,
 			"LDAP_TLS":                       "false",
 			"LDAP_REMOVE_CONFIG_AFTER_SETUP": "false",
+			"DISABLE_CHOWN":                  "true",
 		},
 		Mounts: testcontainers.ContainerMounts{
 			{
@@ -250,9 +252,10 @@ func TestMain(m *testing.M) {
 				Target: testcontainers.ContainerMountTarget(
 					"/container/service/slapd/assets/config/bootstrap/schema/custom",
 				),
+				ReadOnly: true,
 			},
 		},
-		WaitingFor: wait.ForLog("slapd starting").WithStartupTimeout(120 * time.Second),
+		WaitingFor: wait.ForListeningPort("389/tcp").WithStartupTimeout(120 * time.Second),
 	}
 
 	container, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{

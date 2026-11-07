@@ -194,6 +194,7 @@ func TestMain(m *testing.M) {
 			"LDAP_ORGANISATION":   "ALDPro Test",
 			"LDAP_DOMAIN":         "aldpro.test",
 			"LDAP_ADMIN_PASSWORD": aldproAdminPass,
+			"DISABLE_CHOWN":       "true",
 		},
 		Mounts: testcontainers.ContainerMounts{
 			testcontainers.ContainerMount{

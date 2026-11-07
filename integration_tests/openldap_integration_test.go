@@ -141,6 +141,7 @@ func TestMain(m *testing.M) {
 			"LDAP_ORGANISATION":   "Example Org",
 			"LDAP_DOMAIN":         "example.org",
 			"LDAP_ADMIN_PASSWORD": openldapAdminPass,
+			"DISABLE_CHOWN":       "true",
 		},
 		Mounts: testcontainers.ContainerMounts{
 			testcontainers.ContainerMount{

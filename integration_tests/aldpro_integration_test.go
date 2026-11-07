@@ -94,70 +94,116 @@ objectclass ( 1.3.6.1.4.1.99999.2.1
     MAY ( rbtadp $ description ) )
 `
 
-const aldproBootstrapLDIF = `dn: ou=users,dc=aldpro,dc=test
-objectClass: organizationalUnit
-ou: users
+// aldproSeedEntries returns the entries to seed after the container is up.
+//
+// We seed from Go instead of relying on osixia's bootstrap-LDIF loader:
+// that loader has been observed to double-process custom LDIFs on some
+// container builds (the exact trigger differs between Docker Desktop and
+// the Linux runner), producing "Already exists (68)" during startup.
+// Seeding from Go is idempotent and deterministic.
+func aldproSeedEntries() []struct {
+	dn    string
+	attrs map[string][]string
+} {
+	return []struct {
+		dn    string
+		attrs map[string][]string
+	}{
+		{"ou=users," + aldproBaseDN, map[string][]string{
+			"objectClass": {"organizationalUnit"},
+			"ou":          {"users"},
+		}},
+		{"ou=departments," + aldproBaseDN, map[string][]string{
+			"objectClass": {"rbta-org-unit"},
+			"ou":          {"departments"},
+			"rbtadp":      {"Department Container"},
+			"description": {"ALDPro-specific organizational unit"},
+		}},
+		{"ou=groups," + aldproBaseDN, map[string][]string{
+			"objectClass": {"organizationalUnit"},
+			"ou":          {"groups"},
+		}},
+		{"cn=user1,ou=users," + aldproBaseDN, map[string][]string{
+			"objectClass":   {"inetOrgPerson", "posixAccount"},
+			"cn":            {"user1"},
+			"sn":            {"User"},
+			"uid":           {"user1"},
+			"uidNumber":     {"1001"},
+			"gidNumber":     {"1001"},
+			"homeDirectory": {"/home/user1"},
+			"userPassword":  {aldproUser1Pass},
+			"mail":          {"user1@aldpro.test"},
+			"rbtadp":        {"Engineering"},
+		}},
+		{"cn=user2,ou=users," + aldproBaseDN, map[string][]string{
+			"objectClass":   {"inetOrgPerson", "posixAccount"},
+			"cn":            {"user2"},
+			"sn":            {"User"},
+			"uid":           {"user2"},
+			"uidNumber":     {"1002"},
+			"gidNumber":     {"1002"},
+			"homeDirectory": {"/home/user2"},
+			"userPassword":  {aldproUser2Pass},
+			"mail":          {"user2@aldpro.test"},
+			"rbtadp":        {"Sales"},
+		}},
+		{"cn=svc-reader,ou=users," + aldproBaseDN, map[string][]string{
+			"objectClass":   {"inetOrgPerson", "posixAccount"},
+			"cn":            {"svc-reader"},
+			"sn":            {"Reader"},
+			"uid":           {"svc-reader"},
+			"uidNumber":     {"1099"},
+			"gidNumber":     {"1099"},
+			"homeDirectory": {"/home/svc-reader"},
+			"userPassword":  {aldproSvcPass},
+			"mail":          {"svc-reader@aldpro.test"},
+			"rbtadp":        {"IT"},
+		}},
+		{"cn=admins,ou=groups," + aldproBaseDN, map[string][]string{
+			"objectClass": {"groupOfNames"},
+			"cn":          {"admins"},
+			"member":      {"cn=user1,ou=users," + aldproBaseDN},
+		}},
+		{"cn=readers,ou=groups," + aldproBaseDN, map[string][]string{
+			"objectClass": {"posixGroup"},
+			"cn":          {"readers"},
+			"gidNumber":   {"2001"},
+			"memberUid":   {"user2"},
+		}},
+	}
+}
 
-dn: ou=departments,dc=aldpro,dc=test
-objectClass: rbta-org-unit
-ou: departments
-rbtadp: Department Container
-description: ALDPro-specific organizational unit
-
-dn: ou=groups,dc=aldpro,dc=test
-objectClass: organizationalUnit
-ou: groups
-
-dn: cn=user1,ou=users,dc=aldpro,dc=test
-objectClass: inetOrgPerson
-objectClass: posixAccount
-cn: user1
-sn: User
-uid: user1
-uidNumber: 1001
-gidNumber: 1001
-homeDirectory: /home/user1
-userPassword: password1
-mail: user1@aldpro.test
-rbtadp: Engineering
-
-dn: cn=user2,ou=users,dc=aldpro,dc=test
-objectClass: inetOrgPerson
-objectClass: posixAccount
-cn: user2
-sn: User
-uid: user2
-uidNumber: 1002
-gidNumber: 1002
-homeDirectory: /home/user2
-userPassword: password2
-mail: user2@aldpro.test
-rbtadp: Sales
-
-dn: cn=svc-reader,ou=users,dc=aldpro,dc=test
-objectClass: inetOrgPerson
-objectClass: posixAccount
-cn: svc-reader
-sn: Reader
-uid: svc-reader
-uidNumber: 1099
-gidNumber: 1099
-homeDirectory: /home/svc-reader
-userPassword: svcpassword
-mail: svc-reader@aldpro.test
-rbtadp: IT
-
-dn: cn=admins,ou=groups,dc=aldpro,dc=test
-objectClass: groupOfNames
-cn: admins
-member: cn=user1,ou=users,dc=aldpro,dc=test
-
-dn: cn=readers,ou=groups,dc=aldpro,dc=test
-objectClass: posixGroup
-cn: readers
-gidNumber: 2001
-memberUid: user2
-`
+// seedALDProLDIF creates the LDAP entries required by the integration
+// tests. Idempotent: entries that already exist are skipped.
+func seedALDProLDIF(host string, port uint) error {
+	c, err := ldap.DialURL(fmt.Sprintf("ldap://%s:%d", host, port))
+	if err != nil {
+		return fmt.Errorf("dial: %w", err)
+	}
+	defer c.Close()
+	if err := c.Bind(aldproAdminDN, aldproAdminPass); err != nil {
+		return fmt.Errorf("bind: %w", err)
+	}
+	for _, e := range aldproSeedEntries() {
+		_, err := c.Search(ldap.NewSearchRequest(
+			e.dn, ldap.ScopeBaseObject, ldap.NeverDerefAliases,
+			1, 0, false, "(objectClass=*)", []string{"1.1"}, nil))
+		if err == nil {
+			continue // already present
+		}
+		if !ldap.IsErrorWithCode(err, ldap.LDAPResultNoSuchObject) {
+			return fmt.Errorf("search %s: %w", e.dn, err)
+		}
+		req := ldap.NewAddRequest(e.dn, nil)
+		for name, values := range e.attrs {
+			req.Attribute(name, values)
+		}
+		if err := c.Add(req); err != nil {
+			return fmt.Errorf("add %s: %w", e.dn, err)
+		}
+	}
+	return nil
+}
 
 var (
 	aldproHost string
@@ -175,21 +221,16 @@ func TestMain(m *testing.M) {
 	}
 	defer os.RemoveAll(tmpDir)
 
-	ldifDir := filepath.Join(tmpDir, "ldif")
+	// Only the custom schema is mounted; LDIF is seeded from Go code
+	// after the container is up — see seedALDProLDIF.
 	schemaDir := filepath.Join(tmpDir, "schema")
-	if err := os.MkdirAll(ldifDir, 0o755); err != nil {
-		os.Exit(1)
-	}
 	if err := os.MkdirAll(schemaDir, 0o755); err != nil {
-		os.Exit(1)
-	}
-
-	if err := os.WriteFile(filepath.Join(ldifDir, "50-aldpro.ldif"),
-		[]byte(aldproBootstrapLDIF), 0o644); err != nil {
+		fmt.Fprintf(os.Stderr, "cannot create schema dir: %v\n", err)
 		os.Exit(1)
 	}
 	if err := os.WriteFile(filepath.Join(schemaDir, "99-aldpro.schema"),
 		[]byte(aldproSchema), 0o644); err != nil {
+		fmt.Fprintf(os.Stderr, "cannot write schema: %v\n", err)
 		os.Exit(1)
 	}
 
@@ -203,12 +244,6 @@ func TestMain(m *testing.M) {
 			"LDAP_TLS":            "false",
 		},
 		Mounts: testcontainers.ContainerMounts{
-			{
-				Source: testcontainers.GenericBindMountSource{HostPath: ldifDir},
-				Target: testcontainers.ContainerMountTarget(
-					"/container/service/slapd/assets/config/bootstrap/ldif/custom",
-				),
-			},
 			{
 				Source: testcontainers.GenericBindMountSource{HostPath: schemaDir},
 				Target: testcontainers.ContainerMountTarget(
@@ -249,6 +284,12 @@ func TestMain(m *testing.M) {
 		os.Exit(1)
 	}
 
+	if err := seedALDProLDIF(aldproHost, aldproPort); err != nil {
+		_ = container.Terminate(ctx)
+		fmt.Fprintf(os.Stderr, "cannot seed LDAP data: %v\n", err)
+		os.Exit(1)
+	}
+
 	code := m.Run()
 	_ = container.Terminate(ctx)
 	os.Exit(code)
@@ -260,20 +301,10 @@ func waitForALDProReady(host string, port uint, timeout time.Duration) bool {
 		c, err := ldap.DialURL(fmt.Sprintf("ldap://%s:%d", host, port))
 		if err == nil {
 			bindErr := c.Bind(aldproAdminDN, aldproAdminPass)
-			if bindErr == nil {
-				req := ldap.NewSearchRequest(
-					"ou=departments,"+aldproBaseDN,
-					ldap.ScopeBaseObject, ldap.NeverDerefAliases,
-					0, 0, false,
-					"(objectClass=rbta-org-unit)",
-					[]string{"ou"}, nil,
-				)
-				if _, err := c.Search(req); err == nil {
-					_ = c.Close()
-					return true
-				}
-			}
 			_ = c.Close()
+			if bindErr == nil {
+				return true
+			}
 		}
 		time.Sleep(500 * time.Millisecond)
 	}

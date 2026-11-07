@@ -260,12 +260,16 @@ func TestMain(m *testing.M) {
 				),
 			},
 		},
-		// wait.ForLog alone can match the bootstrap-phase "slapd starting".
-		// The real guard against the race is waitForALDProSchema below.
-		WaitingFor: wait.ForAll(
-			wait.ForListeningPort("389/tcp"),
-			wait.ForLog("slapd starting"),
-		).WithStartupTimeout(120 * time.Second),
+		// osixia starts slapd TWICE: once during bootstrap (writes to a
+		// temporary mdb), once as the final serving instance. The custom
+		// schema is loaded into the bootstrap slapd, so waiting for either
+		// "slapd starting" or "port 389" alone fires during bootstrap and
+		// any data seeded at that moment is lost when the final slapd
+		// reinitialises the mdb. The second "slapd starting" is the only
+		// reliable signal that the serving instance is up.
+		WaitingFor: wait.ForLog("slapd starting").
+			WithOccurrence(2).
+			WithStartupTimeout(120 * time.Second),
 	}
 
 	container, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{

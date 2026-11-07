@@ -101,116 +101,77 @@ objectclass ( 1.3.6.1.4.1.99999.2.2
     MAY ( rbtadp ) )
 `
 
-// aldproSeedEntries returns the entries to seed after the container is up.
-//
-// We seed from Go instead of relying on osixia's bootstrap-LDIF loader:
-// that loader has been observed to double-process custom LDIFs on some
-// container builds (the exact trigger differs between Docker Desktop and
-// the Linux runner), producing "Already exists (68)" during startup.
-// Seeding from Go is idempotent and deterministic.
-func aldproSeedEntries() []struct {
-	dn    string
-	attrs map[string][]string
-} {
-	return []struct {
-		dn    string
-		attrs map[string][]string
-	}{
-		{"ou=users," + aldproBaseDN, map[string][]string{
-			"objectClass": {"organizationalUnit"},
-			"ou":          {"users"},
-		}},
-		{"ou=departments," + aldproBaseDN, map[string][]string{
-			"objectClass": {"rbta-org-unit"},
-			"ou":          {"departments"},
-			"rbtadp":      {"Department Container"},
-			"description": {"ALDPro-specific organizational unit"},
-		}},
-		{"ou=groups," + aldproBaseDN, map[string][]string{
-			"objectClass": {"organizationalUnit"},
-			"ou":          {"groups"},
-		}},
-		{"cn=user1,ou=users," + aldproBaseDN, map[string][]string{
-			"objectClass":   {"inetOrgPerson", "posixAccount", "rbta-user"},
-			"cn":            {"user1"},
-			"sn":            {"User"},
-			"uid":           {"user1"},
-			"uidNumber":     {"1001"},
-			"gidNumber":     {"1001"},
-			"homeDirectory": {"/home/user1"},
-			"userPassword":  {aldproUser1Pass},
-			"mail":          {"user1@aldpro.test"},
-			"rbtadp":        {"Engineering"},
-		}},
-		{"cn=user2,ou=users," + aldproBaseDN, map[string][]string{
-			"objectClass":   {"inetOrgPerson", "posixAccount", "rbta-user"},
-			"cn":            {"user2"},
-			"sn":            {"User"},
-			"uid":           {"user2"},
-			"uidNumber":     {"1002"},
-			"gidNumber":     {"1002"},
-			"homeDirectory": {"/home/user2"},
-			"userPassword":  {aldproUser2Pass},
-			"mail":          {"user2@aldpro.test"},
-			"rbtadp":        {"Sales"},
-		}},
-		{"cn=svc-reader,ou=users," + aldproBaseDN, map[string][]string{
-			"objectClass":   {"inetOrgPerson", "posixAccount", "rbta-user"},
-			"cn":            {"svc-reader"},
-			"sn":            {"Reader"},
-			"uid":           {"svc-reader"},
-			"uidNumber":     {"1099"},
-			"gidNumber":     {"1099"},
-			"homeDirectory": {"/home/svc-reader"},
-			"userPassword":  {aldproSvcPass},
-			"mail":          {"svc-reader@aldpro.test"},
-			"rbtadp":        {"IT"},
-		}},
-		{"cn=admins,ou=groups," + aldproBaseDN, map[string][]string{
-			"objectClass": {"groupOfNames"},
-			"cn":          {"admins"},
-			"member":      {"cn=user1,ou=users," + aldproBaseDN},
-		}},
-		{"cn=readers,ou=groups," + aldproBaseDN, map[string][]string{
-			"objectClass": {"posixGroup"},
-			"cn":          {"readers"},
-			"gidNumber":   {"2001"},
-			"memberUid":   {"user2"},
-		}},
-	}
-}
+// aldproBootstrapLDIF mirrors the fixture set exercised by ALDPROAdapter.
+// It is mounted into bootstrap/ldif/custom and loaded by osixia's
+// entrypoint during bootstrap, before the final slapd starts. This is
+// atomic — no seed-then-restart race.
+const aldproBootstrapLDIF = `dn: ou=users,dc=aldpro,dc=test
+objectClass: organizationalUnit
+ou: users
 
-// seedALDProLDIF creates the LDAP entries required by the integration
-// tests. Idempotent: entries that already exist are skipped.
-func seedALDProLDIF(host string, port uint) error {
-	c, err := ldap.DialURL(fmt.Sprintf("ldap://%s:%d", host, port))
-	if err != nil {
-		return fmt.Errorf("dial: %w", err)
-	}
-	defer c.Close()
-	if err := c.Bind(aldproAdminDN, aldproAdminPass); err != nil {
-		return fmt.Errorf("bind: %w", err)
-	}
-	for _, e := range aldproSeedEntries() {
-		_, err := c.Search(ldap.NewSearchRequest(
-			e.dn, ldap.ScopeBaseObject, ldap.NeverDerefAliases,
-			1, 0, false, "(objectClass=*)", []string{"1.1"}, nil))
-		if err == nil {
-			continue // already present
-		}
-		if !ldap.IsErrorWithCode(err, ldap.LDAPResultNoSuchObject) {
-			return fmt.Errorf("search %s: %w", e.dn, err)
-		}
-		req := ldap.NewAddRequest(e.dn, nil)
-		for name, values := range e.attrs {
-			req.Attribute(name, values)
-		}
-		if err := c.Add(req); err != nil {
-			return fmt.Errorf("add %s: %w", e.dn, err)
-		}
-	}
-	return nil
-}
+dn: ou=departments,dc=aldpro,dc=test
+objectClass: rbta-org-unit
+ou: departments
+rbtadp: Department Container
+description: ALDPro-specific organizational unit
+
+dn: ou=groups,dc=aldpro,dc=test
+objectClass: organizationalUnit
+ou: groups
+
+dn: cn=user1,ou=users,dc=aldpro,dc=test
+objectClass: inetOrgPerson
+objectClass: posixAccount
+objectClass: rbta-user
+cn: user1
+sn: User
+uid: user1
+uidNumber: 1001
+gidNumber: 1001
+homeDirectory: /home/user1
+userPassword: password1
+mail: user1@aldpro.test
+rbtadp: Engineering
+
+dn: cn=user2,ou=users,dc=aldpro,dc=test
+objectClass: inetOrgPerson
+objectClass: posixAccount
+objectClass: rbta-user
+cn: user2
+sn: User
+uid: user2
+uidNumber: 1002
+gidNumber: 1002
+homeDirectory: /home/user2
+userPassword: password2
+mail: user2@aldpro.test
+rbtadp: Sales
+
+dn: cn=svc-reader,ou=users,dc=aldpro,dc=test
+objectClass: inetOrgPerson
+objectClass: posixAccount
+objectClass: rbta-user
+cn: svc-reader
+sn: Reader
+uid: svc-reader
+uidNumber: 1099
+gidNumber: 1099
+homeDirectory: /home/svc-reader
+userPassword: svcpassword
+mail: svc-reader@aldpro.test
+rbtadp: IT
+
+dn: cn=admins,ou=groups,dc=aldpro,dc=test
+objectClass: groupOfNames
+cn: admins
+member: cn=user1,ou=users,dc=aldpro,dc=test
+
+dn: cn=readers,ou=groups,dc=aldpro,dc=test
+objectClass: posixGroup
+cn: readers
+gidNumber: 2001
+memberUid: user2
+`
 
 var (
 	aldproHost string
@@ -228,11 +189,18 @@ func TestMain(m *testing.M) {
 	}
 	defer os.RemoveAll(tmpDir)
 
-	// Only the custom schema is mounted; LDIF is seeded from Go code
-	// after the container is up — see seedALDProLDIF.
+	// Schema and LDIF are both mounted as directories; entrypoint loads
+	// them atomically during bootstrap, before the final slapd starts.
+	// This eliminates the seed-then-restart race that seedALDProLDIF via
+	// Go cannot beat on osixia/openldap:1.5.0.
 	schemaDir := filepath.Join(tmpDir, "schema")
+	ldifDir := filepath.Join(tmpDir, "ldif")
 	if err := os.MkdirAll(schemaDir, 0o755); err != nil {
 		fmt.Fprintf(os.Stderr, "cannot create schema dir: %v\n", err)
+		os.Exit(1)
+	}
+	if err := os.MkdirAll(ldifDir, 0o755); err != nil {
+		fmt.Fprintf(os.Stderr, "cannot create ldif dir: %v\n", err)
 		os.Exit(1)
 	}
 	if err := os.WriteFile(filepath.Join(schemaDir, "99-aldpro.schema"),
@@ -240,17 +208,21 @@ func TestMain(m *testing.M) {
 		fmt.Fprintf(os.Stderr, "cannot write schema: %v\n", err)
 		os.Exit(1)
 	}
+	if err := os.WriteFile(filepath.Join(ldifDir, "50-aldpro.ldif"),
+		[]byte(aldproBootstrapLDIF), 0o644); err != nil {
+		fmt.Fprintf(os.Stderr, "cannot write LDIF: %v\n", err)
+		os.Exit(1)
+	}
 
 	req := testcontainers.ContainerRequest{
 		Image:        "osixia/openldap:1.5.0",
 		ExposedPorts: []string{"389/tcp"},
 		Env: map[string]string{
-			"LDAP_ORGANISATION":              "ALDPro Test",
-			"LDAP_DOMAIN":                    "aldpro.test",
-			"LDAP_ADMIN_PASSWORD":            aldproAdminPass,
-			"LDAP_TLS":                       "false",
-			"LDAP_REMOVE_CONFIG_AFTER_SETUP": "false",
-			"DISABLE_CHOWN":                  "true",
+			"LDAP_ORGANISATION":   "ALDPro Test",
+			"LDAP_DOMAIN":         "aldpro.test",
+			"LDAP_ADMIN_PASSWORD": aldproAdminPass,
+			"LDAP_TLS":            "false",
+			"DISABLE_CHOWN":       "true",
 		},
 		Mounts: testcontainers.ContainerMounts{
 			{
@@ -259,13 +231,16 @@ func TestMain(m *testing.M) {
 					"/container/service/slapd/assets/config/bootstrap/schema/custom",
 				),
 			},
+			{
+				Source: testcontainers.GenericBindMountSource{HostPath: ldifDir},
+				Target: testcontainers.ContainerMountTarget(
+					"/container/service/slapd/assets/config/bootstrap/ldif/custom",
+				),
+			},
 		},
-		// In the log, "slapd starting" appears exactly once, and only after
-		// "First start is done..." — i.e. it's the FINAL serving slapd, not the
-		// bootstrap instance (which prints "Start OpenLDAP..." instead).
-		// So plain wait.ForLog is the correct signal: it guarantees that the
-		// final slapd is up and the mdb we're about to seed is the one tests
-		// will read.
+		// wait.ForLog matches the final serving slapd (bootstrap prints
+		// "Start OpenLDAP..." instead, per osixia 1.5.0 logs). By the
+		// time this fires, custom schema and LDIF are already loaded.
 		WaitingFor: wait.ForLog("slapd starting").WithStartupTimeout(120 * time.Second),
 	}
 
@@ -295,22 +270,24 @@ func TestMain(m *testing.M) {
 
 	if !waitForALDProReady(aldproHost, aldproPort, 60*time.Second) {
 		_ = container.Terminate(ctx)
-		fmt.Fprintln(os.Stderr, "OpenLDAP (ALDPro schema) did not become ready")
+		fmt.Fprintln(os.Stderr, "OpenLDAP (ALDPro) admin bind did not succeed within 60s")
 		os.Exit(1)
 	}
 
-	// The schema is loaded asynchronously (bootstrap slapd is stopped and
-	// restarted with the custom schema). Poll for rbta-org-unit before
-	// seeding, otherwise ou=departments fails with "Invalid Attribute Syntax".
+	// Sanity: rbta-org-unit must be in subschema; otherwise ou=departments
+	// (rbta-org-unit) will not have been added.
 	if !waitForALDProSchema(aldproHost, aldproPort, 60*time.Second) {
 		_ = container.Terminate(ctx)
 		fmt.Fprintln(os.Stderr, "rbta-org-unit not present in subschema after 60s")
 		os.Exit(1)
 	}
 
-	if err := seedALDProWithRetry(aldproHost, aldproPort, 60*time.Second); err != nil {
+	// Sanity: at least one LDIF entry is visible. If this fails, entrypoint
+	// did not load 50-aldpro.ldif — check container logs.
+	if !waitForALDProData(aldproHost, aldproPort,
+		"cn=readers,ou=groups,"+aldproBaseDN, 30*time.Second) {
 		_ = container.Terminate(ctx)
-		fmt.Fprintf(os.Stderr, "cannot seed LDAP data: %v\n", err)
+		fmt.Fprintln(os.Stderr, "50-aldpro.ldif entries not visible after 30s")
 		os.Exit(1)
 	}
 
@@ -343,34 +320,6 @@ func waitForALDProData(host string, port uint, dn string, timeout time.Duration)
 		time.Sleep(500 * time.Millisecond)
 	}
 	return false
-}
-
-// seedALDProWithRetry seeds the test fixtures and verifies that at least
-// one seeded entry is visible. If the entry disappears between the seed
-// and the verification (observed on osixia/openldap 1.5.0 when slapd
-// restarts and reinitialises the mdb), seed again — seedALDProLDIF is
-// idempotent, so this is safe and converges within a few iterations.
-func seedALDProWithRetry(host string, port uint, timeout time.Duration) error {
-	deadline := time.Now().Add(timeout)
-	var lastErr error
-	for time.Now().Before(deadline) {
-		if err := seedALDProLDIF(host, port); err != nil {
-			lastErr = err
-			time.Sleep(500 * time.Millisecond)
-			continue
-		}
-		// cn=readers is the last entry in aldproSeedEntries, so its
-		// visibility implies every earlier entry was also written.
-		if waitForALDProData(host, port, "cn=readers,ou=groups,"+aldproBaseDN, 3*time.Second) {
-			return nil
-		}
-		lastErr = fmt.Errorf("seedALDProLDIF returned nil but cn=readers not visible")
-		time.Sleep(500 * time.Millisecond)
-	}
-	if lastErr != nil {
-		return lastErr
-	}
-	return fmt.Errorf("seed never became visible within %s", timeout)
 }
 
 // waitForALDProSchema polls the subschema until rbta-org-unit is present.

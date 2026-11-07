@@ -175,47 +175,45 @@ func TestMain(m *testing.M) {
 	}
 	defer os.RemoveAll(tmpDir)
 
-	// ── два подкаталога: ldif и schema ──────────────────────────────
 	ldifDir := filepath.Join(tmpDir, "ldif")
 	schemaDir := filepath.Join(tmpDir, "schema")
 	if err := os.MkdirAll(ldifDir, 0o755); err != nil {
-		fmt.Fprintf(os.Stderr, "cannot create ldif dir: %v\n", err)
 		os.Exit(1)
 	}
 	if err := os.MkdirAll(schemaDir, 0o755); err != nil {
-		fmt.Fprintf(os.Stderr, "cannot create schema dir: %v\n", err)
 		os.Exit(1)
 	}
 
-	if err := os.WriteFile(filepath.Join(schemaDir, "99-aldpro.schema"), []byte(aldproSchema), 0o644); err != nil {
-		fmt.Fprintf(os.Stderr, "cannot write schema: %v\n", err)
+	if err := os.WriteFile(filepath.Join(ldifDir, "50-aldpro.ldif"),
+		[]byte(aldproBootstrapLDIF), 0o644); err != nil {
 		os.Exit(1)
 	}
-	if err := os.WriteFile(filepath.Join(ldifDir, "50-aldpro.ldif"), []byte(aldproBootstrapLDIF), 0o644); err != nil {
-		fmt.Fprintf(os.Stderr, "cannot write LDIF: %v\n", err)
+	if err := os.WriteFile(filepath.Join(schemaDir, "99-aldpro.schema"),
+		[]byte(aldproSchema), 0o644); err != nil {
 		os.Exit(1)
 	}
 
 	req := testcontainers.ContainerRequest{
 		Image:        "osixia/openldap:1.5.0",
 		ExposedPorts: []string{"389/tcp"},
-		Cmd:          []string{"--copy-service"},
 		Env: map[string]string{
-			"LDAP_ORGANISATION":              "ALDPro Test",
-			"LDAP_DOMAIN":                    "aldpro.test",
-			"LDAP_ADMIN_PASSWORD":            aldproAdminPass,
-			"DISABLE_CHOWN":                  "true",
-			"LDAP_REMOVE_CONFIG_AFTER_SETUP": "false",
-			"LDAP_TLS":                       "false",
-			// ── ключевые переменные ─────────────────────────────────
-			"LDAP_SEED_INTERNAL_LDIF_PATH":   "/seed/ldif",
-			"LDAP_SEED_INTERNAL_SCHEMA_PATH": "/seed/schema",
+			"LDAP_ORGANISATION":   "ALDPro Test",
+			"LDAP_DOMAIN":         "aldpro.test",
+			"LDAP_ADMIN_PASSWORD": aldproAdminPass,
+			"LDAP_TLS":            "false",
 		},
 		Mounts: testcontainers.ContainerMounts{
 			{
-				Source: testcontainers.GenericBindMountSource{HostPath: tmpDir},
-				Target: testcontainers.ContainerMountTarget("/seed"),
-				// без ReadOnly — entrypoint копирует файлы из /seed
+				Source: testcontainers.GenericBindMountSource{HostPath: ldifDir},
+				Target: testcontainers.ContainerMountTarget(
+					"/container/service/slapd/assets/config/bootstrap/ldif/custom",
+				),
+			},
+			{
+				Source: testcontainers.GenericBindMountSource{HostPath: schemaDir},
+				Target: testcontainers.ContainerMountTarget(
+					"/container/service/slapd/assets/config/bootstrap/schema/custom",
+				),
 			},
 		},
 		WaitingFor: wait.ForLog("slapd starting").WithStartupTimeout(120 * time.Second),

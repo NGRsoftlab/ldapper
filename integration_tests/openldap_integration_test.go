@@ -17,7 +17,6 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -126,30 +125,30 @@ func TestMain(m *testing.M) {
 		fmt.Fprintf(os.Stderr, "cannot create temp dir: %v\n", err)
 		os.Exit(1)
 	}
-	defer os.RemoveAll(ldifDir)
+	defer os.RemoveAll(tmpDir)
 
-	ldifDir := filepath.Join(tmpDir, "ldif")
-	if err := os.MkdirAll(ldifDir, 0o755); err != nil { /* ... */
+	if err := os.WriteFile(tmpDir, []byte(openldapBootstrapLDIF), 0o644); err != nil {
+		fmt.Fprintf(os.Stderr, "cannot write LDIF: %v\n", err)
+		os.Exit(1)
 	}
-	os.WriteFile(filepath.Join(ldifDir, "50-bootstrap.ldif"), []byte(openldapBootstrapLDIF), 0o644)
 
 	req := testcontainers.ContainerRequest{
 		Image:        "osixia/openldap:1.5.0",
 		ExposedPorts: []string{"389/tcp"},
 		Cmd:          []string{"--copy-service"},
 		Env: map[string]string{
-			"LDAP_ORGANISATION":              "Example Org",
-			"LDAP_DOMAIN":                    "example.org",
-			"LDAP_ADMIN_PASSWORD":            openldapAdminPass,
-			"DISABLE_CHOWN":                  "true",
-			"LDAP_REMOVE_CONFIG_AFTER_SETUP": "false",
-			"LDAP_TLS":                       "false",
-			"LDAP_SEED_INTERNAL_LDIF_PATH":   "/seed/ldif",
+			"LDAP_ORGANISATION":   "Example Org",
+			"LDAP_DOMAIN":         "example.org",
+			"LDAP_ADMIN_PASSWORD": openldapAdminPass,
+			"LDAP_TLS":            "false",
 		},
 		Mounts: testcontainers.ContainerMounts{
 			{
 				Source: testcontainers.GenericBindMountSource{HostPath: tmpDir},
-				Target: testcontainers.ContainerMountTarget("/seed"),
+				Target: testcontainers.ContainerMountTarget(
+					"/container/service/slapd/assets/config/bootstrap/ldif/custom/50-bootstrap.ldif",
+				),
+				ReadOnly: true,
 			},
 		},
 		WaitingFor: wait.ForLog("slapd starting").WithStartupTimeout(90 * time.Second),

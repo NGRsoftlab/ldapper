@@ -177,7 +177,14 @@ func TestMain(m *testing.M) {
 			"LDAP_ADMIN_PASSWORD": openldapAdminPass,
 			"LDAP_TLS":            "false",
 		},
-		WaitingFor: wait.ForLog("slapd starting").WithStartupTimeout(120 * time.Second),
+		// Wait for the LDAP port, not for the log line. osixia's entrypoint
+		// prints "slapd starting" twice — once for the bootstrap-phase slapd
+		// (which only listens on ldapi:/// and writes to a temporary mdb) and
+		// once for the final serving slapd (which opens :389 against the
+		// persistent mdb). wait.ForLog matches the first occurrence, so tests
+		// would start while bootstrap is still in progress and any entries
+		// seeded at that moment would be discarded with the temp mdb.
+		WaitingFor: wait.ForListeningPort("389/tcp").WithStartupTimeout(120 * time.Second),
 	}
 
 	container, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{

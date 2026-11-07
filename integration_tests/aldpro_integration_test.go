@@ -197,21 +197,14 @@ func TestMain(m *testing.M) {
 			"LDAP_ADMIN_PASSWORD":            aldproAdminPass,
 			"DISABLE_CHOWN":                  "true",
 			"LDAP_REMOVE_CONFIG_AFTER_SETUP": "false",
+			"LDAP_TLS":                       "false",
+			"LDAP_SEED_INTERNAL_LDIF_PATH":   "/seed/ldif",
+			"LDAP_SEED_INTERNAL_SCHEMA_PATH": "/seed/schema",
 		},
 		Mounts: testcontainers.ContainerMounts{
 			testcontainers.ContainerMount{
-				Source: testcontainers.GenericBindMountSource{HostPath: schemaPath},
-				Target: testcontainers.ContainerMountTarget(
-					"/container/service/slapd/assets/config/bootstrap/schema/99-aldpro.schema",
-				),
-				ReadOnly: true,
-			},
-			testcontainers.ContainerMount{
-				Source: testcontainers.GenericBindMountSource{HostPath: ldifPath},
-				Target: testcontainers.ContainerMountTarget(
-					"/container/service/slapd/assets/config/bootstrap/ldif/custom/50-aldpro.ldif",
-				),
-				ReadOnly: true,
+				Source: testcontainers.GenericBindMountSource{HostPath: tmpDir},
+				Target: "/seed",
 			},
 		},
 		WaitingFor: wait.ForLog("slapd starting").WithStartupTimeout(120 * time.Second),

@@ -1,7 +1,7 @@
 # LDAPper
 
 [![Go Reference](https://pkg.go.dev/badge/github.com/NGRsoftlab/ldapper.svg)](https://pkg.go.dev/github.com/NGRsoftlab/ldapper)
-[![Go Report Card](https://goreportcard.com/badge/github.com/NGRsoftlab/ldapper)](https://goreportcard.com/report/github.com/NGRsoftlab/ldapper)
+[![Lint](https://github.com/NGRsoftlab/ldapper/actions/workflows/lint.yml/badge.svg)](https://github.com/NGRsoftlab/ldapper/actions/workflows/lint.yml)
 [![Tests](https://github.com/NGRsoftlab/ldapper/actions/workflows/test.yml/badge.svg)](https://github.com/NGRsoftlab/ldapper/actions/workflows/test.yml)
 [![Integration tests](https://github.com/NGRsoftlab/ldapper/actions/workflows/integration.yml/badge.svg)](https://github.com/NGRsoftlab/ldapper/actions/workflows/integration.yml)
 [![Coverage](https://codecov.io/gh/NGRsoftlab/ldapper/branch/main/graph/badge.svg)](https://codecov.io/gh/NGRsoftlab/ldapper)

@@ -736,7 +736,8 @@ func TestIntegrationMSAD_AuthenticateConn_FailedBind_InvalidatesState(t *testing
 
 	_, err = conn.CheckUserCredentials(context.Background(), msadUser1SAM, msadUser1Pass)
 	require.Error(t, err)
-	assert.ErrorIs(t, err, ldapper.ErrNotAuthenticated)
+	assert.ErrorIs(t, err, ldapper.ErrClosed,
+		"post-failed-bind connection is nil; requireConnLocked fires before the auth check")
 }
 
 // Breaks user1's password via samba-tool, verifies that Reconnect fails on

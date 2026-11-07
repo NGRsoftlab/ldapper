@@ -843,8 +843,8 @@ func TestIntegrationOpenLDAP_AuthenticateConn_FailedBind_InvalidatesState(t *tes
 
 	_, err = conn.CheckUserCredentials(context.Background(), openldapUser2UID, openldapUser2Pass)
 	require.Error(t, err)
-	assert.ErrorIs(t, err, ldapper.ErrNotAuthenticated,
-		"post-failed-bind connection must not be treated as authenticated")
+	assert.ErrorIs(t, err, ldapper.ErrClosed,
+		"post-failed-bind connection is nil; requireConnLocked fires before the auth check")
 }
 
 // Breaks user1's password via direct LDAP Modify, then verifies that

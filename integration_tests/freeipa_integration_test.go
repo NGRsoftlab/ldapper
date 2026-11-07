@@ -762,7 +762,8 @@ func TestIntegrationFreeIPA_AuthenticateConn_FailedBind_InvalidatesState(t *test
 
 	_, err = conn.CheckUserCredentials(context.Background(), freeipaUser1UID, freeipaUser1Pass)
 	require.Error(t, err)
-	assert.ErrorIs(t, err, ldapper.ErrNotAuthenticated)
+	assert.ErrorIs(t, err, ldapper.ErrClosed,
+		"post-failed-bind connection is nil; requireConnLocked fires before the auth check")
 }
 
 // Reconnect-after-rebind-failure requires breaking a user's password so the

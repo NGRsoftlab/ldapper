@@ -92,6 +92,16 @@ objectclass ( 1.3.6.1.4.1.99999.2.1
     SUP organizationalUnit
     STRUCTURAL
     MAY ( rbtadp $ description ) )
+
+# Auxiliary extension for user entries: rbtadp is only allowed on
+# objectClasses that explicitly MAY it. rbta-org-unit is structural and
+# cannot be combined with inetOrgPerson, so user entries need this
+# auxiliary class instead.
+objectclass ( 1.3.6.1.4.1.99999.2.2
+    NAME 'rbta-user'
+    DESC 'ALDPro user extensions'
+    AUXILIARY
+    MAY ( rbtadp ) )
 `
 
 // aldproSeedEntries returns the entries to seed after the container is up.
@@ -124,7 +134,7 @@ func aldproSeedEntries() []struct {
 			"ou":          {"groups"},
 		}},
 		{"cn=user1,ou=users," + aldproBaseDN, map[string][]string{
-			"objectClass":   {"inetOrgPerson", "posixAccount"},
+			"objectClass":   {"inetOrgPerson", "posixAccount", "rbta-user"},
 			"cn":            {"user1"},
 			"sn":            {"User"},
 			"uid":           {"user1"},
@@ -136,7 +146,7 @@ func aldproSeedEntries() []struct {
 			"rbtadp":        {"Engineering"},
 		}},
 		{"cn=user2,ou=users," + aldproBaseDN, map[string][]string{
-			"objectClass":   {"inetOrgPerson", "posixAccount"},
+			"objectClass":   {"inetOrgPerson", "posixAccount", "rbta-user"},
 			"cn":            {"user2"},
 			"sn":            {"User"},
 			"uid":           {"user2"},
@@ -148,7 +158,7 @@ func aldproSeedEntries() []struct {
 			"rbtadp":        {"Sales"},
 		}},
 		{"cn=svc-reader,ou=users," + aldproBaseDN, map[string][]string{
-			"objectClass":   {"inetOrgPerson", "posixAccount"},
+			"objectClass":   {"inetOrgPerson", "posixAccount", "rbta-user"},
 			"cn":            {"svc-reader"},
 			"sn":            {"Reader"},
 			"uid":           {"svc-reader"},
@@ -990,7 +1000,8 @@ func TestIntegrationALDPro_AuthenticateConn_FailedBind_InvalidatesState(t *testi
 
 	_, err = conn.CheckUserCredentials(context.Background(), aldproUser1UID, aldproUser1Pass)
 	require.Error(t, err)
-	assert.ErrorIs(t, err, ldapper.ErrNotAuthenticated)
+	assert.ErrorIs(t, err, ldapper.ErrClosed,
+		"post-failed-bind connection is nil; requireConnLocked fires before the auth check")
 }
 
 // Breaks svc-reader's password via direct LDAP Modify, then verifies that

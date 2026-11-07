@@ -247,6 +247,7 @@ func TestMain(m *testing.M) {
 	req := testcontainers.ContainerRequest{
 		Image:        "osixia/openldap:1.5.0",
 		ExposedPorts: []string{"389/tcp"},
+		Cmd:          []string{"--copy-service"},
 		Env: map[string]string{
 			"LDAP_ORGANISATION":              "ALDPro Test",
 			"LDAP_DOMAIN":                    "aldpro.test",
@@ -257,10 +258,13 @@ func TestMain(m *testing.M) {
 		},
 		Mounts: testcontainers.ContainerMounts{
 			{
-				Source: testcontainers.GenericBindMountSource{HostPath: schemaDir},
+				Source: testcontainers.GenericBindMountSource{
+					HostPath: filepath.Join(schemaDir, "99-aldpro.schema"),
+				},
 				Target: testcontainers.ContainerMountTarget(
-					"/container/service/slapd/assets/config/bootstrap/schema/custom",
+					"/container/service/slapd/assets/config/bootstrap/schema/custom/99-aldpro.schema",
 				),
+				ReadOnly: true,
 			},
 		},
 		WaitingFor: wait.ForListeningPort("389/tcp").WithStartupTimeout(120 * time.Second),

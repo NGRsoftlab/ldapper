@@ -281,13 +281,18 @@ func TestMain(m *testing.M) {
 				),
 			},
 		},
-		// Wait for the LDAP port, not for the log line. osixia's entrypoint
-		// prints "slapd starting" twice — once for the bootstrap-phase slapd
-		// (which only listens on ldapi:/// and writes to a temporary mdb) and
-		// once for the final serving slapd (which opens :389 against the
-		// persistent mdb). wait.ForLog matches the first occurrence, so tests
-		// would start while bootstrap is still in progress.
-		WaitingFor: wait.ForListeningPort("389/tcp").WithStartupTimeout(120 * time.Second),
+		// Wait for BOTH the final slapd's log line AND the LDAP port.
+		// osixia's entrypoint prints "slapd starting" twice — once for the
+		// bootstrap-phase slapd (temp mdb, ldapi:/// only) and once for the
+		// final serving slapd (opens :389 against the persistent mdb).
+		// Requiring the SECOND occurrence guarantees bootstrap is complete;
+		// wait.ForListeningPort alone fired too early on CI runners, letting
+		// seeding land in the temporary mdb that gets discarded when the
+		// final slapd starts.
+		WaitingFor: wait.ForAll(
+			wait.ForLog("slapd starting").WithOccurrence(2),
+			wait.ForListeningPort("389/tcp"),
+		).WithStartupTimeout(180 * time.Second),
 	}
 
 	container, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
@@ -333,6 +338,16 @@ func TestMain(m *testing.M) {
 	if err := seedALDPro(aldproHost, aldproPort); err != nil {
 		_ = container.Terminate(ctx)
 		fmt.Fprintf(os.Stderr, "cannot seed ALDPro entries: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Sanity check: verify each step of the search path independently so
+	// that a failure here names the exact subsystem (base visibility,
+	// svc-reader bind, subtree scope, entryDN filter) rather than
+	// surfacing later as an opaque ErrNotFound from within AuthenticateConn.
+	if err := verifyALDProState(); err != nil {
+		_ = container.Terminate(ctx)
+		fmt.Fprintf(os.Stderr, "ALDPro post-seed verification failed: %v\n", err)
 		os.Exit(1)
 	}
 
@@ -389,6 +404,79 @@ func waitForALDProReady(host string, port uint, timeout time.Duration) bool {
 		time.Sleep(500 * time.Millisecond)
 	}
 	return false
+}
+
+// verifyALDProState checks that every LDAP operation the test suite relies
+// on works from the perspective of both the admin and svc-reader. When a
+// step fails, the error identifies exactly which one, so the next debugging
+// round does not need to guess (base not visible / svc-reader bind rejected
+// / subtree scope broken / entryDN filter rejected).
+func verifyALDProState() error {
+	dial := func() (*ldap.Conn, error) {
+		return ldap.DialURL(fmt.Sprintf("ldap://%s:%d", aldproHost, aldproPort))
+	}
+
+	// 1) Admin can see the base object itself.
+	c1, err := dial()
+	if err != nil {
+		return fmt.Errorf("admin dial: %w", err)
+	}
+	defer c1.Close()
+	if err := c1.Bind(aldproAdminDN, aldproAdminPass); err != nil {
+		return fmt.Errorf("admin bind: %w", err)
+	}
+	if _, err := c1.Search(ldap.NewSearchRequest(
+		aldproBaseDN, ldap.ScopeBaseObject, ldap.NeverDerefAliases,
+		0, 30, false, "(objectClass=*)", []string{"dn"}, nil,
+	)); err != nil {
+		return fmt.Errorf("admin base search at %q: %w", aldproBaseDN, err)
+	}
+
+	// 2) Admin can see the svc-reader entry that was just seeded.
+	res, err := c1.Search(ldap.NewSearchRequest(
+		aldproSvcDN, ldap.ScopeBaseObject, ldap.NeverDerefAliases,
+		0, 30, false, "(objectClass=*)", []string{"cn"}, nil,
+	))
+	if err != nil {
+		return fmt.Errorf("admin svc-reader search at %q: %w", aldproSvcDN, err)
+	}
+	if len(res.Entries) == 0 {
+		return fmt.Errorf("admin search: svc-reader entry %q not present after seed", aldproSvcDN)
+	}
+
+	// 3) svc-reader can bind with the seeded password.
+	c2, err := dial()
+	if err != nil {
+		return fmt.Errorf("svc-reader dial: %w", err)
+	}
+	defer c2.Close()
+	if err := c2.Bind(aldproSvcDN, aldproSvcPass); err != nil {
+		return fmt.Errorf("svc-reader bind: %w", err)
+	}
+
+	// 4) svc-reader can search the base subtree with a simple filter
+	// (no entryDN, no compound objectClass union).
+	if _, err := c2.Search(ldap.NewSearchRequest(
+		aldproBaseDN, ldap.ScopeWholeSubtree, ldap.NeverDerefAliases,
+		0, 30, false, "(objectClass=inetOrgPerson)", []string{"cn"}, nil,
+	)); err != nil {
+		return fmt.Errorf("svc-reader simple subtree search: %w", err)
+	}
+
+	// 5) svc-reader can search with the adapter's actual user filter.
+	// This is the exact filter that AuthenticateConn → getUserLocked issues;
+	// if it fails here, the adapter template (entryDN arm, objectClass
+	// union) is what breaks the auth flow.
+	tmpl := aldproAdpt.SearchUserFilterTemplate()
+	filter := fmt.Sprintf(tmpl, ldap.EscapeFilter(aldproSvcDN))
+	if _, err := c2.Search(ldap.NewSearchRequest(
+		aldproBaseDN, ldap.ScopeWholeSubtree, ldap.NeverDerefAliases,
+		2, 30, false, filter, aldproAdpt.UserAttrs(), nil,
+	)); err != nil {
+		return fmt.Errorf("svc-reader adapter-filter search failed (filter=%q): %w", filter, err)
+	}
+
+	return nil
 }
 
 func containsDN(groups []string, needle string) bool {
@@ -460,10 +548,7 @@ func TestIntegrationALDPro_SearchUserGroupsFilterTemplateArgs_ReturnsDNThenUID(t
 }
 
 // ALDROAdapter must not implement PrimaryGroupResolver: there is no
-// primaryGroupID concept in the ALDPro schema. Uses the real interface
-// from the interfaces package — the previous inline `any` guard was
-// ineffective because any real implementation would use LDAPConn as the
-// third parameter type, not any.
+// primaryGroupID concept in the ALDPro schema.
 var _ = func() any {
 	var c any = adapters.ALDPROAdapter{}
 	if _, ok := c.(interfaces.PrimaryGroupResolver); ok {

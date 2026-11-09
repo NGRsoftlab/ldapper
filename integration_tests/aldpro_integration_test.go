@@ -33,10 +33,17 @@ package ldapper_test
 // ALDROAdapter does NOT implement PrimaryGroupResolver — GetUserGroups
 // returns only membership-based groups.
 //
-// Auth-path note:
-//   ALDPROAdapter.BindIdentity is pass-through (like MSAD), so binding by
-//   full DN works. The osixia admin is a simpleSecurityObject that does not
-//   match UserFilter; tests use a dedicated svc-reader inetOrgPerson.
+// Auth-path / ACL note:
+//   osixia/openldap ships with `olcAccess: to * by * none` for non-admin
+//   identities — only the root DN reads. On a non-root bind, a search under
+//   the base DN returns LDAP Result Code 32 (noSuchObject) rather than an
+//   "insufficient access" error, because every entry is hidden from the
+//   reader. Tests exercise AuthenticateConn and GetUser from a real
+//   authenticated non-root identity (svc-reader), so the suite applies a
+//   permissive ACL through cn=config right after startup:
+//     `to * by self write by users read by * none`.
+//   Without this the auth-path searches would all fail with ErrNotFound
+//   even though the data is present.
 //
 // Run with:
 //   go test -tags=integration_aldpro ./...
@@ -71,6 +78,13 @@ const (
 	aldproBaseDN    = "dc=aldpro,dc=test"
 	aldproAdminDN   = "cn=admin,dc=aldpro,dc=test"
 	aldproAdminPass = "adminpassword"
+
+	// cn=admin,cn=config is the config-DB administrator. osixia creates it
+	// with LDAP_CONFIG_PASSWORD when set, otherwise falls back to
+	// LDAP_ADMIN_PASSWORD. The suite sets LDAP_CONFIG_PASSWORD explicitly so
+	// this DN is deterministic; applyALDProACL binds as it to rewrite
+	// olcAccess.
+	aldproConfigDN = "cn=admin,cn=config"
 
 	aldproUser1DN   = "cn=user1,ou=users,dc=aldpro,dc=test"
 	aldproUser1UID  = "user1"
@@ -122,15 +136,235 @@ objectclass ( 1.3.6.1.4.1.99999.2.2
     MAY ( rbtadp ) )
 `
 
+var (
+	aldproHost string
+	aldproPort uint
+	aldproAdpt = adapters.ALDPROAdapter{}
+)
+
+func TestMain(m *testing.M) {
+	ctx := context.Background()
+
+	// Only schema is mounted: it must be present when slapd starts, so it
+	// goes through osixia's bootstrap/schema/custom path. Data is seeded
+	// from Go after the port is listening (see seedALDPro).
+	tmpDir, err := os.MkdirTemp("", "ldapper-aldpro-*")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "cannot create temp dir: %v\n", err)
+		os.Exit(1)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	schemaDir := filepath.Join(tmpDir, "schema")
+	if err := os.MkdirAll(schemaDir, 0o755); err != nil {
+		fmt.Fprintf(os.Stderr, "cannot create schema dir: %v\n", err)
+		os.Exit(1)
+	}
+	if err := os.WriteFile(filepath.Join(schemaDir, "99-aldpro.schema"),
+		[]byte(aldproSchema), 0o644); err != nil {
+		fmt.Fprintf(os.Stderr, "cannot write schema: %v\n", err)
+		os.Exit(1)
+	}
+
+	req := testcontainers.ContainerRequest{
+		Image:        "osixia/openldap:1.5.0",
+		ExposedPorts: []string{"389/tcp"},
+		Cmd:          []string{"--copy-service"},
+		Env: map[string]string{
+			"LDAP_ORGANISATION":   "ALDPro Test",
+			"LDAP_DOMAIN":         "aldpro.test",
+			"LDAP_ADMIN_PASSWORD": aldproAdminPass,
+			// LDAP_CONFIG_PASSWORD makes cn=admin,cn=config's password
+			// deterministic. applyALDProACL binds as that DN to rewrite
+			// olcAccess; without it osixia's fallback behaviour is
+			// undocumented and varies between releases.
+			"LDAP_CONFIG_PASSWORD":           aldproAdminPass,
+			"LDAP_TLS":                       "false",
+			"DISABLE_CHOWN":                  "true",
+			"LDAP_REMOVE_CONFIG_AFTER_SETUP": "false",
+		},
+		Mounts: testcontainers.ContainerMounts{
+			{
+				Source: testcontainers.GenericBindMountSource{HostPath: schemaDir},
+				Target: testcontainers.ContainerMountTarget(
+					"/container/service/slapd/assets/config/bootstrap/schema/custom",
+				),
+			},
+		},
+		// Wait for the LDAP port. On osixia/openldap:1.5.0 the "slapd
+		// starting" log line is emitted only once — by the final serving
+		// slapd, after bootstrap LDIFs have been applied. The bootstrap
+		// slapd (temp mdb, ldapi:/// only) logs "Waiting for OpenLDAP to
+		// start..." instead, so wait.ForLog would match the final phase
+		// anyway; ForListeningPort is simpler and equivalent here.
+		WaitingFor: wait.ForListeningPort("389/tcp").WithStartupTimeout(120 * time.Second),
+	}
+
+	container, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
+		ContainerRequest: req,
+		Started:          true,
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "cannot start OpenLDAP for ALDPro tests: %v\n", err)
+		os.Exit(1)
+	}
+
+	aldproHost, err = container.Host(ctx)
+	if err != nil {
+		_ = container.Terminate(ctx)
+		fmt.Fprintf(os.Stderr, "cannot resolve host: %v\n", err)
+		os.Exit(1)
+	}
+
+	mappedPort, err := container.MappedPort(ctx, "389")
+	if err != nil {
+		_ = container.Terminate(ctx)
+		fmt.Fprintf(os.Stderr, "cannot resolve port: %v\n", err)
+		os.Exit(1)
+	}
+	aldproPort = uint(mappedPort.Num())
+
+	if !waitForALDProReady(aldproHost, aldproPort, 60*time.Second) {
+		_ = container.Terminate(ctx)
+		fmt.Fprintln(os.Stderr, "OpenLDAP (ALDPro) admin bind did not succeed within 60s")
+		os.Exit(1)
+	}
+
+	// The port can accept connections slightly before the custom schema is
+	// fully loaded (schema and slapd startup are independent). Poll the
+	// subschema until rbta-org-unit is visible, otherwise seeding the
+	// cn=departments entry would fail with ObjectClassViolation.
+	if !waitForALDProSchema(aldproHost, aldproPort, 60*time.Second) {
+		_ = container.Terminate(ctx)
+		fmt.Fprintln(os.Stderr, "rbta-org-unit not present in subschema after 60s")
+		os.Exit(1)
+	}
+
+	// Grant read access to authenticated identities. See the top-of-file
+	// note: osixia defaults to `to * by * none` for non-root, which makes
+	// every authenticated search return noSuchObject rather than
+	// insufficientAccess. Must run before seeding so the admin seed
+	// (which is the root identity) is unaffected but subsequent tests can
+	// search as svc-reader.
+	if err := applyALDProACL(aldproHost, aldproPort); err != nil {
+		_ = container.Terminate(ctx)
+		fmt.Fprintf(os.Stderr, "cannot apply ALDPro ACL: %v\n", err)
+		os.Exit(1)
+	}
+
+	if err := seedALDPro(aldproHost, aldproPort); err != nil {
+		_ = container.Terminate(ctx)
+		fmt.Fprintf(os.Stderr, "cannot seed ALDPro entries: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Sanity check: verify each step of the search path independently so
+	// that a failure here names the exact subsystem (base visibility,
+	// svc-reader bind, subtree scope, entryDN filter) rather than
+	// surfacing later as an opaque ErrNotFound from within AuthenticateConn.
+	if err := verifyALDProState(); err != nil {
+		_ = container.Terminate(ctx)
+		fmt.Fprintf(os.Stderr, "ALDPro post-seed verification failed: %v\n", err)
+		os.Exit(1)
+	}
+
+	code := m.Run()
+	_ = container.Terminate(ctx)
+	os.Exit(code)
+}
+
+// applyALDProACL replaces the olcAccess on the user database with a
+// permissive-but-sane rule:
+//
+//   - self write        — a user can update their own entry (needed for the
+//     reconnect-rebind test that modifies userPassword
+//     via admin; admin still has manage below).
+//   - users read        — any authenticated identity reads the whole tree.
+//     This is what AuthenticateConn and GetUser require
+//     when the bind identity is a non-root user.
+//   - * none            — anonymous access is denied (matches osixia's
+//     intent; only authenticated sessions get through).
+//
+// Note: `by users read` does not include `write` for non-self entries,
+// but the only write path tests exercise is admin (manage) and self
+// (userPassword change by owner, not exercised here — admin does it).
+func applyALDProACL(host string, port uint) error {
+	c, err := ldap.DialURL(fmt.Sprintf("ldap://%s:%d", host, port))
+	if err != nil {
+		return fmt.Errorf("dial: %w", err)
+	}
+	defer c.Close()
+
+	if err := c.Bind(aldproConfigDN, aldproAdminPass); err != nil {
+		return fmt.Errorf("config bind as %q: %w", aldproConfigDN, err)
+	}
+
+	// {1}mdb is osixia's user database for a single-domain setup; {0} is
+	// the frontend/config container. If a future image changes the index,
+	// this will fail loudly rather than silently applying ACL to nothing.
+	modify := ldap.NewModifyRequest("olcDatabase={1}mdb,cn=config", nil)
+	modify.Replace("olcAccess", []string{
+		"{0}to * by self write by users read by * none",
+	})
+	if err := c.Modify(modify); err != nil {
+		return fmt.Errorf("set olcAccess on olcDatabase={1}mdb: %w", err)
+	}
+	return nil
+}
+
+// waitForALDProSchema polls the subschema until rbta-org-unit is present.
+// The port is open before the schema reload finishes, so timing the wait on
+// the port alone would race. Polling for the class name (or its OID, in case
+// the server returns a numeric form) removes the race.
+func waitForALDProSchema(host string, port uint, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		c, err := ldap.DialURL(fmt.Sprintf("ldap://%s:%d", host, port))
+		if err == nil {
+			if bindErr := c.Bind(aldproAdminDN, aldproAdminPass); bindErr == nil {
+				req := ldap.NewSearchRequest(
+					"cn=Subschema", ldap.ScopeBaseObject, ldap.NeverDerefAliases,
+					1, 0, false, "(objectClass=subschema)",
+					[]string{"objectClasses"}, nil,
+				)
+				res, searchErr := c.Search(req)
+				_ = c.Close()
+				if searchErr == nil && len(res.Entries) > 0 {
+					for _, cls := range res.Entries[0].GetAttributeValues("objectClasses") {
+						if strings.Contains(cls, "rbta-org-unit") ||
+							strings.Contains(cls, "1.3.6.1.4.1.99999.2.1") {
+							return true
+						}
+					}
+				}
+			} else {
+				_ = c.Close()
+			}
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	return false
+}
+
+func waitForALDProReady(host string, port uint, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		c, err := ldap.DialURL(fmt.Sprintf("ldap://%s:%d", host, port))
+		if err == nil {
+			bindErr := c.Bind(aldproAdminDN, aldproAdminPass)
+			_ = c.Close()
+			if bindErr == nil {
+				return true
+			}
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	return false
+}
+
 // seedALDPro creates every entry the tests depend on. Idempotent: entries
 // that already exist are skipped, so re-running against the same container
 // is safe.
-//
-// Seed data is created from Go (not via osixia's bootstrap LDIF loader)
-// because that loader is unreliable on CI: it fires "slapd starting" twice
-// (bootstrap phase with a temporary mdb, then final serving slapd against
-// the persistent mdb), and any entries written during the bootstrap window
-// are discarded when the temp mdb is torn down.
 func seedALDPro(host string, port uint) error {
 	c, err := ldap.DialURL(fmt.Sprintf("ldap://%s:%d", host, port))
 	if err != nil {
@@ -230,187 +464,11 @@ func seedALDPro(host string, port uint) error {
 	return nil
 }
 
-var (
-	aldproHost string
-	aldproPort uint
-	aldproAdpt = adapters.ALDPROAdapter{}
-)
-
-func TestMain(m *testing.M) {
-	ctx := context.Background()
-
-	// Only schema is mounted: it must be present when slapd starts, so it
-	// goes through osixia's bootstrap/schema/custom path. Data is seeded
-	// from Go after the port is listening (see seedALDPro and the note there
-	// about osixia's unreliable bootstrap LDIF loader).
-	tmpDir, err := os.MkdirTemp("", "ldapper-aldpro-*")
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "cannot create temp dir: %v\n", err)
-		os.Exit(1)
-	}
-	defer os.RemoveAll(tmpDir)
-
-	schemaDir := filepath.Join(tmpDir, "schema")
-	if err := os.MkdirAll(schemaDir, 0o755); err != nil {
-		fmt.Fprintf(os.Stderr, "cannot create schema dir: %v\n", err)
-		os.Exit(1)
-	}
-	if err := os.WriteFile(filepath.Join(schemaDir, "99-aldpro.schema"),
-		[]byte(aldproSchema), 0o644); err != nil {
-		fmt.Fprintf(os.Stderr, "cannot write schema: %v\n", err)
-		os.Exit(1)
-	}
-
-	req := testcontainers.ContainerRequest{
-		Image:        "osixia/openldap:1.5.0",
-		ExposedPorts: []string{"389/tcp"},
-		Cmd:          []string{"--copy-service"},
-		Env: map[string]string{
-			"LDAP_ORGANISATION":              "ALDPro Test",
-			"LDAP_DOMAIN":                    "aldpro.test",
-			"LDAP_ADMIN_PASSWORD":            aldproAdminPass,
-			"LDAP_TLS":                       "false",
-			"DISABLE_CHOWN":                  "true",
-			"LDAP_REMOVE_CONFIG_AFTER_SETUP": "false",
-		},
-		Mounts: testcontainers.ContainerMounts{
-			{
-				Source: testcontainers.GenericBindMountSource{HostPath: schemaDir},
-				Target: testcontainers.ContainerMountTarget(
-					"/container/service/slapd/assets/config/bootstrap/schema/custom",
-				),
-			},
-		},
-		// Wait for BOTH the final slapd's log line AND the LDAP port.
-		// osixia's entrypoint prints "slapd starting" twice — once for the
-		// bootstrap-phase slapd (temp mdb, ldapi:/// only) and once for the
-		// final serving slapd (opens :389 against the persistent mdb).
-		// Requiring the SECOND occurrence guarantees bootstrap is complete;
-		// wait.ForListeningPort alone fired too early on CI runners, letting
-		// seeding land in the temporary mdb that gets discarded when the
-		// final slapd starts.
-		WaitingFor: wait.ForAll(
-			wait.ForLog("slapd starting").WithOccurrence(2),
-			wait.ForListeningPort("389/tcp"),
-		).WithStartupTimeout(180 * time.Second),
-	}
-
-	container, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
-		ContainerRequest: req,
-		Started:          true,
-	})
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "cannot start OpenLDAP for ALDPro tests: %v\n", err)
-		os.Exit(1)
-	}
-
-	aldproHost, err = container.Host(ctx)
-	if err != nil {
-		_ = container.Terminate(ctx)
-		fmt.Fprintf(os.Stderr, "cannot resolve host: %v\n", err)
-		os.Exit(1)
-	}
-
-	mappedPort, err := container.MappedPort(ctx, "389")
-	if err != nil {
-		_ = container.Terminate(ctx)
-		fmt.Fprintf(os.Stderr, "cannot resolve port: %v\n", err)
-		os.Exit(1)
-	}
-	aldproPort = uint(mappedPort.Num())
-
-	if !waitForALDProReady(aldproHost, aldproPort, 60*time.Second) {
-		_ = container.Terminate(ctx)
-		fmt.Fprintln(os.Stderr, "OpenLDAP (ALDPro) admin bind did not succeed within 60s")
-		os.Exit(1)
-	}
-
-	// The port can accept connections slightly before the custom schema is
-	// fully loaded (schema and slapd startup are independent). Poll the
-	// subschema until rbta-org-unit is visible, otherwise seeding the
-	// cn=departments entry would fail with ObjectClassViolation.
-	if !waitForALDProSchema(aldproHost, aldproPort, 60*time.Second) {
-		_ = container.Terminate(ctx)
-		fmt.Fprintln(os.Stderr, "rbta-org-unit not present in subschema after 60s")
-		os.Exit(1)
-	}
-
-	if err := seedALDPro(aldproHost, aldproPort); err != nil {
-		_ = container.Terminate(ctx)
-		fmt.Fprintf(os.Stderr, "cannot seed ALDPro entries: %v\n", err)
-		os.Exit(1)
-	}
-
-	// Sanity check: verify each step of the search path independently so
-	// that a failure here names the exact subsystem (base visibility,
-	// svc-reader bind, subtree scope, entryDN filter) rather than
-	// surfacing later as an opaque ErrNotFound from within AuthenticateConn.
-	if err := verifyALDProState(); err != nil {
-		_ = container.Terminate(ctx)
-		fmt.Fprintf(os.Stderr, "ALDPro post-seed verification failed: %v\n", err)
-		os.Exit(1)
-	}
-
-	code := m.Run()
-	_ = container.Terminate(ctx)
-	os.Exit(code)
-}
-
-// waitForALDProSchema polls the subschema until rbta-org-unit is present.
-// The port is open before the schema reload finishes, so timing the wait on
-// the port alone would race. Polling for the class name (or its OID, in case
-// the server returns a numeric form) removes the race.
-func waitForALDProSchema(host string, port uint, timeout time.Duration) bool {
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		c, err := ldap.DialURL(fmt.Sprintf("ldap://%s:%d", host, port))
-		if err == nil {
-			if bindErr := c.Bind(aldproAdminDN, aldproAdminPass); bindErr == nil {
-				req := ldap.NewSearchRequest(
-					"cn=Subschema", ldap.ScopeBaseObject, ldap.NeverDerefAliases,
-					1, 0, false, "(objectClass=subschema)",
-					[]string{"objectClasses"}, nil,
-				)
-				res, searchErr := c.Search(req)
-				_ = c.Close()
-				if searchErr == nil && len(res.Entries) > 0 {
-					for _, cls := range res.Entries[0].GetAttributeValues("objectClasses") {
-						if strings.Contains(cls, "rbta-org-unit") ||
-							strings.Contains(cls, "1.3.6.1.4.1.99999.2.1") {
-							return true
-						}
-					}
-				}
-			} else {
-				_ = c.Close()
-			}
-		}
-		time.Sleep(500 * time.Millisecond)
-	}
-	return false
-}
-
-func waitForALDProReady(host string, port uint, timeout time.Duration) bool {
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		c, err := ldap.DialURL(fmt.Sprintf("ldap://%s:%d", host, port))
-		if err == nil {
-			bindErr := c.Bind(aldproAdminDN, aldproAdminPass)
-			_ = c.Close()
-			if bindErr == nil {
-				return true
-			}
-		}
-		time.Sleep(500 * time.Millisecond)
-	}
-	return false
-}
-
 // verifyALDProState checks that every LDAP operation the test suite relies
 // on works from the perspective of both the admin and svc-reader. When a
 // step fails, the error identifies exactly which one, so the next debugging
 // round does not need to guess (base not visible / svc-reader bind rejected
-// / subtree scope broken / entryDN filter rejected).
+// / subtree scope broken / entryDN filter rejected / ACL hides the tree).
 func verifyALDProState() error {
 	dial := func() (*ldap.Conn, error) {
 		return ldap.DialURL(fmt.Sprintf("ldap://%s:%d", aldproHost, aldproPort))
@@ -455,7 +513,8 @@ func verifyALDProState() error {
 	}
 
 	// 4) svc-reader can search the base subtree with a simple filter
-	// (no entryDN, no compound objectClass union).
+	// (no entryDN, no compound objectClass union). Fails with noSuchObject
+	// if the ACL did not take effect — osixia maps "hidden" to code 32.
 	if _, err := c2.Search(ldap.NewSearchRequest(
 		aldproBaseDN, ldap.ScopeWholeSubtree, ldap.NeverDerefAliases,
 		0, 30, false, "(objectClass=inetOrgPerson)", []string{"cn"}, nil,
@@ -474,6 +533,50 @@ func verifyALDProState() error {
 		2, 30, false, filter, aldproAdpt.UserAttrs(), nil,
 	)); err != nil {
 		return fmt.Errorf("svc-reader adapter-filter search failed (filter=%q): %w", filter, err)
+	}
+
+	// 6) Admin subtree enumeration: seed must have landed in the serving
+	// slapd. If this fails or yields < 8 entries, the entries were written
+	// to the bootstrap-phase slapd and discarded when the final slapd
+	// started.
+	const expectedMinEntries = 8 // base + 3 OUs + 3 users + 2 groups + departments
+	all, err := c1.Search(ldap.NewSearchRequest(
+		aldproBaseDN, ldap.ScopeWholeSubtree, ldap.NeverDerefAliases,
+		0, 30, false, "(objectClass=*)", []string{"dn"}, nil,
+	))
+	if err != nil {
+		return fmt.Errorf("admin subtree enumeration at %q: %w", aldproBaseDN, err)
+	}
+	if len(all.Entries) < expectedMinEntries {
+		got := make([]string, 0, len(all.Entries))
+		for _, e := range all.Entries {
+			got = append(got, e.DN)
+		}
+		return fmt.Errorf(
+			"admin sees only %d entries under %q (expected >= %d after seed): %v — "+
+				"seed likely landed in the bootstrap-phase slapd and was discarded",
+			len(all.Entries), aldproBaseDN, expectedMinEntries, got)
+	}
+
+	// 7) svc-reader subtree visibility: rules out an ACL masking the base
+	// tree for authenticated non-admin identities. Insufficient access
+	// shows up as noSuchObject (32) on some OpenLDAP builds, so this step
+	// distinguishes "data missing" from "data present but hidden".
+	sAll, err := c2.Search(ldap.NewSearchRequest(
+		aldproBaseDN, ldap.ScopeWholeSubtree, ldap.NeverDerefAliases,
+		0, 30, false, "(objectClass=*)", []string{"dn"}, nil,
+	))
+	if err != nil {
+		return fmt.Errorf(
+			"svc-reader subtree enumeration at %q failed (ACL visibility?): %w",
+			aldproBaseDN, err)
+	}
+	if len(sAll.Entries) == 0 {
+		return fmt.Errorf(
+			"svc-reader sees 0 entries under %q while admin sees %d — "+
+				"ACL hides the base tree from authenticated non-admin identities; "+
+				"check that applyALDProACL set olcAccess on olcDatabase={1}mdb",
+			aldproBaseDN, len(all.Entries))
 	}
 
 	return nil

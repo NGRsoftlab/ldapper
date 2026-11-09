@@ -233,16 +233,7 @@ func TestMain(m *testing.M) {
 					"/container/service/slapd/assets/config/bootstrap/schema/custom",
 				),
 			},
-			{
-				Source: testcontainers.GenericBindMountSource{HostPath: ldifDir},
-				Target: testcontainers.ContainerMountTarget(
-					"/container/service/slapd/assets/config/bootstrap/ldif/custom",
-				),
-			},
 		},
-		// wait.ForLog matches the final serving slapd (bootstrap prints
-		// "Start OpenLDAP..." instead, per osixia 1.5.0 logs). By the
-		// time this fires, custom schema and LDIF are already loaded.
 		WaitingFor: wait.ForLog("slapd starting").WithStartupTimeout(120 * time.Second),
 	}
 
@@ -284,12 +275,10 @@ func TestMain(m *testing.M) {
 		os.Exit(1)
 	}
 
-	// Sanity: at least one LDIF entry is visible. If this fails, entrypoint
-	// did not load 50-aldpro.ldif — check container logs.
-	if !waitForALDProData(aldproHost, aldproPort,
-		"cn=readers,ou=groups,"+aldproBaseDN, 30*time.Second) {
+	// load data
+	if err := seedALDProLDIF(aldproHost, aldproPort); err != nil {
 		_ = container.Terminate(ctx)
-		fmt.Fprintln(os.Stderr, "50-aldpro.ldif entries not visible after 30s")
+		fmt.Fprintf(os.Stderr, "cannot seed ALDPro LDIF: %v\n", err)
 		os.Exit(1)
 	}
 
@@ -298,30 +287,102 @@ func TestMain(m *testing.M) {
 	os.Exit(code)
 }
 
-// seedALDProLDIF as a safety net: if slapd restarts after seeding (which
-// osixia does in some builds), the mdb may be reinitialised and the seed
-// is lost. Detecting this and retrying the seed is cheaper than
-// understanding which internal restart point wait.ForLog matched.
-func waitForALDProData(host string, port uint, dn string, timeout time.Duration) bool {
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		c, err := ldap.DialURL(fmt.Sprintf("ldap://%s:%d", host, port))
-		if err == nil {
-			if bindErr := c.Bind(aldproAdminDN, aldproAdminPass); bindErr == nil {
-				_, searchErr := c.Search(ldap.NewSearchRequest(
-					dn, ldap.ScopeBaseObject, ldap.NeverDerefAliases,
-					1, 0, false, "(objectClass=*)", []string{"1.1"}, nil))
-				_ = c.Close()
-				if searchErr == nil {
-					return true
-				}
-			} else {
-				_ = c.Close()
-			}
-		}
-		time.Sleep(500 * time.Millisecond)
+func seedALDProLDIF(host string, port uint) error {
+	c, err := ldap.DialURL(fmt.Sprintf("ldap://%s:%d", host, port))
+	if err != nil {
+		return fmt.Errorf("dial: %w", err)
 	}
-	return false
+	defer c.Close()
+	if err := c.Bind(aldproAdminDN, aldproAdminPass); err != nil {
+		return fmt.Errorf("bind: %w", err)
+	}
+
+	entries := []struct {
+		dn    string
+		attrs map[string][]string
+	}{
+		{"ou=users," + aldproBaseDN, map[string][]string{
+			"objectClass": {"organizationalUnit"},
+			"ou":          {"users"},
+		}},
+		{"ou=departments," + aldproBaseDN, map[string][]string{
+			"objectClass": {"rbta-org-unit"},
+			"ou":          {"departments"},
+			"rbtadp":      {"Department Container"},
+		}},
+		{"ou=groups," + aldproBaseDN, map[string][]string{
+			"objectClass": {"organizationalUnit"},
+			"ou":          {"groups"},
+		}},
+		{aldproUser1DN, map[string][]string{
+			"objectClass":   {"inetOrgPerson", "posixAccount", "rbta-user"},
+			"cn":            {"user1"},
+			"sn":            {"User"},
+			"uid":           {aldproUser1UID},
+			"uidNumber":     {"1001"},
+			"gidNumber":     {"1001"},
+			"homeDirectory": {"/home/user1"},
+			"userPassword":  {aldproUser1Pass},
+			"mail":          {"user1@aldpro.test"},
+			"rbtadp":        {"Engineering"},
+		}},
+		{aldproUser2DN, map[string][]string{
+			"objectClass":   {"inetOrgPerson", "posixAccount", "rbta-user"},
+			"cn":            {"user2"},
+			"sn":            {"User"},
+			"uid":           {aldproUser2UID},
+			"uidNumber":     {"1002"},
+			"gidNumber":     {"1002"},
+			"homeDirectory": {"/home/user2"},
+			"userPassword":  {aldproUser2Pass},
+			"mail":          {"user2@aldpro.test"},
+			"rbtadp":        {"Engineering"},
+		}},
+		{aldproSvcDN, map[string][]string{
+			"objectClass":   {"inetOrgPerson", "posixAccount", "rbta-user"},
+			"cn":            {"svc-reader"},
+			"sn":            {"Reader"},
+			"uid":           {aldproSvcUID},
+			"uidNumber":     {"1099"},
+			"gidNumber":     {"1099"},
+			"homeDirectory": {"/home/svc-reader"},
+			"userPassword":  {aldproSvcPass},
+			"mail":          {"svc-reader@aldpro.test"},
+			"rbtadp":        {"IT"},
+		}},
+		{"cn=admins,ou=groups," + aldproBaseDN, map[string][]string{
+			"objectClass": {"groupOfNames"},
+			"cn":          {"admins"},
+			"member":      {aldproUser1DN},
+		}},
+		{"cn=readers,ou=groups," + aldproBaseDN, map[string][]string{
+			"objectClass": {"posixGroup"},
+			"cn":          {"readers"},
+			"gidNumber":   {"2001"},
+			"memberUid":   {aldproUser2UID},
+		}},
+	}
+
+	for _, e := range entries {
+		_, err := c.Search(ldap.NewSearchRequest(
+			e.dn, ldap.ScopeBaseObject, ldap.NeverDerefAliases,
+			1, 0, false, "(objectClass=*)", []string{"1.1"}, nil))
+		if err == nil {
+			continue
+		}
+		if !ldap.IsErrorWithCode(err, ldap.LDAPResultNoSuchObject) {
+			return fmt.Errorf("search %s: %w", e.dn, err)
+		}
+
+		req := ldap.NewAddRequest(e.dn, nil)
+		for name, values := range e.attrs {
+			req.Attribute(name, values)
+		}
+		if err := c.Add(req); err != nil {
+			return fmt.Errorf("add %s: %w", e.dn, err)
+		}
+	}
+	return nil
 }
 
 // waitForALDProSchema polls the subschema until rbta-org-unit is present.

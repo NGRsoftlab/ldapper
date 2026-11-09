@@ -984,13 +984,13 @@ Rules of thumb:
    but `SearchUserGroupsFilterTemplateArgs` must return exactly that many
    values in the same order.
 3. **Group membership format**:
-  - Schema stores DN-valued `member` → use `(member=%[1]s)` and
-    return `[user.DN]`.
-  - Schema stores uid-valued `memberUid` → use `(memberUid=%[1]s)` and
-    return `[user.GetAttributeValue("uid")]`.
-  - Both (like `OPENLDAPAdapter` / `ALDPROAdapter` /
-    `FREEIPAAdapter`) → use a union with two placeholders and return
-    both values in order.
+- Schema stores DN-valued `member` → use `(member=%[1]s)` and
+  return `[user.DN]`.
+- Schema stores uid-valued `memberUid` → use `(memberUid=%[1]s)` and
+  return `[user.GetAttributeValue("uid")]`.
+- Both (like `OPENLDAPAdapter` / `ALDPROAdapter` /
+  `FREEIPAAdapter`) → use a union with two placeholders and return
+  both values in order.
 4. **`GetNormalizedOUInfoFromEntry` must return a non-nil `Children`
    slice** — `GetCatalogTree` may append to it.
 5. **`DistinguishedName`** in `GetNormalizedUserInfo` must come from
@@ -1188,11 +1188,21 @@ What each suite exercises:
   non-interactively); the equivalent path is covered by the OpenLDAP
   suite.
 - **ALDPro** — stock OpenLDAP augmented with a custom schema mirroring
-  the ALDPro-specific `rbta-org-unit` objectClass and `rbtadp` attribute.
-  Exercises both branches of the dual-branch group filter, and confirms
-  that `OUObjectFilter` matches both standard `organizationalUnit` and
-  ALDPro-specific `rbta-org-unit` entries. Uses a dedicated `svc-reader`
-  inetOrgPerson for authenticated binds because the osixia admin is a
+  the ALDPro-specific objectClass `rbta-org-unit` and `rbtadp` attribute.
+  The `rbta-org-unit` class is **cn-named** (`SUP top MUST cn`, it does
+  *not* inherit from `organizationalUnit`), which is what exercises the
+  `ou → cn` fallback in `GetNormalizedOUInfoFromEntry` and the `cn=`
+  arm of `SearchOUFilterTemplate`. The suite also rewrites the default
+  `olcAccess` through `cn=config` right after startup:
+  `attrs=userPassword by anonymous auth` (Simple Bind compares the hash
+  as an anonymous identity — without this every non-root bind fails with
+  `LDAP Result Code 49`) and `to * by users read` (without this every
+  authenticated search returns `LDAP Result Code 32 "No Such Object"`
+  even though the data is present). Exercises both branches of the
+  dual-branch group filter, and confirms that `OUObjectFilter` matches
+  both standard `organizationalUnit` and ALDPro-specific
+  `rbta-org-unit` entries. Uses a dedicated `svc-reader` inetOrgPerson
+  for authenticated binds because the osixia admin is a
   `simpleSecurityObject` that `UserFilter` does not match.
 
 All integration tests assert error conditions with `errors.Is(err,

@@ -39,9 +39,22 @@ package ldapper_test
 //   the base DN returns LDAP Result Code 32 (noSuchObject) rather than an
 //   "insufficient access" error, because every entry is hidden from the
 //   reader. Tests exercise AuthenticateConn and GetUser from a real
-//   authenticated non-root identity (svc-reader), so the suite applies a
-//   permissive ACL through cn=config right after startup:
-//     `to * by self write by users read by * none`.
+//   authenticated non-root identity (svc-reader), so the suite replaces the
+//   default ACL through cn=config right after startup with the standard
+//   two-rule layout:
+//
+//     {0}to attrs=userPassword by self write by anonymous auth by * none
+//     {1}to * by self read by users read by * none
+//
+//   The first rule is what makes Simple Bind possible at all: the server
+//   compares userPassword as an *anonymous* identity (the bind has not
+//   completed yet), so it needs `auth` — not `read` — on that attribute
+//   for anonymous. A single `to * by * none` rule (tried in an earlier
+//   iteration) blocks that anonymous comparison and every non-root bind
+//   fails with LDAP Result Code 49 "Invalid Credentials". The second rule
+//   lets authenticated non-admins read the tree, which is what
+//   AuthenticateConn's post-bind lookup and GetUser require.
+//
 //   Without this the auth-path searches would all fail with ErrNotFound
 //   even though the data is present.
 //
@@ -273,21 +286,24 @@ func TestMain(m *testing.M) {
 	os.Exit(code)
 }
 
-// applyALDProACL replaces the olcAccess on the user database with a
-// permissive-but-sane rule:
+// applyALDProACL replaces the olcAccess on the user database. Two rules
+// are needed:
 //
-//   - self write        — a user can update their own entry (needed for the
-//     reconnect-rebind test that modifies userPassword
-//     via admin; admin still has manage below).
-//   - users read        — any authenticated identity reads the whole tree.
-//     This is what AuthenticateConn and GetUser require
-//     when the bind identity is a non-root user.
-//   - * none            — anonymous access is denied (matches osixia's
-//     intent; only authenticated sessions get through).
+//  1. userPassword — Simple Bind reads userPassword as an *anonymous*
+//     identity: at the moment the server verifies the password, the bind
+//     has not completed yet, so the session carries no authenticated
+//     identity. Without `by anonymous auth` on this attribute, every
+//     Simple Bind returns LDAP Result Code 49 "Invalid Credentials" even
+//     though the stored hash matches. Note: `auth` (not `read`) — bind
+//     only needs to compare, not to return the value.
 //
-// Note: `by users read` does not include `write` for non-self entries,
-// but the only write path tests exercise is admin (manage) and self
-// (userPassword change by owner, not exercised here — admin does it).
+//  2. Everything else — read for any authenticated identity. This is what
+//     AuthenticateConn and GetUser require when the bind identity is a
+//     non-root user.
+//
+// Anonymous is denied everything except the `auth` check on userPassword.
+// Admin (rootDN cn=admin,dc=aldpro,dc=test) bypasses ACLs entirely, so
+// seeding and the reconnect-rebind test work regardless of these rules.
 func applyALDProACL(host string, port uint) error {
 	c, err := ldap.DialURL(fmt.Sprintf("ldap://%s:%d", host, port))
 	if err != nil {
@@ -304,7 +320,8 @@ func applyALDProACL(host string, port uint) error {
 	// this will fail loudly rather than silently applying ACL to nothing.
 	modify := ldap.NewModifyRequest("olcDatabase={1}mdb,cn=config", nil)
 	modify.Replace("olcAccess", []string{
-		"{0}to * by self write by users read by * none",
+		"{0}to attrs=userPassword by self write by anonymous auth by * none",
+		"{1}to * by self read by users read by * none",
 	})
 	if err := c.Modify(modify); err != nil {
 		return fmt.Errorf("set olcAccess on olcDatabase={1}mdb: %w", err)

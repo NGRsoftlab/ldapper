@@ -217,6 +217,7 @@ func TestMain(m *testing.M) {
 	req := testcontainers.ContainerRequest{
 		Image:        "osixia/openldap:1.5.0",
 		ExposedPorts: []string{"389/tcp"},
+		Cmd:          []string{"--copy-service"},
 		Env: map[string]string{
 			"LDAP_ORGANISATION":              "ALDPro Test",
 			"LDAP_DOMAIN":                    "aldpro.test",

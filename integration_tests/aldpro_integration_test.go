@@ -6,19 +6,29 @@ package ldapper_test
 // ALDPro (Astra Linux Directory Pro) integration tests.
 //
 // ALDPro is a commercial Russian directory service built on FreeIPA/389ds
-// with schema extensions (rbta-org-unit, rbtadp). No public Docker image
-// exists, so this suite runs against stock osixia/openldap augmented with
-// a custom schema that mirrors the ALDPro-specific pieces exercised by
-// ALDPROAdapter:
-//   - objectClass rbta-org-unit  (used by OUObjectFilter / SearchOUFilterTemplate)
-//   - attribute   rbtadp         (used as department attribute in UserAttrs)
+// with schema extensions. No public Docker image exists, so this suite runs
+// against stock osixia/openldap augmented with a custom schema that mirrors
+// the ALDPro-specific pieces exercised by ALDPROAdapter.
 //
-// ALDPROAdapter group filter (two positional args, member + memberIndirect +
-// memberUid — mirroring OPENLDAP but with ipaUserGroup and memberIndirect):
+// Schema design (matters for the tests):
+//
+//   - attributetype rbtadp        — department analogue (MAY on users and
+//                                   on containers).
+//   - objectClass   rbta-org-unit — container class using cn as its naming
+//                                   attribute. Deliberately does NOT inherit
+//                                   from organizationalUnit (which would
+//                                   force ou as a MUST and forbid cn), so
+//                                   this exercises the ou→cn fallback in
+//                                   ALDPROAdapter.GetNormalizedOUInfoFromEntry.
+//   - objectClass   rbta-user     — auxiliary class carrying rbtadp on users.
+//
+// ALDROAdapter group filter (two positional args — member/memberIndirect by
+// DN, memberUid by uid):
+//
 //   (|(&(|(objectClass=groupOfNames)(objectClass=ipaUserGroup)(objectClass=posixGroup))
 //       (|(member=%[1]s)(memberIndirect=%[1]s)))
 //     (&(objectClass=posixGroup)(memberUid=%[2]s)))
-// args = [user.DN, user.uid].
+//   args = [user.DN, user.uid].
 //
 // ALDROAdapter does NOT implement PrimaryGroupResolver — GetUserGroups
 // returns only membership-based groups.
@@ -49,6 +59,7 @@ import (
 	"github.com/NGRsoftlab/ldapper"
 	"github.com/NGRsoftlab/ldapper/adapters"
 	"github.com/NGRsoftlab/ldapper/constants"
+	"github.com/NGRsoftlab/ldapper/interfaces"
 	"github.com/NGRsoftlab/ldapper/types"
 )
 
@@ -74,11 +85,20 @@ const (
 	aldproSvcUID  = "svc-reader"
 	aldproSvcPass = "svcpassword"
 	aldproSvcDN   = "cn=svc-reader,ou=users,dc=aldpro,dc=test"
+
+	// ALDPro-specific container: cn-named rbta-org-unit, no ou attribute.
+	// Exercises the ou→cn fallback in GetNormalizedOUInfoFromEntry and the
+	// cn= arm of SearchOUFilterTemplate.
+	aldproDepartmentsDN = "cn=departments,dc=aldpro,dc=test"
 )
 
 // aldproSchema mirrors ALDPro-specific schema extensions. OIDs use the
 // private enterprise placeholder; they need only to be unique inside the
 // ephemeral test instance, not to match real ALDPro OIDs.
+//
+// rbta-org-unit intentionally does NOT inherit from organizationalUnit: real
+// ALDPro containers use cn for naming (like FreeIPA's nsContainer), and this
+// suite exists in part to exercise that fallback.
 const aldproSchema = `attributetype ( 1.3.6.1.4.1.99999.1.1
     NAME 'rbtadp'
     DESC 'ALDPro department attribute'
@@ -88,10 +108,11 @@ const aldproSchema = `attributetype ( 1.3.6.1.4.1.99999.1.1
 
 objectclass ( 1.3.6.1.4.1.99999.2.1
     NAME 'rbta-org-unit'
-    DESC 'ALDPro organizational unit'
-    SUP organizationalUnit
+    DESC 'ALDPro organizational unit (cn-named container)'
+    SUP top
     STRUCTURAL
-    MAY ( rbtadp $ description ) )
+    MUST cn
+    MAY ( ou $ rbtadp $ description ) )
 
 objectclass ( 1.3.6.1.4.1.99999.2.2
     NAME 'rbta-user'
@@ -101,77 +122,113 @@ objectclass ( 1.3.6.1.4.1.99999.2.2
     MAY ( rbtadp ) )
 `
 
-// aldproBootstrapLDIF mirrors the fixture set exercised by ALDPROAdapter.
-// It is mounted into bootstrap/ldif/custom and loaded by osixia's
-// entrypoint during bootstrap, before the final slapd starts. This is
-// atomic — no seed-then-restart race.
-const aldproBootstrapLDIF = `dn: ou=users,dc=aldpro,dc=test
-objectClass: organizationalUnit
-ou: users
+// seedALDPro creates every entry the tests depend on. Idempotent: entries
+// that already exist are skipped, so re-running against the same container
+// is safe.
+//
+// Seed data is created from Go (not via osixia's bootstrap LDIF loader)
+// because that loader is unreliable on CI: it fires "slapd starting" twice
+// (bootstrap phase with a temporary mdb, then final serving slapd against
+// the persistent mdb), and any entries written during the bootstrap window
+// are discarded when the temp mdb is torn down.
+func seedALDPro(host string, port uint) error {
+	c, err := ldap.DialURL(fmt.Sprintf("ldap://%s:%d", host, port))
+	if err != nil {
+		return fmt.Errorf("dial: %w", err)
+	}
+	defer c.Close()
+	if err := c.Bind(aldproAdminDN, aldproAdminPass); err != nil {
+		return fmt.Errorf("bind: %w", err)
+	}
 
-dn: ou=departments,dc=aldpro,dc=test
-objectClass: rbta-org-unit
-ou: departments
-rbtadp: Department Container
-description: ALDPro-specific organizational unit
+	entries := []struct {
+		dn    string
+		attrs map[string][]string
+	}{
+		{"ou=users," + aldproBaseDN, map[string][]string{
+			"objectClass": {"organizationalUnit"},
+			"ou":          {"users"},
+		}},
+		{aldproDepartmentsDN, map[string][]string{
+			"objectClass": {"rbta-org-unit"},
+			"cn":          {"departments"},
+			"rbtadp":      {"Department Container"},
+			"description": {"ALDPro-specific cn-named container"},
+		}},
+		{"ou=groups," + aldproBaseDN, map[string][]string{
+			"objectClass": {"organizationalUnit"},
+			"ou":          {"groups"},
+		}},
+		{aldproUser1DN, map[string][]string{
+			"objectClass":   {"inetOrgPerson", "posixAccount", "rbta-user"},
+			"cn":            {"user1"},
+			"sn":            {"User"},
+			"uid":           {aldproUser1UID},
+			"uidNumber":     {"1001"},
+			"gidNumber":     {"1001"},
+			"homeDirectory": {"/home/user1"},
+			"userPassword":  {aldproUser1Pass},
+			"mail":          {"user1@aldpro.test"},
+			"rbtadp":        {"Engineering"},
+		}},
+		{aldproUser2DN, map[string][]string{
+			"objectClass":   {"inetOrgPerson", "posixAccount", "rbta-user"},
+			"cn":            {"user2"},
+			"sn":            {"User"},
+			"uid":           {aldproUser2UID},
+			"uidNumber":     {"1002"},
+			"gidNumber":     {"1002"},
+			"homeDirectory": {"/home/user2"},
+			"userPassword":  {aldproUser2Pass},
+			"mail":          {"user2@aldpro.test"},
+			"rbtadp":        {"Sales"},
+		}},
+		{aldproSvcDN, map[string][]string{
+			"objectClass":   {"inetOrgPerson", "posixAccount", "rbta-user"},
+			"cn":            {"svc-reader"},
+			"sn":            {"Reader"},
+			"uid":           {aldproSvcUID},
+			"uidNumber":     {"1099"},
+			"gidNumber":     {"1099"},
+			"homeDirectory": {"/home/svc-reader"},
+			"userPassword":  {aldproSvcPass},
+			"mail":          {"svc-reader@aldpro.test"},
+			"rbtadp":        {"IT"},
+		}},
+		{"cn=admins,ou=groups," + aldproBaseDN, map[string][]string{
+			"objectClass": {"groupOfNames"},
+			"cn":          {"admins"},
+			"member":      {aldproUser1DN},
+		}},
+		{"cn=readers,ou=groups," + aldproBaseDN, map[string][]string{
+			"objectClass": {"posixGroup"},
+			"cn":          {"readers"},
+			"gidNumber":   {"2001"},
+			"memberUid":   {aldproUser2UID},
+		}},
+	}
 
-dn: ou=groups,dc=aldpro,dc=test
-objectClass: organizationalUnit
-ou: groups
+	for _, e := range entries {
+		_, err := c.Search(ldap.NewSearchRequest(
+			e.dn, ldap.ScopeBaseObject, ldap.NeverDerefAliases,
+			1, 0, false, "(objectClass=*)", []string{"1.1"}, nil))
+		if err == nil {
+			continue // already present
+		}
+		if !ldap.IsErrorWithCode(err, ldap.LDAPResultNoSuchObject) {
+			return fmt.Errorf("search %s: %w", e.dn, err)
+		}
 
-dn: cn=user1,ou=users,dc=aldpro,dc=test
-objectClass: inetOrgPerson
-objectClass: posixAccount
-objectClass: rbta-user
-cn: user1
-sn: User
-uid: user1
-uidNumber: 1001
-gidNumber: 1001
-homeDirectory: /home/user1
-userPassword: password1
-mail: user1@aldpro.test
-rbtadp: Engineering
-
-dn: cn=user2,ou=users,dc=aldpro,dc=test
-objectClass: inetOrgPerson
-objectClass: posixAccount
-objectClass: rbta-user
-cn: user2
-sn: User
-uid: user2
-uidNumber: 1002
-gidNumber: 1002
-homeDirectory: /home/user2
-userPassword: password2
-mail: user2@aldpro.test
-rbtadp: Sales
-
-dn: cn=svc-reader,ou=users,dc=aldpro,dc=test
-objectClass: inetOrgPerson
-objectClass: posixAccount
-objectClass: rbta-user
-cn: svc-reader
-sn: Reader
-uid: svc-reader
-uidNumber: 1099
-gidNumber: 1099
-homeDirectory: /home/svc-reader
-userPassword: svcpassword
-mail: svc-reader@aldpro.test
-rbtadp: IT
-
-dn: cn=admins,ou=groups,dc=aldpro,dc=test
-objectClass: groupOfNames
-cn: admins
-member: cn=user1,ou=users,dc=aldpro,dc=test
-
-dn: cn=readers,ou=groups,dc=aldpro,dc=test
-objectClass: posixGroup
-cn: readers
-gidNumber: 2001
-memberUid: user2
-`
+		req := ldap.NewAddRequest(e.dn, nil)
+		for name, values := range e.attrs {
+			req.Attribute(name, values)
+		}
+		if err := c.Add(req); err != nil {
+			return fmt.Errorf("add %s: %w", e.dn, err)
+		}
+	}
+	return nil
+}
 
 var (
 	aldproHost string
@@ -182,6 +239,10 @@ var (
 func TestMain(m *testing.M) {
 	ctx := context.Background()
 
+	// Only schema is mounted: it must be present when slapd starts, so it
+	// goes through osixia's bootstrap/schema/custom path. Data is seeded
+	// from Go after the port is listening (see seedALDPro and the note there
+	// about osixia's unreliable bootstrap LDIF loader).
 	tmpDir, err := os.MkdirTemp("", "ldapper-aldpro-*")
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "cannot create temp dir: %v\n", err)
@@ -189,28 +250,14 @@ func TestMain(m *testing.M) {
 	}
 	defer os.RemoveAll(tmpDir)
 
-	// Schema and LDIF are both mounted as directories; entrypoint loads
-	// them atomically during bootstrap, before the final slapd starts.
-	// This eliminates the seed-then-restart race that seedALDProLDIF via
-	// Go cannot beat on osixia/openldap:1.5.0.
 	schemaDir := filepath.Join(tmpDir, "schema")
-	ldifDir := filepath.Join(tmpDir, "ldif")
 	if err := os.MkdirAll(schemaDir, 0o755); err != nil {
 		fmt.Fprintf(os.Stderr, "cannot create schema dir: %v\n", err)
-		os.Exit(1)
-	}
-	if err := os.MkdirAll(ldifDir, 0o755); err != nil {
-		fmt.Fprintf(os.Stderr, "cannot create ldif dir: %v\n", err)
 		os.Exit(1)
 	}
 	if err := os.WriteFile(filepath.Join(schemaDir, "99-aldpro.schema"),
 		[]byte(aldproSchema), 0o644); err != nil {
 		fmt.Fprintf(os.Stderr, "cannot write schema: %v\n", err)
-		os.Exit(1)
-	}
-	if err := os.WriteFile(filepath.Join(ldifDir, "50-aldpro.ldif"),
-		[]byte(aldproBootstrapLDIF), 0o644); err != nil {
-		fmt.Fprintf(os.Stderr, "cannot write LDIF: %v\n", err)
 		os.Exit(1)
 	}
 
@@ -234,7 +281,13 @@ func TestMain(m *testing.M) {
 				),
 			},
 		},
-		WaitingFor: wait.ForLog("slapd starting").WithStartupTimeout(120 * time.Second),
+		// Wait for the LDAP port, not for the log line. osixia's entrypoint
+		// prints "slapd starting" twice — once for the bootstrap-phase slapd
+		// (which only listens on ldapi:/// and writes to a temporary mdb) and
+		// once for the final serving slapd (which opens :389 against the
+		// persistent mdb). wait.ForLog matches the first occurrence, so tests
+		// would start while bootstrap is still in progress.
+		WaitingFor: wait.ForListeningPort("389/tcp").WithStartupTimeout(120 * time.Second),
 	}
 
 	container, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
@@ -267,18 +320,19 @@ func TestMain(m *testing.M) {
 		os.Exit(1)
 	}
 
-	// Sanity: rbta-org-unit must be in subschema; otherwise ou=departments
-	// (rbta-org-unit) will not have been added.
+	// The port can accept connections slightly before the custom schema is
+	// fully loaded (schema and slapd startup are independent). Poll the
+	// subschema until rbta-org-unit is visible, otherwise seeding the
+	// cn=departments entry would fail with ObjectClassViolation.
 	if !waitForALDProSchema(aldproHost, aldproPort, 60*time.Second) {
 		_ = container.Terminate(ctx)
 		fmt.Fprintln(os.Stderr, "rbta-org-unit not present in subschema after 60s")
 		os.Exit(1)
 	}
 
-	// load data
-	if err := seedALDProLDIF(aldproHost, aldproPort); err != nil {
+	if err := seedALDPro(aldproHost, aldproPort); err != nil {
 		_ = container.Terminate(ctx)
-		fmt.Fprintf(os.Stderr, "cannot seed ALDPro LDIF: %v\n", err)
+		fmt.Fprintf(os.Stderr, "cannot seed ALDPro entries: %v\n", err)
 		os.Exit(1)
 	}
 
@@ -287,109 +341,10 @@ func TestMain(m *testing.M) {
 	os.Exit(code)
 }
 
-func seedALDProLDIF(host string, port uint) error {
-	c, err := ldap.DialURL(fmt.Sprintf("ldap://%s:%d", host, port))
-	if err != nil {
-		return fmt.Errorf("dial: %w", err)
-	}
-	defer c.Close()
-	if err := c.Bind(aldproAdminDN, aldproAdminPass); err != nil {
-		return fmt.Errorf("bind: %w", err)
-	}
-
-	entries := []struct {
-		dn    string
-		attrs map[string][]string
-	}{
-		{"ou=users," + aldproBaseDN, map[string][]string{
-			"objectClass": {"organizationalUnit"},
-			"ou":          {"users"},
-		}},
-		{"ou=departments," + aldproBaseDN, map[string][]string{
-			"objectClass": {"rbta-org-unit"},
-			"ou":          {"departments"},
-			"rbtadp":      {"Department Container"},
-		}},
-		{"ou=groups," + aldproBaseDN, map[string][]string{
-			"objectClass": {"organizationalUnit"},
-			"ou":          {"groups"},
-		}},
-		{aldproUser1DN, map[string][]string{
-			"objectClass":   {"inetOrgPerson", "posixAccount", "rbta-user"},
-			"cn":            {"user1"},
-			"sn":            {"User"},
-			"uid":           {aldproUser1UID},
-			"uidNumber":     {"1001"},
-			"gidNumber":     {"1001"},
-			"homeDirectory": {"/home/user1"},
-			"userPassword":  {aldproUser1Pass},
-			"mail":          {"user1@aldpro.test"},
-			"rbtadp":        {"Engineering"},
-		}},
-		{aldproUser2DN, map[string][]string{
-			"objectClass":   {"inetOrgPerson", "posixAccount", "rbta-user"},
-			"cn":            {"user2"},
-			"sn":            {"User"},
-			"uid":           {aldproUser2UID},
-			"uidNumber":     {"1002"},
-			"gidNumber":     {"1002"},
-			"homeDirectory": {"/home/user2"},
-			"userPassword":  {aldproUser2Pass},
-			"mail":          {"user2@aldpro.test"},
-			"rbtadp":        {"Engineering"},
-		}},
-		{aldproSvcDN, map[string][]string{
-			"objectClass":   {"inetOrgPerson", "posixAccount", "rbta-user"},
-			"cn":            {"svc-reader"},
-			"sn":            {"Reader"},
-			"uid":           {aldproSvcUID},
-			"uidNumber":     {"1099"},
-			"gidNumber":     {"1099"},
-			"homeDirectory": {"/home/svc-reader"},
-			"userPassword":  {aldproSvcPass},
-			"mail":          {"svc-reader@aldpro.test"},
-			"rbtadp":        {"IT"},
-		}},
-		{"cn=admins,ou=groups," + aldproBaseDN, map[string][]string{
-			"objectClass": {"groupOfNames"},
-			"cn":          {"admins"},
-			"member":      {aldproUser1DN},
-		}},
-		{"cn=readers,ou=groups," + aldproBaseDN, map[string][]string{
-			"objectClass": {"posixGroup"},
-			"cn":          {"readers"},
-			"gidNumber":   {"2001"},
-			"memberUid":   {aldproUser2UID},
-		}},
-	}
-
-	for _, e := range entries {
-		_, err := c.Search(ldap.NewSearchRequest(
-			e.dn, ldap.ScopeBaseObject, ldap.NeverDerefAliases,
-			1, 0, false, "(objectClass=*)", []string{"1.1"}, nil))
-		if err == nil {
-			continue
-		}
-		if !ldap.IsErrorWithCode(err, ldap.LDAPResultNoSuchObject) {
-			return fmt.Errorf("search %s: %w", e.dn, err)
-		}
-
-		req := ldap.NewAddRequest(e.dn, nil)
-		for name, values := range e.attrs {
-			req.Attribute(name, values)
-		}
-		if err := c.Add(req); err != nil {
-			return fmt.Errorf("add %s: %w", e.dn, err)
-		}
-	}
-	return nil
-}
-
 // waitForALDProSchema polls the subschema until rbta-org-unit is present.
-// This is the deterministic replacement for relying on wait strategy
-// timing: entrypoint loads custom schema asynchronously (stop slapd →
-// ldapadd to cn=config → restart slapd), and the port is open before
-// the reload finishes. Polling for the class name removes the race.
+// The port is open before the schema reload finishes, so timing the wait on
+// the port alone would race. Polling for the class name (or its OID, in case
+// the server returns a numeric form) removes the race.
 func waitForALDProSchema(host string, port uint, timeout time.Duration) bool {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
@@ -479,8 +434,6 @@ func newALDProAuthConn(t *testing.T, opts ...ldapper.Option) *ldapper.LDAPper {
 
 // ALDROAdapter group template uses TWO positional args:
 // member/memberIndirect (%[1]s = DN) and memberUid (%[2]s = uid).
-// The previous test expected a single %s — that was wrong and would have
-// failed against the current adapter.
 func TestIntegrationALDPro_SearchUserGroupsFilterTemplate_TwoArgs(t *testing.T) {
 	tmpl := aldproAdpt.SearchUserGroupsFilterTemplate()
 
@@ -507,12 +460,13 @@ func TestIntegrationALDPro_SearchUserGroupsFilterTemplateArgs_ReturnsDNThenUID(t
 }
 
 // ALDROAdapter must not implement PrimaryGroupResolver: there is no
-// primaryGroupID concept in the ALDPro schema.
+// primaryGroupID concept in the ALDPro schema. Uses the real interface
+// from the interfaces package — the previous inline `any` guard was
+// ineffective because any real implementation would use LDAPConn as the
+// third parameter type, not any.
 var _ = func() any {
 	var c any = adapters.ALDPROAdapter{}
-	if _, ok := c.(interface {
-		ResolvePrimaryGroupDN(context.Context, types.LDAPUser, any) (string, error)
-	}); ok {
+	if _, ok := c.(interfaces.PrimaryGroupResolver); ok {
 		panic("ALDPROAdapter must not implement PrimaryGroupResolver")
 	}
 	return nil
@@ -773,16 +727,20 @@ func TestIntegrationALDPro_CustomSearch_OUFilterMatchesBothTypes(t *testing.T) {
 		aldproBaseDN, ldap.ScopeWholeSubtree, ldap.NeverDerefAliases,
 		0, 0, false,
 		aldproAdpt.OUObjectFilter(),
-		[]string{"ou"},
+		[]string{"ou", "cn", "objectClass"},
 		nil,
 	)
 
 	res, err := conn.CustomSearch(context.Background(), req)
 	require.NoError(t, err)
 
+	// Use the adapter's normalization — GetAttributeValue("ou") alone would
+	// miss rbta-org-unit containers, which have no ou and carry the name in
+	// cn. This is exactly the fallback path exercised by the adapter.
 	ous := make([]string, 0, len(res.Entries))
 	for _, e := range res.Entries {
-		ous = append(ous, e.GetAttributeValue("ou"))
+		info := aldproAdpt.GetNormalizedOUInfoFromEntry(*e)
+		ous = append(ous, info.OU)
 	}
 	assert.Contains(t, ous, "users")
 	assert.Contains(t, ous, "departments",
@@ -866,12 +824,17 @@ func TestIntegrationALDPro_GetOU_ALDProOU(t *testing.T) {
 	conn := newALDProAuthConn(t)
 
 	// departments is an rbta-org-unit — SearchOUFilterTemplate matches on
-	// cn= (since rbta-org-unit has no ou attribute), and the adapter's
-	// GetNormalizedOUInfoFromEntry falls back to cn when ou is absent.
+	// cn= (rbta-org-unit has no ou attribute; the seed creates it with cn
+	// only), and the adapter's GetNormalizedOUInfoFromEntry falls back to
+	// cn when ou is absent.
 	ou, err := conn.GetOU(context.Background(), "departments", aldproBaseDN)
 	require.NoError(t, err)
 	require.NotNil(t, ou)
-	assert.Contains(t, strings.ToLower(ou.DN), "cn=departments")
+	assert.Contains(t, strings.ToLower(ou.DN), "cn=departments",
+		"rbta-org-unit entries are cn-named")
+	assert.Empty(t, ou.GetAttributeValue("ou"),
+		"rbta-org-unit has no ou attribute in this schema")
+	assert.Equal(t, "departments", ou.GetAttributeValue("cn"))
 }
 
 func TestIntegrationALDPro_GetOU_NotFound(t *testing.T) {
@@ -903,6 +866,32 @@ func TestIntegrationALDPro_GetCatalogTree_Success(t *testing.T) {
 	assert.Contains(t, names, "departments",
 		"rbta-org-unit must be discovered as a tree node")
 	assert.Contains(t, names, "groups")
+}
+
+func TestIntegrationALDPro_GetCatalogTree_NormalizesCnNamedContainer(t *testing.T) {
+	conn := newALDProAuthConn(t)
+
+	tree, err := conn.GetCatalogTree(context.Background(), aldproBaseDN, 0)
+	require.NoError(t, err)
+
+	// Find the departments node and verify the adapter populated OU from cn
+	// (there is no ou on the entry — the adapter's fallback is what makes
+	// this a useful node for tree rendering).
+	var found *types.OUNormalizedInfo
+	var walk func(nodes []*types.OUNormalizedInfo)
+	walk = func(nodes []*types.OUNormalizedInfo) {
+		for _, n := range nodes {
+			if strings.EqualFold(n.Name, "departments") {
+				found = n
+			}
+			walk(n.Children)
+		}
+	}
+	walk(tree.Tree)
+
+	require.NotNil(t, found, "departments node must be present")
+	assert.Equal(t, "departments", found.OU,
+		"OU must fall back to cn when ou is absent")
 }
 
 func TestIntegrationALDPro_GetCatalogTree_MaxDepth(t *testing.T) {
@@ -1002,7 +991,7 @@ func TestIntegrationALDPro_GetOUUsers_StandardOU(t *testing.T) {
 func TestIntegrationALDPro_GetOUUsers_ALDProOU(t *testing.T) {
 	conn := newALDProAuthConn(t)
 
-	users, err := conn.GetOUUsers(context.Background(), "ou=departments,"+aldproBaseDN)
+	users, err := conn.GetOUUsers(context.Background(), aldproDepartmentsDN)
 	require.NoError(t, err)
 	assert.Empty(t, users, "departments contains no users")
 }

@@ -1292,7 +1292,7 @@ func TestIntegrationALDPro_BindConn_FailedBind_InvalidatesState(t *testing.T) {
 		aldproSvcDN, aldproSvcPass, aldproBaseDN)
 	require.NoError(t, err)
 
-	_, err = conn.BindConn(context.Background(),
+	err = conn.BindConn(context.Background(),
 		aldproSvcDN, "wrong-password", aldproBaseDN)
 	require.Error(t, err)
 	assert.ErrorIs(t, err, ldapper.ErrInvalidCredentials)

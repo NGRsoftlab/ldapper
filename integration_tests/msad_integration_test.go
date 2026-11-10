@@ -725,7 +725,7 @@ func TestIntegrationMSAD_BindConn_FailedBind_InvalidatesState(t *testing.T) {
 	err := conn.BindConn(context.Background(), msadAdminDN, msadAdminPass, msadBaseDN)
 	require.NoError(t, err)
 
-	_, err = conn.BindConn(context.Background(), msadAdminDN, "wrong-password", msadBaseDN)
+	err = conn.BindConn(context.Background(), msadAdminDN, "wrong-password", msadBaseDN)
 	require.Error(t, err)
 	assert.ErrorIs(t, err, ldapper.ErrInvalidCredentials)
 

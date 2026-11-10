@@ -828,7 +828,7 @@ func TestIntegrationOpenLDAP_BindConn_FailedBind_InvalidatesState(t *testing.T) 
 		openldapUser1DN, openldapUser1Pass, openldapBaseDN)
 	require.NoError(t, err)
 
-	_, err = conn.BindConn(context.Background(),
+	err = conn.BindConn(context.Background(),
 		openldapUser1DN, "wrong-password", openldapBaseDN)
 	require.Error(t, err)
 	assert.ErrorIs(t, err, ldapper.ErrInvalidCredentials)

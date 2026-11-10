@@ -221,7 +221,7 @@ func newFreeIPAAuthConn(t *testing.T, opts ...ldapper.Option) *ldapper.LDAPper {
 	t.Helper()
 	requireFreeIPA(t)
 
-	conn, _, err := ldapper.NewAuthenticatedLDAPper(
+	conn, err := ldapper.NewAuthenticatedLDAPper(
 		context.Background(),
 		freeipaAdminDN, freeipaAdminPass, freeipaBaseDN,
 		[]string{freeipaHost}, freeipaPort,
@@ -331,23 +331,18 @@ func TestIntegrationFreeIPA_NewConnection_UnreachableHost(t *testing.T) {
 func TestIntegrationFreeIPA_NewAuthenticatedConnection_Success(t *testing.T) {
 	requireFreeIPA(t)
 
-	conn, user, err := ldapper.NewAuthenticatedLDAPper(
+	conn, err := ldapper.NewAuthenticatedLDAPper(
 		context.Background(),
 		freeipaAdminDN, freeipaAdminPass, freeipaBaseDN,
 		[]string{freeipaHost}, freeipaPort, false, true, nil, freeipaAdpt,
 	)
 	require.NoError(t, err)
 	defer conn.Close()
-
-	require.NotNil(t, user)
-	assert.True(t,
-		strings.HasPrefix(strings.ToLower(user.DN), "uid=admin,"),
-		"expected admin DN, got %q", user.DN)
 }
 
 func TestIntegrationFreeIPA_NewAuthenticatedConnection_EmptyCredentials(t *testing.T) {
 	requireFreeIPA(t)
-	_, _, err := ldapper.NewAuthenticatedLDAPper(
+	_, err := ldapper.NewAuthenticatedLDAPper(
 		context.Background(), "", "", freeipaBaseDN,
 		[]string{freeipaHost}, freeipaPort, false, true, nil, freeipaAdpt,
 	)
@@ -357,7 +352,7 @@ func TestIntegrationFreeIPA_NewAuthenticatedConnection_EmptyCredentials(t *testi
 
 func TestIntegrationFreeIPA_NewAuthenticatedConnection_WrongPassword(t *testing.T) {
 	requireFreeIPA(t)
-	_, _, err := ldapper.NewAuthenticatedLDAPper(
+	_, err := ldapper.NewAuthenticatedLDAPper(
 		context.Background(),
 		freeipaAdminDN, "wrong-password", freeipaBaseDN,
 		[]string{freeipaHost}, freeipaPort, false, true, nil, freeipaAdpt,
@@ -371,23 +366,21 @@ func TestIntegrationFreeIPA_NewAuthenticatedConnection_WrongPassword(t *testing.
 func TestIntegrationFreeIPA_BindConn_Success(t *testing.T) {
 	conn := newFreeIPAConn(t)
 
-	user, err := conn.BindConn(context.Background(),
+	err := conn.BindConn(context.Background(),
 		freeipaAdminDN, freeipaAdminPass, freeipaBaseDN)
 	require.NoError(t, err)
-	require.NotNil(t, user)
-	assert.True(t, strings.HasPrefix(strings.ToLower(user.DN), "uid=admin,"))
 }
 
 func TestIntegrationFreeIPA_BindConn_EmptyCredentials(t *testing.T) {
 	conn := newFreeIPAConn(t)
-	_, err := conn.BindConn(context.Background(), "", "", freeipaBaseDN)
+	err := conn.BindConn(context.Background(), "", "", freeipaBaseDN)
 	require.Error(t, err)
 	assert.ErrorIs(t, err, ldapper.ErrInvalidArgument)
 }
 
 func TestIntegrationFreeIPA_BindConn_WrongPassword(t *testing.T) {
 	conn := newFreeIPAConn(t)
-	_, err := conn.BindConn(context.Background(),
+	err := conn.BindConn(context.Background(),
 		freeipaAdminDN, "bad-password", freeipaBaseDN)
 	require.Error(t, err)
 	assert.ErrorIs(t, err, ldapper.ErrInvalidCredentials)
@@ -395,7 +388,7 @@ func TestIntegrationFreeIPA_BindConn_WrongPassword(t *testing.T) {
 
 func TestIntegrationFreeIPA_BindConn_NonExistentUser(t *testing.T) {
 	conn := newFreeIPAConn(t)
-	_, err := conn.BindConn(context.Background(),
+	err := conn.BindConn(context.Background(),
 		"uid=ghost,cn=users,cn=accounts,dc=example,dc=test", "whatever", freeipaBaseDN)
 	require.Error(t, err)
 }
@@ -751,7 +744,7 @@ func TestIntegrationFreeIPA_BindConn_FailedBind_InvalidatesState(t *testing.T) {
 	requireFreeIPAUsers(t)
 	conn := newFreeIPAConn(t)
 
-	_, err := conn.BindConn(context.Background(),
+	err := conn.BindConn(context.Background(),
 		freeipaAdminDN, freeipaAdminPass, freeipaBaseDN)
 	require.NoError(t, err)
 

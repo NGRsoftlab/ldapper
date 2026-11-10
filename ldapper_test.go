@@ -247,24 +247,22 @@ func TestNewAuthenticatedLDAPper_EmptyCredentials(t *testing.T) {
 
 	t.Run("empty username", func(t *testing.T) {
 		t.Parallel()
-		l, user, err := NewAuthenticatedLDAPper(context.Background(),
+		l, err := NewAuthenticatedLDAPper(context.Background(),
 			"", "pass", "dc=x",
 			[]string{"h"}, 389, false, true, nil, fakeAdapter{})
 		require.Error(t, err)
 		assert.ErrorIs(t, err, ErrInvalidArgument)
 		assert.Nil(t, l)
-		assert.Nil(t, user)
 	})
 
 	t.Run("empty password", func(t *testing.T) {
 		t.Parallel()
-		l, user, err := NewAuthenticatedLDAPper(context.Background(),
+		l, err := NewAuthenticatedLDAPper(context.Background(),
 			"user", "", "dc=x",
 			[]string{"h"}, 389, false, true, nil, fakeAdapter{})
 		require.Error(t, err)
 		assert.ErrorIs(t, err, ErrInvalidArgument)
 		assert.Nil(t, l)
-		assert.Nil(t, user)
 	})
 }
 
@@ -272,14 +270,13 @@ func TestNewAuthenticatedLDAPper_PropagatesNewLDAPperError(t *testing.T) {
 	t.Parallel()
 
 	// Empty host list — NewLDAPper fails before any dial.
-	l, user, err := NewAuthenticatedLDAPper(context.Background(),
+	l, err := NewAuthenticatedLDAPper(context.Background(),
 		"user", "pass", "dc=x",
 		nil, 389, false, true, nil, fakeAdapter{})
 
 	require.Error(t, err)
 	assert.ErrorIs(t, err, ErrInvalidArgument)
 	assert.Nil(t, l)
-	assert.Nil(t, user)
 }
 
 func TestNewAuthenticatedLDAPper_PropagatesAuthError(t *testing.T) {
@@ -295,11 +292,10 @@ func TestNewAuthenticatedLDAPper_PropagatesAuthError(t *testing.T) {
 		return nil, errors.New("dial failed")
 	})
 
-	l, user, err := NewAuthenticatedLDAPper(context.Background(),
+	l, err := NewAuthenticatedLDAPper(context.Background(),
 		"user", "pass", "dc=x",
 		[]string{"h"}, 389, false, true, nil, fakeAdapter{})
 
 	require.Error(t, err)
 	assert.Nil(t, l)
-	assert.Nil(t, user)
 }

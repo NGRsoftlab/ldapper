@@ -167,7 +167,7 @@ func TestBindConn_NoConnection(t *testing.T) {
 	t.Parallel()
 
 	l := newAuthTestLDAPper(nil)
-	_, err := l.BindConn(context.Background(), "alice", "pass", "dc=x")
+	err := l.BindConn(context.Background(), "alice", "pass", "dc=x")
 	require.Error(t, err)
 	assert.ErrorIs(t, err, ErrClosed)
 }
@@ -176,11 +176,11 @@ func TestBindConn_EmptyCredentials(t *testing.T) {
 	t.Parallel()
 
 	l := newAuthTestLDAPper(&mocks.MockLDAPConn{})
-	_, err := l.BindConn(context.Background(), "", "pass", "dc=x")
+	err := l.BindConn(context.Background(), "", "pass", "dc=x")
 	require.Error(t, err)
 	assert.ErrorIs(t, err, ErrInvalidArgument)
 
-	_, err = l.BindConn(context.Background(), "alice", "", "dc=x")
+	err = l.BindConn(context.Background(), "alice", "", "dc=x")
 	require.Error(t, err)
 	assert.ErrorIs(t, err, ErrInvalidArgument)
 }
@@ -189,7 +189,7 @@ func TestBindConn_EmptyBaseDN(t *testing.T) {
 	t.Parallel()
 
 	l := newAuthTestLDAPper(&mocks.MockLDAPConn{})
-	_, err := l.BindConn(context.Background(), "alice", "pass", "")
+	err := l.BindConn(context.Background(), "alice", "pass", "")
 	require.Error(t, err)
 	assert.ErrorIs(t, err, ErrInvalidArgument)
 }
@@ -204,7 +204,7 @@ func TestBindConn_BindIdentityError(t *testing.T) {
 		},
 	}
 
-	_, err := l.BindConn(context.Background(), "alice", "pass", "dc=x")
+	err := l.BindConn(context.Background(), "alice", "pass", "dc=x")
 	require.Error(t, err)
 	assert.ErrorIs(t, err, ErrInvalidArgument)
 	assert.Contains(t, err.Error(), "cannot map login")
@@ -223,7 +223,7 @@ func TestBindConn_BindFailure_MasksAndCloses(t *testing.T) {
 	}
 	l := newAuthTestLDAPper(conn)
 
-	_, err := l.BindConn(context.Background(), "alice", "secret", "dc=x")
+	err := l.BindConn(context.Background(), "alice", "secret", "dc=x")
 
 	require.Error(t, err)
 	assert.ErrorIs(t, err, ErrInvalidCredentials)
@@ -250,7 +250,7 @@ func TestBindConn_BaseDNProbeFailure_ClosesAndInvalidates(t *testing.T) {
 	}
 	l := newAuthTestLDAPper(conn)
 
-	_, err := l.BindConn(context.Background(), "alice", "pass", "dc=x")
+	err := l.BindConn(context.Background(), "alice", "pass", "dc=x")
 
 	require.Error(t, err)
 	assert.ErrorIs(t, err, ErrUnavailable)
@@ -272,7 +272,7 @@ func TestBindConn_BaseDNNotFound_ClosesAndInvalidates(t *testing.T) {
 	}
 	l := newAuthTestLDAPper(conn)
 
-	_, err := l.BindConn(context.Background(), "alice", "pass", "dc=ghost")
+	err := l.BindConn(context.Background(), "alice", "pass", "dc=ghost")
 
 	require.Error(t, err)
 	assert.ErrorIs(t, err, ErrNotFoundOrNotVisible)
@@ -281,7 +281,7 @@ func TestBindConn_BaseDNNotFound_ClosesAndInvalidates(t *testing.T) {
 	assert.False(t, l.isAuthenticated)
 }
 
-func TestBindConn_Success_CachesBindPrincipalNotLogin(t *testing.T) {
+func TestBindConn_CachesBindPrincipalFromBindIdentity(t *testing.T) {
 	t.Parallel()
 
 	conn := &mocks.MockLDAPConn{
@@ -306,13 +306,9 @@ func TestBindConn_Success_CachesBindPrincipalNotLogin(t *testing.T) {
 		},
 	}
 
-	user, err := l.BindConn(context.Background(), "alice", "alice-pass", "dc=x")
+	err := l.BindConn(context.Background(), "alice", "alice-pass", "dc=x")
 
 	require.NoError(t, err)
-	require.NotNil(t, user)
-	assert.Equal(t, "uid=alice,ou=people,dc=x", user.DN,
-		"user.DN carries the bind principal, not the looked-up entry DN")
-	assert.Empty(t, user.Attributes)
 	assert.True(t, l.isAuthenticated)
 	assert.Equal(t, "uid=alice,ou=people,dc=x", l.bindUser)
 	assert.Equal(t, "alice-pass", l.bindPassword)

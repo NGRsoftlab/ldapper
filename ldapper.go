@@ -12,7 +12,6 @@ import (
 
 	"github.com/NGRsoftlab/ldapper/constants"
 	"github.com/NGRsoftlab/ldapper/interfaces"
-	"github.com/NGRsoftlab/ldapper/types"
 )
 
 type LDAPper struct {
@@ -130,8 +129,8 @@ func NewLDAPper(
 // verifies the connection by probing `baseDN` with a base-object search.
 // No post-bind user lookup is performed: any principal accepted by the
 // adapter's BindIdentity is accepted as long as baseDN is reachable
-// under it. The returned *types.LDAPUser carries only the bind principal
-// in DN (may be a UPN on MSAD/ALDPro); call GetUser for the user entry.
+// under it. No user entry is returned — call GetUser afterwards if you
+// need the full entry.
 //
 // `username` and `baseDN` are cached for later CheckUserCredentials calls.
 //
@@ -149,22 +148,22 @@ func NewAuthenticatedLDAPper(
 	skipTLS bool,
 	tlsCfg *tls.Config,
 	catalogAdapter interfaces.CatalogAdapter,
-	opts ...Option) (*LDAPper, *types.LDAPUser, error) {
+	opts ...Option) (*LDAPper, error) {
 
 	if username == "" || password == "" {
-		return nil, nil, fmt.Errorf("%w: empty bind username/password", ErrInvalidArgument)
+		return nil, fmt.Errorf("%w: empty bind username/password", ErrInvalidArgument)
 	}
 
 	ldapper, err := NewLDAPper(ctx, hosts, port, useSSL, skipTLS, tlsCfg, catalogAdapter, opts...)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
-	user, err := ldapper.BindConn(ctx, username, password, baseDN)
+	err = ldapper.BindConn(ctx, username, password, baseDN)
 	if err != nil {
 		ldapper.Close()
-		return nil, nil, err
+		return nil, err
 	}
 
-	return ldapper, user, nil
+	return ldapper, nil
 }

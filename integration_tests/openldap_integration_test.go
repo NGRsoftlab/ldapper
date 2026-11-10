@@ -273,7 +273,7 @@ func newOpenLDAPConn(t *testing.T, opts ...ldapper.Option) *ldapper.LDAPper {
 
 func newOpenLDAPAuthConn(t *testing.T, opts ...ldapper.Option) *ldapper.LDAPper {
 	t.Helper()
-	conn, _, err := ldapper.NewAuthenticatedLDAPper(
+	conn, err := ldapper.NewAuthenticatedLDAPper(
 		context.Background(),
 		openldapUser1DN, openldapUser1Pass, openldapBaseDN,
 		[]string{openldapHost}, openldapPort,
@@ -333,20 +333,17 @@ func TestIntegrationOpenLDAP_NewConnection_UnreachableHost(t *testing.T) {
 }
 
 func TestIntegrationOpenLDAP_NewAuthenticatedConnection_Success(t *testing.T) {
-	conn, user, err := ldapper.NewAuthenticatedLDAPper(
+	conn, err := ldapper.NewAuthenticatedLDAPper(
 		context.Background(),
 		openldapUser1DN, openldapUser1Pass, openldapBaseDN,
 		[]string{openldapHost}, openldapPort, false, true, nil, openldapAdpt,
 	)
 	require.NoError(t, err)
 	defer conn.Close()
-
-	require.NotNil(t, user)
-	assert.Equal(t, openldapUser1DN, user.DN)
 }
 
 func TestIntegrationOpenLDAP_NewAuthenticatedConnection_EmptyCredentials(t *testing.T) {
-	_, _, err := ldapper.NewAuthenticatedLDAPper(
+	_, err := ldapper.NewAuthenticatedLDAPper(
 		context.Background(), "", "", openldapBaseDN,
 		[]string{openldapHost}, openldapPort, false, true, nil, openldapAdpt,
 	)
@@ -355,7 +352,7 @@ func TestIntegrationOpenLDAP_NewAuthenticatedConnection_EmptyCredentials(t *test
 }
 
 func TestIntegrationOpenLDAP_NewAuthenticatedConnection_WrongPassword(t *testing.T) {
-	_, _, err := ldapper.NewAuthenticatedLDAPper(
+	_, err := ldapper.NewAuthenticatedLDAPper(
 		context.Background(),
 		openldapUser1DN, "wrong-password", openldapBaseDN,
 		[]string{openldapHost}, openldapPort, false, true, nil, openldapAdpt,
@@ -369,23 +366,21 @@ func TestIntegrationOpenLDAP_NewAuthenticatedConnection_WrongPassword(t *testing
 func TestIntegrationOpenLDAP_BindConn_Success(t *testing.T) {
 	conn := newOpenLDAPConn(t)
 
-	user, err := conn.BindConn(context.Background(),
+	err := conn.BindConn(context.Background(),
 		openldapUser1DN, openldapUser1Pass, openldapBaseDN)
 	require.NoError(t, err)
-	require.NotNil(t, user)
-	assert.Equal(t, openldapUser1DN, user.DN)
 }
 
 func TestIntegrationOpenLDAP_BindConn_EmptyCredentials(t *testing.T) {
 	conn := newOpenLDAPConn(t)
-	_, err := conn.BindConn(context.Background(), "", "", openldapBaseDN)
+	err := conn.BindConn(context.Background(), "", "", openldapBaseDN)
 	require.Error(t, err)
 	assert.ErrorIs(t, err, ldapper.ErrInvalidArgument)
 }
 
 func TestIntegrationOpenLDAP_BindConn_WrongPassword(t *testing.T) {
 	conn := newOpenLDAPConn(t)
-	_, err := conn.BindConn(context.Background(),
+	err := conn.BindConn(context.Background(),
 		openldapUser1DN, "bad-password", openldapBaseDN)
 	require.Error(t, err)
 	assert.ErrorIs(t, err, ldapper.ErrInvalidCredentials)
@@ -393,7 +388,7 @@ func TestIntegrationOpenLDAP_BindConn_WrongPassword(t *testing.T) {
 
 func TestIntegrationOpenLDAP_BindConn_NonExistentUser(t *testing.T) {
 	conn := newOpenLDAPConn(t)
-	_, err := conn.BindConn(context.Background(),
+	err := conn.BindConn(context.Background(),
 		"cn=ghost,ou=users,dc=example,dc=org", "whatever", openldapBaseDN)
 	require.Error(t, err)
 }
@@ -829,7 +824,7 @@ func TestIntegrationOpenLDAP_OperationTimeout_WithOption(t *testing.T) {
 func TestIntegrationOpenLDAP_BindConn_FailedBind_InvalidatesState(t *testing.T) {
 	conn := newOpenLDAPConn(t)
 
-	_, err := conn.BindConn(context.Background(),
+	err := conn.BindConn(context.Background(),
 		openldapUser1DN, openldapUser1Pass, openldapBaseDN)
 	require.NoError(t, err)
 
@@ -849,7 +844,7 @@ func TestIntegrationOpenLDAP_BindConn_FailedBind_InvalidatesState(t *testing.T) 
 // client unusable (ErrClosed) instead of falling back to anonymous.
 func TestIntegrationOpenLDAP_Reconnect_RebindFailure_ClosesConnection(t *testing.T) {
 	conn := newOpenLDAPConn(t)
-	_, err := conn.BindConn(context.Background(),
+	err := conn.BindConn(context.Background(),
 		openldapUser1DN, openldapUser1Pass, openldapBaseDN)
 	require.NoError(t, err)
 

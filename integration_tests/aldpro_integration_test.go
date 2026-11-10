@@ -625,7 +625,7 @@ func newALDProConn(t *testing.T, opts ...ldapper.Option) *ldapper.LDAPper {
 
 func newALDProAuthConn(t *testing.T, opts ...ldapper.Option) *ldapper.LDAPper {
 	t.Helper()
-	conn, _, err := ldapper.NewAuthenticatedLDAPper(
+	conn, err := ldapper.NewAuthenticatedLDAPper(
 		context.Background(),
 		aldproSvcDN, aldproSvcPass, aldproBaseDN,
 		[]string{aldproHost}, aldproPort,
@@ -738,20 +738,17 @@ func TestIntegrationALDPro_NewConnection_UnreachableHost(t *testing.T) {
 }
 
 func TestIntegrationALDPro_NewAuthenticatedConnection_Success(t *testing.T) {
-	conn, user, err := ldapper.NewAuthenticatedLDAPper(
+	conn, err := ldapper.NewAuthenticatedLDAPper(
 		context.Background(),
 		aldproSvcDN, aldproSvcPass, aldproBaseDN,
 		[]string{aldproHost}, aldproPort, false, true, nil, aldproAdpt,
 	)
 	require.NoError(t, err)
 	defer conn.Close()
-
-	require.NotNil(t, user)
-	assert.Equal(t, aldproSvcDN, user.DN)
 }
 
 func TestIntegrationALDPro_NewAuthenticatedConnection_EmptyCredentials(t *testing.T) {
-	_, _, err := ldapper.NewAuthenticatedLDAPper(
+	_, err := ldapper.NewAuthenticatedLDAPper(
 		context.Background(), "", "", aldproBaseDN,
 		[]string{aldproHost}, aldproPort, false, true, nil, aldproAdpt,
 	)
@@ -760,7 +757,7 @@ func TestIntegrationALDPro_NewAuthenticatedConnection_EmptyCredentials(t *testin
 }
 
 func TestIntegrationALDPro_NewAuthenticatedConnection_WrongPassword(t *testing.T) {
-	_, _, err := ldapper.NewAuthenticatedLDAPper(
+	_, err := ldapper.NewAuthenticatedLDAPper(
 		context.Background(),
 		aldproSvcDN, "wrong-password", aldproBaseDN,
 		[]string{aldproHost}, aldproPort, false, true, nil, aldproAdpt,
@@ -774,23 +771,21 @@ func TestIntegrationALDPro_NewAuthenticatedConnection_WrongPassword(t *testing.T
 func TestIntegrationALDPro_BindConn_Success(t *testing.T) {
 	conn := newALDProConn(t)
 
-	user, err := conn.BindConn(context.Background(),
+	err := conn.BindConn(context.Background(),
 		aldproSvcDN, aldproSvcPass, aldproBaseDN)
 	require.NoError(t, err)
-	require.NotNil(t, user)
-	assert.Equal(t, aldproSvcDN, user.DN)
 }
 
 func TestIntegrationALDPro_BindConn_EmptyCredentials(t *testing.T) {
 	conn := newALDProConn(t)
-	_, err := conn.BindConn(context.Background(), "", "", aldproBaseDN)
+	err := conn.BindConn(context.Background(), "", "", aldproBaseDN)
 	require.Error(t, err)
 	assert.ErrorIs(t, err, ldapper.ErrInvalidArgument)
 }
 
 func TestIntegrationALDPro_BindConn_WrongPassword(t *testing.T) {
 	conn := newALDProConn(t)
-	_, err := conn.BindConn(context.Background(),
+	err := conn.BindConn(context.Background(),
 		aldproSvcDN, "bad-password", aldproBaseDN)
 	require.Error(t, err)
 	assert.ErrorIs(t, err, ldapper.ErrInvalidCredentials)
@@ -800,7 +795,7 @@ func TestIntegrationALDPro_BindConn_WrongPassword(t *testing.T) {
 
 func TestIntegrationALDPro_BindConn_NonExistentUser(t *testing.T) {
 	conn := newALDProConn(t)
-	_, err := conn.BindConn(context.Background(),
+	err := conn.BindConn(context.Background(),
 		"cn=ghost,ou=users,"+aldproBaseDN, "whatever", aldproBaseDN)
 	require.Error(t, err)
 }
@@ -1293,7 +1288,7 @@ func TestIntegrationALDPro_OperationTimeout_WithOption(t *testing.T) {
 func TestIntegrationALDPro_BindConn_FailedBind_InvalidatesState(t *testing.T) {
 	conn := newALDProConn(t)
 
-	_, err := conn.BindConn(context.Background(),
+	err := conn.BindConn(context.Background(),
 		aldproSvcDN, aldproSvcPass, aldproBaseDN)
 	require.NoError(t, err)
 
@@ -1313,7 +1308,7 @@ func TestIntegrationALDPro_BindConn_FailedBind_InvalidatesState(t *testing.T) {
 // client unusable (ErrClosed) instead of falling back to anonymous.
 func TestIntegrationALDPro_Reconnect_RebindFailure_ClosesConnection(t *testing.T) {
 	conn := newALDProConn(t)
-	_, err := conn.BindConn(context.Background(),
+	err := conn.BindConn(context.Background(),
 		aldproSvcDN, aldproSvcPass, aldproBaseDN)
 	require.NoError(t, err)
 

@@ -110,7 +110,7 @@ func main() {
     limits := ldapper.DefaultSearchLimits()
     limits.TimeLimit = 30
 
-    conn, user, err := ldapper.NewAuthenticatedLDAPper(
+    conn, err := ldapper.NewAuthenticatedLDAPper(
         ctx,
         "svc-reader@corp.example.com", "secret",       // bind credentials
         "DC=corp,DC=example,DC=com",                   // base DN for probe and user lookups
@@ -127,10 +127,6 @@ func main() {
         log.Fatalf("connect: %v", err)
     }
     defer conn.Close()
-
-    // user.DN is the bind principal (UPN for AD, DN for OpenLDAP/FreeIPA);
-    // user.Attributes is empty — call GetUser below for the full entry.
-    log.Printf("authenticated as %s", user.DN)
 
     u, err := conn.GetUser(ctx, "jdoe", "DC=corp,DC=example,DC=com")
     if err != nil {
@@ -374,10 +370,9 @@ func NewLDAPper(
 // Authenticated: dials, then binds as `username` and probes `baseDN`
 // with a base-object search to confirm the tree is reachable under the
 // bound identity. No post-bind user lookup is performed, so service
-// principals that do not match UserObjectFilter are accepted. The
-// returned *types.LDAPUser carries only the bind principal (DN); call
-// GetUser to fetch the user entry. `username` and `baseDN` are cached
-// for later CheckUserCredentials calls.
+// principals that do not match UserObjectFilter are accepted. No user
+// entry is returned — call GetUser to fetch it. `username` and `baseDN`
+// are cached for later CheckUserCredentials calls.
 func NewAuthenticatedLDAPper(
     ctx context.Context,
     username, password, baseDN string,
@@ -387,7 +382,7 @@ func NewAuthenticatedLDAPper(
     tlsCfg *tls.Config,
     catalogAdapter interfaces.CatalogAdapter,
     opts ...Option,
-) (*LDAPper, *types.LDAPUser, error)
+) (*LDAPper, error)
 ```
 
 TLS matrix — `useSSL` and `skipTLS` together select the transport:
@@ -704,7 +699,7 @@ Key differences to keep in mind:
 
 ```go
 // Bind as `username` and store the credentials + base DN for later use.
-user, err := conn.BindConn(ctx, username, password, baseDN)
+err := conn.BindConn(ctx, username, password, baseDN)
 
 // Verify a user's password against an already-authenticated connection,
 // then rebind back to the service account.
@@ -714,12 +709,12 @@ user, err := conn.CheckUserCredentials(ctx, username, password)
 `BindConn`:
 
 - Stores username, password and baseDN on the connection.
-  Performs the bind first, then probes baseDN with a base-object search 
-  to confirm the tree is reachable under the bound identity.
-  No post-bind user lookup is performed. The returned *types.LDAPUser 
-  carries only the bind principal in DN (may be a UPN on MSAD/ALDPro); 
-  call GetUser for the user entry. If the bind fails, the base-DN probe is never issued
-  (`errors.Is(err, ErrInvalidCredentials)`).
+- Performs the bind first, then probes baseDN with a base-object search
+  to confirm the tree is reachable under the bound identity. No post-bind
+  user lookup is performed, and no `*types.LDAPUser` is returned — call
+  `GetUser` afterwards if you need the user entry. If the bind fails,
+  the base-DN probe is never issued and the error is
+  `ErrInvalidCredentials` (testable with `errors.Is`).
 - On success, caches `isAuthenticated=true`, `bindUser`, `bindPassword`,
   `bindDN`. `bindUser` is the value returned by `BindIdentity`, **not**
   the raw login — that's what `Reconnect` replays.

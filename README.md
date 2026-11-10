@@ -725,7 +725,7 @@ user, err := conn.CheckUserCredentials(ctx, username, password)
   the raw login — that's what `Reconnect` replays.
 - On any failure, closes the connection and invalidates the cached
   credentials (RFC 4513 §4 — a failed Bind transitions the session to
-  anonymous; a successful Bind whose post-bind lookup failed leaves the
+  anonymous; a successful Bind whose base-DN probe failed leaves the
   session identified as an unverified principal).
 
 `CheckUserCredentials`:

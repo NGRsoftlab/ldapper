@@ -38,7 +38,7 @@ package ldapper_test
 //   identities — only the root DN reads. On a non-root bind, a search under
 //   the base DN returns LDAP Result Code 32 (noSuchObject) rather than an
 //   "insufficient access" error, because every entry is hidden from the
-//   reader. Tests exercise AuthenticateConn and GetUser from a real
+//   reader. Tests exercise BindConn and GetUser from a real
 //   authenticated non-root identity (svc-reader), so the suite replaces the
 //   default ACL through cn=config right after startup with the standard
 //   two-rule layout:
@@ -53,7 +53,7 @@ package ldapper_test
 //   iteration) blocks that anonymous comparison and every non-root bind
 //   fails with LDAP Result Code 49 "Invalid Credentials". The second rule
 //   lets authenticated non-admins read the tree, which is what
-//   AuthenticateConn's post-bind lookup and GetUser require.
+//   BindConn's post-bind lookup and GetUser require.
 //
 //   Without this the auth-path searches would all fail with ErrNotFound
 //   even though the data is present.
@@ -274,7 +274,7 @@ func TestMain(m *testing.M) {
 	// Sanity check: verify each step of the search path independently so
 	// that a failure here names the exact subsystem (base visibility,
 	// svc-reader bind, subtree scope, entryDN filter) rather than
-	// surfacing later as an opaque ErrNotFound from within AuthenticateConn.
+	// surfacing later as an opaque ErrNotFound from within BindConn.
 	if err := verifyALDProState(); err != nil {
 		_ = container.Terminate(ctx)
 		fmt.Fprintf(os.Stderr, "ALDPro post-seed verification failed: %v\n", err)
@@ -298,7 +298,7 @@ func TestMain(m *testing.M) {
 //     only needs to compare, not to return the value.
 //
 //  2. Everything else — read for any authenticated identity. This is what
-//     AuthenticateConn and GetUser require when the bind identity is a
+//     BindConn and GetUser require when the bind identity is a
 //     non-root user.
 //
 // Anonymous is denied everything except the `auth` check on userPassword.
@@ -540,9 +540,9 @@ func verifyALDProState() error {
 	}
 
 	// 5) svc-reader can search with the adapter's actual user filter.
-	// This is the exact filter that AuthenticateConn → getUserLocked issues;
+	// This is the exact filter that GetUser → searchSingleEntryLocked issues;
 	// if it fails here, the adapter template (entryDN arm, objectClass
-	// union) is what breaks the auth flow.
+	// union) is what breaks user lookups.
 	tmpl := aldproAdpt.SearchUserFilterTemplate()
 	filter := fmt.Sprintf(tmpl, ldap.EscapeFilter(aldproSvcDN))
 	if _, err := c2.Search(ldap.NewSearchRequest(
@@ -748,7 +748,6 @@ func TestIntegrationALDPro_NewAuthenticatedConnection_Success(t *testing.T) {
 
 	require.NotNil(t, user)
 	assert.Equal(t, aldproSvcDN, user.DN)
-	assert.Equal(t, aldproSvcUID, user.GetAttributeValue("uid"))
 }
 
 func TestIntegrationALDPro_NewAuthenticatedConnection_EmptyCredentials(t *testing.T) {
@@ -770,28 +769,28 @@ func TestIntegrationALDPro_NewAuthenticatedConnection_WrongPassword(t *testing.T
 	assert.ErrorIs(t, err, ldapper.ErrInvalidCredentials)
 }
 
-// ================== AuthenticateConn ==================
+// ================== BindConn ==================
 
-func TestIntegrationALDPro_AuthenticateConn_Success(t *testing.T) {
+func TestIntegrationALDPro_BindConn_Success(t *testing.T) {
 	conn := newALDProConn(t)
 
-	user, err := conn.AuthenticateConn(context.Background(),
+	user, err := conn.BindConn(context.Background(),
 		aldproSvcDN, aldproSvcPass, aldproBaseDN)
 	require.NoError(t, err)
 	require.NotNil(t, user)
 	assert.Equal(t, aldproSvcDN, user.DN)
 }
 
-func TestIntegrationALDPro_AuthenticateConn_EmptyCredentials(t *testing.T) {
+func TestIntegrationALDPro_BindConn_EmptyCredentials(t *testing.T) {
 	conn := newALDProConn(t)
-	_, err := conn.AuthenticateConn(context.Background(), "", "", aldproBaseDN)
+	_, err := conn.BindConn(context.Background(), "", "", aldproBaseDN)
 	require.Error(t, err)
 	assert.ErrorIs(t, err, ldapper.ErrInvalidArgument)
 }
 
-func TestIntegrationALDPro_AuthenticateConn_WrongPassword(t *testing.T) {
+func TestIntegrationALDPro_BindConn_WrongPassword(t *testing.T) {
 	conn := newALDProConn(t)
-	_, err := conn.AuthenticateConn(context.Background(),
+	_, err := conn.BindConn(context.Background(),
 		aldproSvcDN, "bad-password", aldproBaseDN)
 	require.Error(t, err)
 	assert.ErrorIs(t, err, ldapper.ErrInvalidCredentials)
@@ -799,9 +798,9 @@ func TestIntegrationALDPro_AuthenticateConn_WrongPassword(t *testing.T) {
 		"submitted credentials must not echo back")
 }
 
-func TestIntegrationALDPro_AuthenticateConn_NonExistentUser(t *testing.T) {
+func TestIntegrationALDPro_BindConn_NonExistentUser(t *testing.T) {
 	conn := newALDProConn(t)
-	_, err := conn.AuthenticateConn(context.Background(),
+	_, err := conn.BindConn(context.Background(),
 		"cn=ghost,ou=users,"+aldproBaseDN, "whatever", aldproBaseDN)
 	require.Error(t, err)
 }
@@ -1291,14 +1290,14 @@ func TestIntegrationALDPro_OperationTimeout_WithOption(t *testing.T) {
 
 // ================== Failure paths ==================
 
-func TestIntegrationALDPro_AuthenticateConn_FailedBind_InvalidatesState(t *testing.T) {
+func TestIntegrationALDPro_BindConn_FailedBind_InvalidatesState(t *testing.T) {
 	conn := newALDProConn(t)
 
-	_, err := conn.AuthenticateConn(context.Background(),
+	_, err := conn.BindConn(context.Background(),
 		aldproSvcDN, aldproSvcPass, aldproBaseDN)
 	require.NoError(t, err)
 
-	_, err = conn.AuthenticateConn(context.Background(),
+	_, err = conn.BindConn(context.Background(),
 		aldproSvcDN, "wrong-password", aldproBaseDN)
 	require.Error(t, err)
 	assert.ErrorIs(t, err, ldapper.ErrInvalidCredentials)
@@ -1314,7 +1313,7 @@ func TestIntegrationALDPro_AuthenticateConn_FailedBind_InvalidatesState(t *testi
 // client unusable (ErrClosed) instead of falling back to anonymous.
 func TestIntegrationALDPro_Reconnect_RebindFailure_ClosesConnection(t *testing.T) {
 	conn := newALDProConn(t)
-	_, err := conn.AuthenticateConn(context.Background(),
+	_, err := conn.BindConn(context.Background(),
 		aldproSvcDN, aldproSvcPass, aldproBaseDN)
 	require.NoError(t, err)
 

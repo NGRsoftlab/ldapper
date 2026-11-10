@@ -366,36 +366,36 @@ func TestIntegrationFreeIPA_NewAuthenticatedConnection_WrongPassword(t *testing.
 	assert.ErrorIs(t, err, ldapper.ErrInvalidCredentials)
 }
 
-// ================== AuthenticateConn ==================
+// ================== BindConn ==================
 
-func TestIntegrationFreeIPA_AuthenticateConn_Success(t *testing.T) {
+func TestIntegrationFreeIPA_BindConn_Success(t *testing.T) {
 	conn := newFreeIPAConn(t)
 
-	user, err := conn.AuthenticateConn(context.Background(),
+	user, err := conn.BindConn(context.Background(),
 		freeipaAdminDN, freeipaAdminPass, freeipaBaseDN)
 	require.NoError(t, err)
 	require.NotNil(t, user)
 	assert.True(t, strings.HasPrefix(strings.ToLower(user.DN), "uid=admin,"))
 }
 
-func TestIntegrationFreeIPA_AuthenticateConn_EmptyCredentials(t *testing.T) {
+func TestIntegrationFreeIPA_BindConn_EmptyCredentials(t *testing.T) {
 	conn := newFreeIPAConn(t)
-	_, err := conn.AuthenticateConn(context.Background(), "", "", freeipaBaseDN)
+	_, err := conn.BindConn(context.Background(), "", "", freeipaBaseDN)
 	require.Error(t, err)
 	assert.ErrorIs(t, err, ldapper.ErrInvalidArgument)
 }
 
-func TestIntegrationFreeIPA_AuthenticateConn_WrongPassword(t *testing.T) {
+func TestIntegrationFreeIPA_BindConn_WrongPassword(t *testing.T) {
 	conn := newFreeIPAConn(t)
-	_, err := conn.AuthenticateConn(context.Background(),
+	_, err := conn.BindConn(context.Background(),
 		freeipaAdminDN, "bad-password", freeipaBaseDN)
 	require.Error(t, err)
 	assert.ErrorIs(t, err, ldapper.ErrInvalidCredentials)
 }
 
-func TestIntegrationFreeIPA_AuthenticateConn_NonExistentUser(t *testing.T) {
+func TestIntegrationFreeIPA_BindConn_NonExistentUser(t *testing.T) {
 	conn := newFreeIPAConn(t)
-	_, err := conn.AuthenticateConn(context.Background(),
+	_, err := conn.BindConn(context.Background(),
 		"uid=ghost,cn=users,cn=accounts,dc=example,dc=test", "whatever", freeipaBaseDN)
 	require.Error(t, err)
 }
@@ -747,15 +747,15 @@ func TestIntegrationFreeIPA_OperationTimeout_WithOption(t *testing.T) {
 // A failed Bind transitions the session to anonymous (RFC 4513 §4). The
 // cached auth state must be invalidated, so subsequent operations do not
 // silently run under the previously-bound principal.
-func TestIntegrationFreeIPA_AuthenticateConn_FailedBind_InvalidatesState(t *testing.T) {
+func TestIntegrationFreeIPA_BindConn_FailedBind_InvalidatesState(t *testing.T) {
 	requireFreeIPAUsers(t)
 	conn := newFreeIPAConn(t)
 
-	_, err := conn.AuthenticateConn(context.Background(),
+	_, err := conn.BindConn(context.Background(),
 		freeipaAdminDN, freeipaAdminPass, freeipaBaseDN)
 	require.NoError(t, err)
 
-	_, err = conn.AuthenticateConn(context.Background(),
+	_, err = conn.BindConn(context.Background(),
 		freeipaAdminDN, "wrong-password", freeipaBaseDN)
 	require.Error(t, err)
 	assert.ErrorIs(t, err, ldapper.ErrInvalidCredentials)

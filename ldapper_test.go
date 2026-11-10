@@ -236,7 +236,7 @@ func TestNewLDAPper_DialFails(t *testing.T) {
 // ================== NewAuthenticatedLDAPper ==================
 //
 // The success path requires a live connection: NewAuthenticatedLDAPper
-// calls AuthenticateConn which invokes Bind on the *ldap.Conn returned by
+// calls BindConn which invokes Bind on the *ldap.Conn returned by
 // dialConn, and a bare &ldap.Conn{} panics on Bind (nil net.Conn inside).
 // Full success coverage therefore lives in an integration test against a
 // real LDAP server (testcontainers-go is already in go.mod); here we cover

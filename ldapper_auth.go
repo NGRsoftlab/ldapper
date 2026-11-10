@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/go-ldap/ldap/v3"
+
 	"github.com/NGRsoftlab/ldapper/types"
 )
 
@@ -20,7 +22,7 @@ import (
 // caller re-authenticates explicitly.
 //
 // The base DN (bindDN) is intentionally preserved: it is the caller-supplied
-// search scope, not a credential, and is required if AuthenticateConn is
+// search scope, not a credential, and is required if BindConn is
 // invoked again on the same object.
 func (ldapper *LDAPper) invalidateAuthLocked() {
 	ldapper.isAuthenticated = false
@@ -52,17 +54,27 @@ func (ldapper *LDAPper) restoreServiceBindLocked(ctx context.Context) error {
 	return classifySensitiveBindError(err)
 }
 
-// AuthenticateConn binds as the service user and caches its credentials for
-// later reconnect and per-user checks. See CheckUserCredentials for verifying
-// an arbitrary user without disturbing the service session.
-// NB: if you need connection for futher catalog reading - pass read access granted user credentials here
-func (ldapper *LDAPper) AuthenticateConn(ctx context.Context, username, password, baseDN string) (*types.LDAPUser, error) {
+// BindConn binds as the service user and caches its credentials for
+// later reconnect and per-user checks. See CheckUserCredentials for
+// verifying an arbitrary user without disturbing the service session.
+//
+// Post-bind verification does not perform a user lookup: any principal
+// accepted by BindIdentity (UPN, sAMAccountName, DN — not necessarily an
+// entry matching UserObjectFilter, e.g. simpleSecurityObject service
+// accounts) is accepted as long as baseDN is reachable under the bound
+// identity.
+//
+// The returned *types.LDAPUser carries the bind principal in DN and has
+// empty Attributes. For OpenLDAP/FreeIPA DN is a real DN; for MSAD/ALDPro
+// it may be a UPN or sAMAccountName. Callers that need the user entry
+// must call GetUser separately.
+func (ldapper *LDAPper) BindConn(ctx context.Context, username, password, baseDN string) (*types.LDAPUser, error) {
 	ldapper.opMu.Lock()
 	defer ldapper.opMu.Unlock()
-	return ldapper.authenticateConnLocked(ctx, username, password, baseDN)
+	return ldapper.bindConnLocked(ctx, username, password, baseDN)
 }
 
-func (ldapper *LDAPper) authenticateConnLocked(ctx context.Context, username, password, baseDN string) (*types.LDAPUser, error) {
+func (ldapper *LDAPper) bindConnLocked(ctx context.Context, username, password, baseDN string) (*types.LDAPUser, error) {
 	if err := ldapper.requireConnLocked(); err != nil {
 		return nil, err
 	}
@@ -84,7 +96,7 @@ func (ldapper *LDAPper) authenticateConnLocked(ctx context.Context, username, pa
 	}
 
 	// Bind with the adapter-supplied principal. A failed Bind invalidates
-	// cached state; a failed post-bind lookup closes the connection.
+	// cached state; a failed post-bind verification closes the connection.
 	if err := ldapper.withCtx(ctx, ldapper.opTimeouts.Bind, func() error {
 		return ldapper.connection.Bind(bindUsername, password)
 	}); err != nil {
@@ -96,11 +108,11 @@ func (ldapper *LDAPper) authenticateConnLocked(ctx context.Context, username, pa
 		return nil, classifySensitiveBindError(err)
 	}
 
-	// Verify the bind principal by applying the adapter's user filter to
-	// the ORIGINAL login. The adapter's SearchUserFilterTemplate must
-	// accept every form it accepts in BindIdentity (see shipped adapters).
-	user, err := ldapper.getUserLocked(ctx, username, baseDN)
-	if err != nil {
+	// Verify the bind is usable by probing baseDN. This intentionally
+	// replaces the previous post-bind user lookup: service accounts
+	// (simpleSecurityObject, AD service principals) often do not match
+	// UserObjectFilter, but the base DN is still readable under them.
+	if err := ldapper.verifyBaseDNLocked(ctx, baseDN); err != nil {
 		if ldapper.connection != nil {
 			_ = ldapper.connection.Close()
 			ldapper.connection = nil
@@ -116,7 +128,9 @@ func (ldapper *LDAPper) authenticateConnLocked(ctx context.Context, username, pa
 	ldapper.bindPassword = password
 	ldapper.bindDN = baseDN
 
-	return user, nil
+	// The returned user carries only the bind principal; attributes are
+	// empty because no lookup was issued. See the BindConn doc comment.
+	return &types.LDAPUser{DN: bindUsername}, nil
 }
 
 // CheckUserCredentials verifies a user's password by binding as that user and
@@ -167,4 +181,34 @@ func (ldapper *LDAPper) CheckUserCredentials(ctx context.Context, username, pass
 	}
 
 	return user, nil
+}
+
+// verifyBaseDNLocked checks that baseDN exists and is readable under the
+// currently bound identity. Uses ScopeBaseObject so the server resolves
+// exactly one entry — a definitive "base is present and accessible".
+// Caller must hold opMu.
+func (ldapper *LDAPper) verifyBaseDNLocked(ctx context.Context, baseDN string) error {
+	req := ldap.NewSearchRequest(
+		baseDN,
+		ldap.ScopeBaseObject,
+		ldap.NeverDerefAliases,
+		1, // base-object returns at most one entry; hardcoded cap
+		ldapper.searchLimits.TimeLimit,
+		false,
+		"(objectClass=*)",
+		[]string{"1.1"}, // no attributes: DN-only probe
+		nil,
+	)
+
+	res, err := ldapper.withCtxResult(ctx, ldapper.opTimeouts.Search, func() (*ldap.SearchResult, error) {
+		return ldapper.connection.Search(req)
+	})
+	if err != nil {
+		return fmt.Errorf("base DN probe: %w", classifyLDAPError(err))
+	}
+	if len(res.Entries) == 0 {
+		return fmt.Errorf("%w: base DN %q not found or not visible",
+			ErrNotFoundOrNotVisible, baseDN)
+	}
+	return nil
 }

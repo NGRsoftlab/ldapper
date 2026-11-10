@@ -128,6 +128,8 @@ func main() {
     }
     defer conn.Close()
 
+    // user.DN is the bind principal (UPN for AD, DN for OpenLDAP/FreeIPA);
+    // user.Attributes is empty — call GetUser below for the full entry.
     log.Printf("authenticated as %s", user.DN)
 
     u, err := conn.GetUser(ctx, "jdoe", "DC=corp,DC=example,DC=com")
@@ -163,7 +165,7 @@ plain structs and functions.
 │  ldapper.go                        constructors + LDAPper struct   │
 │  ldapper_connection.go             dial / failover / IsAlive /     │
 │                                    Reconnect / EnsureAlive / Close │
-│  ldapper_auth.go                   AuthenticateConn,               │
+│  ldapper_auth.go                   BindConn,               │
 │                                    CheckUserCredentials            │
 │  ldapper_search.go                 searchPaged,                    │
 │                                    searchSingleEntryLocked,        │
@@ -227,7 +229,7 @@ LDAPper
 ├── catalogAdapter  interfaces.CatalogAdapter       schema-specific behavior
 ├── connection      interfaces.LDAPConn             active network connection
 │
-├── isAuthenticated bool                            set by AuthenticateConn
+├── isAuthenticated bool                            set by BindConn
 ├── bindUser        string                          cached for re-bind on
 ├── bindPassword    string                            Reconnect /
 ├── bindDN          string                            CheckUserCredentials
@@ -251,7 +253,7 @@ Every search method funnels through `newSearchRequest(...)`, which injects
 `searchLimits`. Changing limits at runtime (`SetSearchLimits`) is
 therefore a single assignment with no plumbing.
 
-`bindDN` is a subtle but useful field: `AuthenticateConn(ctx, username,
+`bindDN` is a subtle but useful field: `BindConn(ctx, username,
 password, baseDN)` records `baseDN` so that later calls to
 `CheckUserCredentials(ctx, username, password)` can look users up under
 the same base DN without the caller repeating it.
@@ -369,9 +371,13 @@ func NewLDAPper(
     opts ...Option,
 ) (*LDAPper, error)
 
-// Authenticated: dials, then binds as `username` and looks the user up
-// via the adapter's user filter to confirm the credentials. The same
-// `username` and `baseDN` are cached for later CheckUserCredentials calls.
+// Authenticated: dials, then binds as `username` and probes `baseDN`
+// with a base-object search to confirm the tree is reachable under the
+// bound identity. No post-bind user lookup is performed, so service
+// principals that do not match UserObjectFilter are accepted. The
+// returned *types.LDAPUser carries only the bind principal (DN); call
+// GetUser to fetch the user entry. `username` and `baseDN` are cached
+// for later CheckUserCredentials calls.
 func NewAuthenticatedLDAPper(
     ctx context.Context,
     username, password, baseDN string,
@@ -698,18 +704,21 @@ Key differences to keep in mind:
 
 ```go
 // Bind as `username` and store the credentials + base DN for later use.
-user, err := conn.AuthenticateConn(ctx, username, password, baseDN)
+user, err := conn.BindConn(ctx, username, password, baseDN)
 
 // Verify a user's password against an already-authenticated connection,
 // then rebind back to the service account.
 user, err := conn.CheckUserCredentials(ctx, username, password)
 ```
 
-`AuthenticateConn`:
+`BindConn`:
 
-- Stores `username`, `password` and `baseDN` on the connection.
-- Performs the bind **first**, then looks the user up via the adapter's
-  user filter. If the bind fails, the user lookup is never issued
+- Stores username, password and baseDN on the connection.
+  Performs the bind first, then probes baseDN with a base-object search 
+  to confirm the tree is reachable under the bound identity.
+  No post-bind user lookup is performed. The returned *types.LDAPUser 
+  carries only the bind principal in DN (may be a UPN on MSAD/ALDPro); 
+  call GetUser for the user entry. If the bind fails, the base-DN probe is never issued
   (`errors.Is(err, ErrInvalidCredentials)`).
 - On success, caches `isAuthenticated=true`, `bindUser`, `bindPassword`,
   `bindDN`. `bindUser` is the value returned by `BindIdentity`, **not**
@@ -721,7 +730,7 @@ user, err := conn.CheckUserCredentials(ctx, username, password)
 
 `CheckUserCredentials`:
 
-- Requires `isAuthenticated == true` (i.e. `AuthenticateConn` or
+- Requires `isAuthenticated == true` (i.e. `BindConn` or
   `NewAuthenticatedLDAPper` was called) **and** a live connection.
   Otherwise returns `ErrNotAuthenticated` or `ErrClosed` respectively.
 - Uses the **stored `bindDN`** as the base DN for the internal user
@@ -865,7 +874,7 @@ if err := conn.EnsureAlive(ctx); err != nil {
   `hosts` again, and — if the connection was authenticated — re-binds with
   the stored credentials. On rebind failure, the new connection is
   closed, `isAuthenticated` is cleared, and subsequent operations return
-  `ErrClosed` until `AuthenticateConn` is called again. `bindDN` is
+  `ErrClosed` until `BindConn` is called again. `bindDN` is
   preserved, so `CheckUserCredentials` continues to work after a
   successful reconnect.
 - **`EnsureAlive(ctx)`** — `IsAlive()` first; reconnect only when stale.
@@ -888,7 +897,7 @@ preserved in the wrapped chain (`errors.As` still works).
 | `ErrInvalidArgument`           | Config or argument validation failed (empty/invalid DN, empty username, invalid host, invalid port, `useSSL && skipTLS`, nil TLS config, nil adapter, …). |
 | `ErrInvalidCredentials`        | Bind rejected as bad credentials. Also returned by `CheckUserCredentials` when the user is missing (enumeration protection). |
 | `ErrInvalidCredentialsOrUnknown` | Bind-path classifier could not map the LDAP result code to a specific sentinel. Treat as inconclusive, not as a rejection. |
-| `ErrNotAuthenticated`          | `CheckUserCredentials` called on a connection without a successful prior `AuthenticateConn`/`NewAuthenticatedLDAPper`, or the service rebind was lost. |
+| `ErrNotAuthenticated`          | `CheckUserCredentials` called on a connection without a successful prior `BindConn`/`NewAuthenticatedLDAPper`, or the service rebind was lost. |
 | `ErrUnavailable`               | Directory unreachable (dial failure, `LDAPResultUnavailable`/`Busy`/`ServerDown`, transport errors). |
 | `ErrTimeout`                   | Timeout / deadline exceeded (`LDAPResultTimeout`, `LDAPResultTimeLimitExceeded`, `net.Error.Timeout`, `context.DeadlineExceeded`). |
 | `ErrClosed`                    | The connection is nil (never initialized, or `Close()` was called, or a failed reconnect left it nil). |
@@ -902,6 +911,10 @@ Bind-path failures **never** wrap the raw LDAP text — this prevents
 credential leakage into logs when the server echoes back the submitted
 password. All bind errors are mapped to bare sentinels by
 `classifySensitiveBindError`.
+
+BindConn can return ErrNotFoundOrNotVisible if baseDN is unreachable under 
+the bound identity (for example, when the bind principal has no read access to the tree root). 
+This is produced by the base-DN probe, not by a user lookup.
 
 Non-bind failures use `classifyLDAPError`, which wraps both the sentinel
 and the original error:
@@ -1084,7 +1097,8 @@ Unit tests run without any network access and cover:
   `dialAnyLocked`. Tests that swap the package-level `dialConn` seam are
   **not** parallel — the swap is process-wide.
 - **Auth** — `ldapper_auth_test.go`: `invalidateAuthLocked`,
-  `restoreServiceBindLocked`, `AuthenticateConn`,
+  `restoreServiceBindLocked`, `bindConnLocked` / `verifyBaseDNLocked`
+  (success path, 0-entry base probe, transport failure), `BindConn`,
   `CheckUserCredentials` (user-not-found masking, restore-failure path,
   context-cancelled path).
 - **User / group / OU ops** — `ldapper_user_ops_test.go`,

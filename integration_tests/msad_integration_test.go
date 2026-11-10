@@ -326,27 +326,27 @@ func TestIntegrationMSAD_NewAuthenticatedConnection_WrongPassword(t *testing.T) 
 	assert.ErrorIs(t, err, ldapper.ErrInvalidCredentials)
 }
 
-// ================== AuthenticateConn ==================
+// ================== BindConn ==================
 
-func TestIntegrationMSAD_AuthenticateConn_Success(t *testing.T) {
+func TestIntegrationMSAD_BindConn_Success(t *testing.T) {
 	conn := newMSADConn(t)
 
-	user, err := conn.AuthenticateConn(context.Background(), msadAdminDN, msadAdminPass, msadBaseDN)
+	user, err := conn.BindConn(context.Background(), msadAdminDN, msadAdminPass, msadBaseDN)
 	require.NoError(t, err)
 	require.NotNil(t, user)
 	assert.True(t, strings.HasPrefix(strings.ToLower(user.DN), "cn=administrator,"))
 }
 
-func TestIntegrationMSAD_AuthenticateConn_EmptyCredentials(t *testing.T) {
+func TestIntegrationMSAD_BindConn_EmptyCredentials(t *testing.T) {
 	conn := newMSADConn(t)
-	_, err := conn.AuthenticateConn(context.Background(), "", "", msadBaseDN)
+	_, err := conn.BindConn(context.Background(), "", "", msadBaseDN)
 	require.Error(t, err)
 	assert.ErrorIs(t, err, ldapper.ErrInvalidArgument)
 }
 
-func TestIntegrationMSAD_AuthenticateConn_WrongPassword(t *testing.T) {
+func TestIntegrationMSAD_BindConn_WrongPassword(t *testing.T) {
 	conn := newMSADConn(t)
-	_, err := conn.AuthenticateConn(context.Background(), msadAdminDN, "bad-password", msadBaseDN)
+	_, err := conn.BindConn(context.Background(), msadAdminDN, "bad-password", msadBaseDN)
 	require.Error(t, err)
 	assert.ErrorIs(t, err, ldapper.ErrInvalidCredentials)
 }
@@ -724,13 +724,13 @@ func TestIntegrationMSAD_OperationTimeout_WithOption(t *testing.T) {
 
 // ================== Failure paths ==================
 
-func TestIntegrationMSAD_AuthenticateConn_FailedBind_InvalidatesState(t *testing.T) {
+func TestIntegrationMSAD_BindConn_FailedBind_InvalidatesState(t *testing.T) {
 	conn := newMSADConn(t)
 
-	_, err := conn.AuthenticateConn(context.Background(), msadAdminDN, msadAdminPass, msadBaseDN)
+	_, err := conn.BindConn(context.Background(), msadAdminDN, msadAdminPass, msadBaseDN)
 	require.NoError(t, err)
 
-	_, err = conn.AuthenticateConn(context.Background(), msadAdminDN, "wrong-password", msadBaseDN)
+	_, err = conn.BindConn(context.Background(), msadAdminDN, "wrong-password", msadBaseDN)
 	require.Error(t, err)
 	assert.ErrorIs(t, err, ldapper.ErrInvalidCredentials)
 
@@ -744,7 +744,7 @@ func TestIntegrationMSAD_AuthenticateConn_FailedBind_InvalidatesState(t *testing
 // the stale cached password and leaves the client unusable (ErrClosed).
 func TestIntegrationMSAD_Reconnect_RebindFailure_ClosesConnection(t *testing.T) {
 	conn := newMSADConn(t)
-	_, err := conn.AuthenticateConn(context.Background(), msadUser1SAM, msadUser1Pass, msadBaseDN)
+	_, err := conn.BindConn(context.Background(), msadUser1SAM, msadUser1Pass, msadBaseDN)
 	require.NoError(t, err)
 
 	ctx := context.Background()

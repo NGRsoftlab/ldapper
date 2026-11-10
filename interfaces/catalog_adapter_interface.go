@@ -46,10 +46,12 @@ type CatalogAdapter interface {
 	//   - FreeIPA:       requires a DN → "uid=<login>,cn=users,cn=accounts,
 	//                    <baseDN>" when <login> is not already a DN.
 	//
-	// The lookup uses the ORIGINAL login (not the value returned by
-	// BindIdentity), so SearchUserFilterTemplate must accept every form
-	// that BindIdentity accepts — typically by unioning the schema
-	// attribute with an entryDN alternative (see the shipped adapters).
+	// The lookup performed by GetUser / GetUserGroups / CheckUserCredentials
+	// uses the ORIGINAL login (not the value returned by BindIdentity), so
+	// SearchUserFilterTemplate must accept every form that BindIdentity
+	// accepts — typically by unioning the schema attribute with an entryDN
+	// alternative (see the shipped adapters). BindConn itself does not
+	// perform a post-bind user lookup; it verifies baseDN reachability only.
 	//
 	// Returning an error lets the adapter reject inputs it cannot map to
 	// a bind principal (e.g. a short-form login with an empty baseDN).

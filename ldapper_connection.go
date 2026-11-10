@@ -245,6 +245,7 @@ func dialHost(ctx context.Context, host string, port uint,
 	if tlsTimeout <= 0 {
 		tlsTimeout = constants.DefaultStartTLSTimeout
 	}
+
 	if dl, ok := ctx.Deadline(); ok {
 		remaining := time.Until(dl)
 		if remaining <= 0 {
@@ -299,6 +300,7 @@ func dialHost(ctx context.Context, host string, port uint,
 		_ = conn.Close()
 		return nil, fmt.Errorf("start tls: %w", classifyLDAPError(err))
 	}
+
 	return conn, nil
 }
 
@@ -349,7 +351,7 @@ func (ldapper *LDAPper) isAliveLocked(ctx context.Context) bool {
 // against any of the configured hosts. If the previous connection was
 // authenticated, the stored bind credentials are re-applied — and if the
 // rebind fails, the new connection is closed and the cached auth state is
-// invalidated (subsequent operations return ErrClosed until AuthenticateConn
+// invalidated (subsequent operations return ErrClosed until BindConn
 // is called again).
 func (ldapper *LDAPper) Reconnect(ctx context.Context) error {
 	ldapper.opMu.Lock()

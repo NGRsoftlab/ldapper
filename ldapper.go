@@ -126,12 +126,20 @@ func NewLDAPper(
 	return ldapper, nil
 }
 
+// NewAuthenticatedLDAPper dials a host and binds as `username`, then
+// verifies the connection by probing `baseDN` with a base-object search.
+// No post-bind user lookup is performed: any principal accepted by the
+// adapter's BindIdentity is accepted as long as baseDN is reachable
+// under it. The returned *types.LDAPUser carries only the bind principal
+// in DN (may be a UPN on MSAD/ALDPro); call GetUser for the user entry.
+//
+// `username` and `baseDN` are cached for later CheckUserCredentials calls.
+//
 // NB: if you need connection for futher catalog reading - pass read access granted user credentials here
 // NB: hosts and TLS config are validated and copied by NewLDAPper; see its
 // doc comment for the host count limit and TLS mode semantics.
 // NB: use WithSearchLimits(...) to override default size/time limits for all search requests.
 // NB: use WithDialTimeout(...) to override default dial timeout for connect/reconnect.
-// NB: use useSSL=false with skipTLS=true only for dev/test purposes, not production
 func NewAuthenticatedLDAPper(
 	ctx context.Context,
 	username, password, baseDN string,
@@ -152,7 +160,7 @@ func NewAuthenticatedLDAPper(
 		return nil, nil, err
 	}
 
-	user, err := ldapper.AuthenticateConn(ctx, username, password, baseDN)
+	user, err := ldapper.BindConn(ctx, username, password, baseDN)
 	if err != nil {
 		ldapper.Close()
 		return nil, nil, err

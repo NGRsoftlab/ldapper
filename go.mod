@@ -1,6 +1,6 @@
 module github.com/NGRsoftlab/ldapper
 
-go 1.26.10
+go 1.26.8
 
 require (
 	github.com/go-ldap/ldap/v3 v3.4.15

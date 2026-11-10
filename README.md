@@ -113,7 +113,7 @@ func main() {
     conn, user, err := ldapper.NewAuthenticatedLDAPper(
         ctx,
         "svc-reader@corp.example.com", "secret",       // bind credentials
-        "DC=corp,DC=example,DC=com",                   // base DN for user lookup
+        "DC=corp,DC=example,DC=com",                   // base DN for probe and user lookups
         []string{"dc1.corp.example.com", "dc2.corp.example.com"},
         636,        // port
         true,       // useSSL (LDAPS)

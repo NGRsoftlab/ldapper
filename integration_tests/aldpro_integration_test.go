@@ -53,7 +53,7 @@ package ldapper_test
 //   iteration) blocks that anonymous comparison and every non-root bind
 //   fails with LDAP Result Code 49 "Invalid Credentials". The second rule
 //   lets authenticated non-admins read the tree, which is what
-//   BindConn's post-bind lookup and GetUser require.
+//   BindConn's base-DN probe and GetUser require.
 //
 //   Without this the auth-path searches would all fail with ErrNotFound
 //   even though the data is present.

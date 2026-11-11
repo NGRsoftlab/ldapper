@@ -57,6 +57,7 @@ the tags are also what keeps the four suites from colliding).
 - [Architecture](#architecture)
 - [Core concepts](#core-concepts)
   - [Connections](#connections)
+  - [mTLS](#mtls)
   - [Adapters](#adapters)
   - [Search limits](#search-limits)
   - [Dial timeout](#dial-timeout)
@@ -406,6 +407,159 @@ Other constructor rules:
 - **`dialConn` is a package-level variable** (of type `DialFunc`) so
   tests can swap it out via `withDialConn(t, fn)` without touching
   production code.
+
+### mTLS
+
+Mutual TLS works with no LDAPper-specific API: the `*tls.Config` passed
+to `NewLDAPper` / `NewAuthenticatedLDAPper` is `Clone()`d and then used
+verbatim by both transports —
+
+- **LDAPS** (`useLDAPS=true`) — `tls.Dialer{Config: tlsCfg}` in `dialHost`.
+- **StartTLS** (`useLDAPS=false, skipStartTLS=false`) — `conn.StartTLS(tlsCfg)`
+  immediately after the plain dial.
+
+Client authentication is configured exactly as in the standard library:
+put the client certificate into `tls.Config.Certificates` (or
+`tls.Config.GetClientCertificate`), and the CA that signed the server
+certificate into `tls.Config.RootCAs`.
+
+#### LDAPS
+
+```go
+cert, err := tls.LoadX509KeyPair("client.crt", "client.key")
+if err != nil {
+    log.Fatalf("load client cert: %v", err)
+}
+
+caPool := x509.NewCertPool()
+caPEM, err := os.ReadFile("ca.crt")
+if err != nil {
+    log.Fatalf("read CA: %v", err)
+}
+if !caPool.AppendCertsFromPEM(caPEM) {
+    log.Fatal("CA bundle contains no valid certificates")
+}
+
+tlsCfg := &tls.Config{
+    // Optional for LDAPS: ServerName is inferred from the dialed host.
+    // Set it explicitly when `hosts` holds an IP or a name that does not
+    // appear in the server certificate's SAN.
+    ServerName:   "ldap.example.com",
+    RootCAs:      caPool,
+    Certificates: []tls.Certificate{cert},
+    MinVersion:   tls.VersionTLS12,
+}
+
+conn, err := ldapper.NewAuthenticatedLDAPper(
+    ctx,
+    "svc-reader@corp.example.com", "secret", "DC=corp,DC=example,DC=com",
+    []string{"ldap.example.com"}, 636,
+    true,  // useLDAPS
+    false, // skipStartTLS (must be false when useLDAPS is true)
+    tlsCfg,
+    adapters.MSADAdapter{},
+)
+```
+
+#### StartTLS
+
+`ServerName` is **required** for StartTLS: `go-ldap` calls
+`tls.Client(conn, cfg)` without a `ServerName` hint, so the standard
+library rejects the handshake with
+
+```
+tls: either ServerName or InsecureSkipVerify must be specified in the tls.Config
+```
+
+unless one of the two fields is set. `InsecureSkipVerify: true` defeats
+the point of TLS — prefer `ServerName`.
+
+```go
+tlsCfg := &tls.Config{
+    ServerName:   "ldap.example.com", // required for StartTLS
+    RootCAs:      caPool,
+    Certificates: []tls.Certificate{cert},
+    MinVersion:   tls.VersionTLS12,
+}
+
+conn, err := ldapper.NewLDAPper(
+    ctx, []string{"ldap.example.com"}, 389,
+    false, // useLDAPS
+    false, // skipStartTLS → StartTLS upgrade
+    tlsCfg,
+    adapters.OPENLDAPAdapter{},
+)
+```
+
+#### Certificate rotation
+
+`NewLDAPper` stores a `Clone()` of the provided `tls.Config`. The clone
+is shallow — the `Certificates` slice and the DER bytes inside each
+`tls.Certificate` are shared with the caller — so **do not mutate the
+certificate bytes after passing them in**. For hot rotation (common with
+short-lived mTLS certificates issued by Vault / SPIRE / a custom CA),
+use `tls.Config.GetClientCertificate` instead of `Certificates`; the
+callback is invoked on every handshake, and `Clone()` copies it by
+reference:
+
+```go
+type certRotator struct {
+    mu  sync.RWMutex
+    cur *tls.Certificate
+}
+
+func (r *certRotator) load(crtPath, keyPath string) error {
+    c, err := tls.LoadX509KeyPair(crtPath, keyPath)
+    if err != nil {
+        return err
+    }
+    r.mu.Lock()
+    r.cur = &c
+    r.mu.Unlock()
+    return nil
+}
+
+func (r *certRotator) get(*tls.CertificateRequestInfo) (*tls.Certificate, error) {
+    r.mu.RLock()
+    defer r.mu.RUnlock()
+    return r.cur, nil
+}
+
+tlsCfg := &tls.Config{
+    ServerName:           "ldap.example.com",
+    RootCAs:              caPool,
+    GetClientCertificate: rotator.get,
+    MinVersion:           tls.VersionTLS12,
+}
+```
+
+To pick up new material, reload it in the rotator and call
+`conn.Reconnect(ctx)`: reconnect performs a fresh TLS handshake against
+`ldapper.tlsCfg`, so the callback serves the new certificate
+immediately. Cached bind credentials (see [Connections](#connections))
+survive the reconnect — `Reconnect` replays the bind before publishing
+the connection, and a failed rebind still invalidates auth state and
+returns `ErrInvalidCredentials`, exactly as for non-mTLS connections.
+
+#### Diagnostics
+
+TLS handshake failures — including "server rejected client certificate"
+— flow through `classifyLDAPError` and surface as `ErrUnavailable`
+(transport class). They are not distinguishable from a network outage
+via `errors.Is` today. Use `errors.As` against `*tls.CertificateVerificationError`
+or an `x509` error type if you need the root cause:
+
+```go
+var cvErr *tls.CertificateVerificationError
+if errors.As(err, &cvErr) {
+    log.Printf("TLS verification failed: %v", cvErr)
+}
+```
+
+> **Note:** `tls.Config.ClientAuth` is a **server-side** field. Setting
+> it on the client has no effect — the certificate presented by the
+> client is selected from `Certificates` / `GetClientCertificate`, not
+> by `ClientAuth`.
 
 ### Adapters
 

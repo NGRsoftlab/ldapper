@@ -1,3 +1,2 @@
 - other adapters
-- fuzzing tests
 - wide user/ou/group normalisation

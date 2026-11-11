@@ -17,7 +17,7 @@ import (
 
 // DialFunc is a seam for tests.
 type DialFunc func(ctx context.Context, host string, port uint,
-	useSSL, skipTLS bool, tlsCfg *tls.Config, timeout time.Duration) (*ldap.Conn, error)
+	useLDAPS, skipStartTLS bool, tlsCfg *tls.Config, timeout time.Duration) (*ldap.Conn, error)
 
 var dialConn DialFunc = dialHost
 
@@ -195,7 +195,7 @@ func (ldapper *LDAPper) connectLocked(ctx context.Context) error {
 func (ldapper *LDAPper) dialAnyLocked(ctx context.Context) (interfaces.LDAPConn, string, error) {
 	var lastErr error
 	for _, host := range ldapper.hosts {
-		c, err := dialConn(ctx, host, ldapper.port, ldapper.useSSL, ldapper.skipTLS,
+		c, err := dialConn(ctx, host, ldapper.port, ldapper.useLDAPS, ldapper.skipStartTLS,
 			ldapper.tlsCfg, ldapper.dialTimeout)
 		if err != nil {
 			lastErr = err
@@ -211,12 +211,12 @@ func (ldapper *LDAPper) dialAnyLocked(ctx context.Context) (interfaces.LDAPConn,
 
 // dialHost establishes a single LDAP connection to the given host.
 func dialHost(ctx context.Context, host string, port uint,
-	useSSL, skipTLS bool, tlsCfg *tls.Config, timeout time.Duration,
+	useLDAPS, skipStartTLS bool, tlsCfg *tls.Config, timeout time.Duration,
 ) (*ldap.Conn, error) {
 	addr := net.JoinHostPort(formatHost(host), strconv.FormatUint(uint64(port), 10))
 	dialer := &net.Dialer{Timeout: timeout}
 
-	if useSSL {
+	if useLDAPS {
 		td := &tls.Dialer{Config: tlsCfg, NetDialer: dialer}
 		raw, err := td.DialContext(ctx, "tcp", addr)
 		if err != nil {
@@ -234,7 +234,7 @@ func dialHost(ctx context.Context, host string, port uint,
 	conn := ldap.NewConn(raw, false)
 	conn.Start()
 
-	if skipTLS {
+	if skipStartTLS {
 		return conn, nil
 	}
 

@@ -36,8 +36,8 @@ type LDAPper struct {
 	catalogAdapter interfaces.CatalogAdapter
 	hosts          []string
 	port           uint
-	useSSL         bool
-	skipTLS        bool
+	useLDAPS       bool
+	skipStartTLS   bool
 	tlsCfg         *tls.Config
 }
 
@@ -47,16 +47,16 @@ type LDAPper struct {
 // attempt sequential dialing against each.
 // NB: use WithSearchLimits(...) to override default size/time limits for all search requests.
 // NB: use WithDialTimeout(...) to override default dial timeout for connect/reconnect.
-// NB: skipTLS only affects plain LDAP connections: when false, StartTLS is
+// NB: skipStartTLS only affects plain LDAP connections: when false, StartTLS is
 // performed after Dial; when true, the connection stays in cleartext.
-// For LDAPS (useSSL=true) the flag has no effect.
-// NB: use useSSL=false with skipTLS=true only for dev/test purposes, not production
+// For LDAPS (useLDAPS=true) the flag has no effect.
+// NB: use useLDAPS=false with skipStartTLS=true only for dev/test purposes, not production
 func NewLDAPper(
 	ctx context.Context,
 	hosts []string,
 	port uint,
-	useSSL bool,
-	skipTLS bool,
+	useLDAPS bool,
+	skipStartTLS bool,
 	tlsCfg *tls.Config,
 	catalogAdapter interfaces.CatalogAdapter,
 	opts ...Option) (*LDAPper, error) {
@@ -81,11 +81,11 @@ func NewLDAPper(
 		return nil, fmt.Errorf("%w: invalid port %d", ErrInvalidArgument, port)
 	}
 
-	if useSSL && skipTLS {
-		return nil, fmt.Errorf("%w: skipTLS has no effect with useSSL", ErrInvalidArgument)
+	if useLDAPS && skipStartTLS {
+		return nil, fmt.Errorf("%w: skipStartTLS has no effect with useLDAPS", ErrInvalidArgument)
 	}
 
-	if tlsCfg == nil && !skipTLS {
+	if tlsCfg == nil && !skipStartTLS {
 		return nil, fmt.Errorf("%w: nil tls config", ErrInvalidArgument)
 	}
 
@@ -102,8 +102,8 @@ func NewLDAPper(
 		catalogAdapter: catalogAdapter,
 		hosts:          append([]string(nil), hosts...), // defensive copy
 		port:           port,
-		useSSL:         useSSL,
-		skipTLS:        skipTLS,
+		useLDAPS:       useLDAPS,
+		skipStartTLS:   skipStartTLS,
 		tlsCfg:         clonedTLSCfg,
 		searchLimits:   DefaultSearchLimits(),
 		dialTimeout:    constants.DefaultDialTimeout,
@@ -144,8 +144,8 @@ func NewAuthenticatedLDAPper(
 	username, password, baseDN string,
 	hosts []string,
 	port uint,
-	useSSL bool,
-	skipTLS bool,
+	useLDAPS bool,
+	skipStartTLS bool,
 	tlsCfg *tls.Config,
 	catalogAdapter interfaces.CatalogAdapter,
 	opts ...Option) (*LDAPper, error) {
@@ -154,7 +154,7 @@ func NewAuthenticatedLDAPper(
 		return nil, fmt.Errorf("%w: empty bind username/password", ErrInvalidArgument)
 	}
 
-	ldapper, err := NewLDAPper(ctx, hosts, port, useSSL, skipTLS, tlsCfg, catalogAdapter, opts...)
+	ldapper, err := NewLDAPper(ctx, hosts, port, useLDAPS, skipStartTLS, tlsCfg, catalogAdapter, opts...)
 	if err != nil {
 		return nil, err
 	}

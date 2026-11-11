@@ -116,8 +116,8 @@ func main() {
         "DC=corp,DC=example,DC=com",                   // base DN for probe and user lookups
         []string{"dc1.corp.example.com", "dc2.corp.example.com"},
         636,        // port
-        true,       // useSSL (LDAPS)
-        false,      // skipTLS (must be false when useSSL is true)
+        true,       // useLDAPS
+        false,      // skipStartTLS (must be false when useLDAPS is true)
         &tls.Config{MinVersion: tls.VersionTLS12},
         adapter,
         ldapper.WithSearchLimits(limits),
@@ -236,8 +236,8 @@ LDAPper
 ├── currentHost     string                          host of the active conn
 ├── port            uint
 │
-├── useSSL          bool                            LDAPS vs plain LDAP
-├── skipTLS         bool                            disable StartTLS upgrade
+├── useLDAPS        bool                            LDAPS vs plain LDAP
+├── skipStartTLS    bool                            disable StartTLS upgrade
 ├── tlsCfg          *tls.Config
 │
 ├── searchLimits    SearchLimits                    injected via newSearchRequest
@@ -361,7 +361,7 @@ func NewLDAPper(
     ctx context.Context,
     hosts []string,
     port uint,
-    useSSL, skipTLS bool,
+    useLDAPS, skipStartTLS bool,
     tlsCfg *tls.Config,
     catalogAdapter interfaces.CatalogAdapter,
     opts ...Option,
@@ -378,16 +378,16 @@ func NewAuthenticatedLDAPper(
     username, password, baseDN string,
     hosts []string,
     port uint,
-    useSSL, skipTLS bool,
+    useLDAPS, skipStartTLS bool,
     tlsCfg *tls.Config,
     catalogAdapter interfaces.CatalogAdapter,
     opts ...Option,
 ) (*LDAPper, error)
 ```
 
-TLS matrix — `useSSL` and `skipTLS` together select the transport:
+TLS matrix — `useLDAPS` and `skipStartTLS` together select the transport:
 
-| `useSSL` | `skipTLS` | `tlsCfg` | Result                                          |
+| `useLDAPS` | `skipStartTLS` | `tlsCfg` | Result                                          |
 |----------|-----------|----------|-------------------------------------------------|
 | `true`   | `false`   | required | LDAPS — TLS from the first byte                 |
 | `true`   | `true`    | —        | **rejected** (`ErrInvalidArgument`)             |
@@ -889,7 +889,7 @@ preserved in the wrapped chain (`errors.As` still works).
 
 | Sentinel                       | Meaning |
 |--------------------------------|---------|
-| `ErrInvalidArgument`           | Config or argument validation failed (empty/invalid DN, empty username, invalid host, invalid port, `useSSL && skipTLS`, nil TLS config, nil adapter, …). |
+| `ErrInvalidArgument`           | Config or argument validation failed (empty/invalid DN, empty username, invalid host, invalid port, `useLDAPS && skipStartTLS`, nil TLS config, nil adapter, …). |
 | `ErrInvalidCredentials`        | Bind rejected as bad credentials. Also returned by `CheckUserCredentials` when the user is missing (enumeration protection). |
 | `ErrInvalidCredentialsOrUnknown` | Bind-path classifier could not map the LDAP result code to a specific sentinel. Treat as inconclusive, not as a rejection. |
 | `ErrNotAuthenticated`          | `CheckUserCredentials` called on a connection without a successful prior `BindConn`/`NewAuthenticatedLDAPper`, or the service rebind was lost. |

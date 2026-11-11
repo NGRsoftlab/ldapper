@@ -104,18 +104,18 @@ func TestNewLDAPper_UseSSLWithSkipTLS(t *testing.T) {
 	t.Parallel()
 
 	_, err := NewLDAPper(context.Background(),
-		[]string{"h"}, 636, true /*useSSL*/, true /*skipTLS*/, stubTLSCfg(), fakeAdapter{})
+		[]string{"h"}, 636, true /*useLDAPS*/, true /*skipStartTLS*/, stubTLSCfg(), fakeAdapter{})
 
 	require.Error(t, err)
 	assert.ErrorIs(t, err, ErrInvalidArgument)
-	assert.Contains(t, err.Error(), "skipTLS has no effect")
+	assert.Contains(t, err.Error(), "skipStartTLS has no effect")
 }
 
 func TestNewLDAPper_NilTLSWithoutSkip(t *testing.T) {
 	t.Parallel()
 
 	_, err := NewLDAPper(context.Background(),
-		[]string{"h"}, 389, false /*useSSL*/, false /*skipTLS*/, nil, fakeAdapter{})
+		[]string{"h"}, 389, false /*useLDAPS*/, false /*skipStartTLS*/, nil, fakeAdapter{})
 
 	require.Error(t, err)
 	assert.ErrorIs(t, err, ErrInvalidArgument)
@@ -192,7 +192,7 @@ func TestNewLDAPper_ClonesTLSConfig(t *testing.T) {
 
 	orig := stubTLSCfg()
 	l, err := NewLDAPper(context.Background(),
-		[]string{"h"}, 389, true /*useSSL*/, false, orig, fakeAdapter{})
+		[]string{"h"}, 389, true /*useLDAPS*/, false, orig, fakeAdapter{})
 
 	require.NoError(t, err)
 	require.NotNil(t, l.tlsCfg)

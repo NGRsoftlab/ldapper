@@ -213,8 +213,8 @@ func newMSADConn(t *testing.T, opts ...ldapper.Option) *ldapper.LDAPper {
 		context.Background(),
 		[]string{msadHost},
 		msadPort,
-		false, // useSSL
-		true,  // skipTLS
+		false, // useLDAPS
+		true,  // skipStartTLS
 		nil,
 		msadAdpt,
 		opts...,

@@ -4,6 +4,8 @@ on:
   workflow_dispatch:
   schedule:
     - cron: '0 3 * * *'   # nightly
+  push:
+    branches: [main]
   pull_request:
     paths:
       - 'adapters/**'

@@ -1,6 +1,6 @@
-// Copyright 2020-2026 NGR Softlab
 // Package ldapper provides a thin, opinionated LDAP client with pluggable
 // catalog adapters (AldPro, FreeIPA, MSAD, OpenLDAP). ...
+// Copyright 2020-2026 NGR Softlab
 package ldapper
 
 import (

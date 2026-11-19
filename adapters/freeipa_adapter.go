@@ -3,7 +3,6 @@ package adapters
 
 import (
 	"fmt"
-	"strings"
 
 	"github.com/go-ldap/ldap/v3"
 
@@ -67,22 +66,35 @@ func (a FREEIPAAdapter) BindIdentity(login, baseDN string) (string, error) {
 	if baseDN == "" {
 		return "", fmt.Errorf("baseDN required for short-form bind")
 	}
+
+	// Parse baseDN once so the cn=accounts / cn=users detection is
+	// structural (RDN-level) rather than substring-based. Substring
+	// matching is unsound here:
+	//   - it is case-sensitive: "CN=ACCOUNTS" would not match "cn=accounts",
+	//     so a duplicate cn=accounts would be prepended;
+	//   - it is false-positive-prone: "ou=pcn=accountsfoo" contains the
+	//     substring "cn=accounts" but is a different RDN, so the prefix a
+	//     FreeIPA server actually needs would be skipped.
+	parsed, err := ldap.ParseDN(baseDN)
+	if err != nil {
+		return "", fmt.Errorf("invalid baseDN %q: %w", baseDN, err)
+	}
+
 	// appendRDN prepends, so build the chain from the deepest container
 	// outward: cn=accounts sits directly under baseDN, cn=users sits
 	// under cn=accounts, uid sits under cn=users. Reversing this order
 	// produces uid=<login>,cn=accounts,cn=users,<baseDN> — a well-formed
 	// DN that no FreeIPA server would ever match.
 	toAppend := baseDN
-	var err error
 
-	if !strings.Contains(toAppend, "cn=accounts") {
+	if !hasRDN(parsed, "cn", "accounts") {
 		toAppend, err = appendRDN("cn", "accounts", toAppend)
 		if err != nil {
 			return "", err
 		}
 	}
 
-	if !strings.Contains(toAppend, "cn=users") {
+	if !hasRDN(parsed, "cn", "users") {
 		toAppend, err = appendRDN("cn", "users", toAppend)
 		if err != nil {
 			return "", err

@@ -22,7 +22,7 @@ package ldapper_test
 //                                   ALDPROAdapter.GetNormalizedOUInfoFromEntry.
 //   - objectClass   rbta-user     — auxiliary class carrying rbtadp on users.
 //
-// ALDROAdapter group filter (two positional args — member/memberIndirect by
+// ALDPROAdapter group filter (two positional args — member/memberIndirect by
 // DN, memberUid by uid):
 //
 //   (|(&(|(objectClass=groupOfNames)(objectClass=ipaUserGroup)(objectClass=posixGroup))
@@ -30,7 +30,7 @@ package ldapper_test
 //     (&(objectClass=posixGroup)(memberUid=%[2]s)))
 //   args = [user.DN, user.uid].
 //
-// ALDROAdapter does NOT implement PrimaryGroupResolver — GetUserGroups
+// ALDPROAdapter does NOT implement PrimaryGroupResolver — GetUserGroups
 // returns only membership-based groups.
 //
 // Auth-path / ACL note:
@@ -599,16 +599,6 @@ func verifyALDProState() error {
 	return nil
 }
 
-func containsDN(groups []string, needle string) bool {
-	needle = strings.ToLower(needle)
-	for _, g := range groups {
-		if strings.Contains(strings.ToLower(g), needle) {
-			return true
-		}
-	}
-	return false
-}
-
 func newALDProConn(t *testing.T, opts ...ldapper.Option) *ldapper.LDAPper {
 	t.Helper()
 	conn, err := ldapper.NewLDAPper(
@@ -640,7 +630,7 @@ func newALDProAuthConn(t *testing.T, opts ...ldapper.Option) *ldapper.LDAPper {
 
 // ================== adapter contract (no server needed) ==================
 
-// ALDROAdapter group template uses TWO positional args:
+// ALDPROAdapter group template uses TWO positional args:
 // member/memberIndirect (%[1]s = DN) and memberUid (%[2]s = uid).
 func TestIntegrationALDPro_SearchUserGroupsFilterTemplate_TwoArgs(t *testing.T) {
 	tmpl := aldproAdpt.SearchUserGroupsFilterTemplate()
@@ -667,11 +657,12 @@ func TestIntegrationALDPro_SearchUserGroupsFilterTemplateArgs_ReturnsDNThenUID(t
 	require.Equal(t, "user1", args[1], "arg 1 (uid) feeds memberUid")
 }
 
-// ALDROAdapter must not implement PrimaryGroupResolver: there is no
-// primaryGroupID concept in the ALDPro schema.
+// ALDPROAdapter must not implement PrimaryGroupResolver: there is no
+// primaryGroupID concept in the ALDPro schema. Go has no static "does not
+// implement" assertion, so this is a runtime check that panics at init if
+// a future edit accidentally adds the method.
 var _ = func() any {
-	var c any = adapters.ALDPROAdapter{}
-	if _, ok := c.(interfaces.PrimaryGroupResolver); ok {
+	if _, ok := any(adapters.ALDPROAdapter{}).(interfaces.PrimaryGroupResolver); ok {
 		panic("ALDPROAdapter must not implement PrimaryGroupResolver")
 	}
 	return nil

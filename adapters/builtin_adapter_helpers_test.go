@@ -2,6 +2,7 @@
 package adapters
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/go-ldap/ldap/v3"
@@ -153,6 +154,45 @@ func TestAppendRDN(t *testing.T) {
 			baseDN:  "",
 			want:    "uid=alice",
 		},
+
+		// attrType validation: added alongside FuzzAppendRDN. ldap.DN.String
+		// would happily render these as-is, but ldap.ParseDN would reject
+		// the result — reject upfront instead.
+		{
+			name:    "empty attrType rejected",
+			attrTyp: "",
+			value:   "x",
+			baseDN:  "dc=x",
+			wantErr: true,
+		},
+		{
+			name:    "attrType with space rejected",
+			attrTyp: "foo bar",
+			value:   "x",
+			baseDN:  "dc=x",
+			wantErr: true,
+		},
+		{
+			name:    "attrType with equals rejected",
+			attrTyp: "cn=",
+			value:   "x",
+			baseDN:  "dc=x",
+			wantErr: true,
+		},
+		{
+			name:    "attrType starting with hyphen rejected",
+			attrTyp: "-cn",
+			value:   "x",
+			baseDN:  "dc=x",
+			wantErr: true,
+		},
+		{
+			name:    "numeric OID attrType accepted",
+			attrTyp: "1.2.3.4",
+			value:   "x",
+			baseDN:  "dc=x",
+			want:    "1.2.3.4=x,dc=x",
+		},
 	}
 
 	for _, tt := range tests {
@@ -222,4 +262,48 @@ func TestAppendRDN_ChainedPrependPreservesOrder(t *testing.T) {
 	require.NoError(t, err)
 
 	assert.Equal(t, "uid=alice,cn=users,cn=accounts,dc=example", third)
+}
+
+// ================== fuzz ==================
+
+// FuzzAppendRDN asserts the load-bearing property of appendRDN: whatever
+// it returns without an error must be a valid DN whose first RDN carries
+// the caller-supplied attrType and value. If attrType or baseDN is
+// rejected, we accept any error — the specific reason is not part of the
+// contract here (validateAttrType and ldap.ParseDN handle that).
+func FuzzAppendRDN(f *testing.F) {
+	f.Add("uid", "alice", "dc=example,dc=com")
+	f.Add("cn", "Smith, John", "dc=example")
+	f.Add("cn", `a\+b`, "dc=x")
+	f.Add("uid", "alice", "")
+	f.Add("cn", "", "dc=x")
+	f.Add("", "x", "dc=x")
+	f.Add("foo bar", "x", "dc=x")
+	f.Add("1.2.3.4", "x", "dc=x")
+
+	f.Fuzz(func(t *testing.T, attrType, value, baseDN string) {
+		got, err := appendRDN(attrType, value, baseDN)
+		if err != nil {
+			return // error path: anything goes, attrType or baseDN was rejected
+		}
+
+		parsed, parseErr := ldap.ParseDN(got)
+		if parseErr != nil {
+			t.Fatalf(
+				"appendRDN returned success but produced unparsable DN: "+
+					"got=%q attrType=%q value=%q baseDN=%q err=%v",
+				got, attrType, value, baseDN, parseErr)
+		}
+
+		if len(parsed.RDNs) == 0 || len(parsed.RDNs[0].Attributes) != 1 {
+			t.Fatalf("unexpected first RDN shape in %q: %+v", got, parsed.RDNs)
+		}
+		a := parsed.RDNs[0].Attributes[0]
+		if !strings.EqualFold(a.Type, attrType) {
+			t.Fatalf("first RDN type mismatch in %q: got %q, want %q", got, a.Type, attrType)
+		}
+		if a.Value != value {
+			t.Fatalf("first RDN value mismatch in %q: got %q, want %q", got, a.Value, value)
+		}
+	})
 }

@@ -56,6 +56,63 @@ func FuzzCanonicalDN_CaseEquivalence(f *testing.F) {
 	})
 }
 
+// FuzzParentDNOf asserts the load-bearing property of parentDNOf: valid
+// inputs with N>1 RDNs yield a parsable DN whose RDN list equals the
+// original RDNs[1:]. Malformed inputs (and single-RDN valid DNs) yield "".
+func FuzzParentDNOf(f *testing.F) {
+	f.Add("cn=user,dc=example,dc=com")
+	f.Add("dc=example")
+	f.Add("")
+	f.Add("not-a-dn")
+	f.Add("cn=user,ou=sales+ou=east,dc=example")
+	f.Add("cn=Smith\\, John,dc=example")
+
+	f.Fuzz(func(t *testing.T, dn string) {
+		parent := parentDNOf(dn)
+
+		if dn == "" {
+			if parent != "" {
+				t.Fatalf("parentDNOf(%q) = %q; want \"\" for empty input", dn, parent)
+			}
+			return
+		}
+
+		parsed, err := ldap.ParseDN(dn)
+		if err != nil {
+			// Malformed input: parentDNOf falls back to "".
+			if parent != "" {
+				t.Fatalf("parentDNOf(%q) = %q; want \"\" for malformed DN", dn, parent)
+			}
+			return
+		}
+
+		if len(parsed.RDNs) <= 1 {
+			if parent != "" {
+				t.Fatalf("parentDNOf(%q) = %q; want \"\" for single-RDN DN", dn, parent)
+			}
+			return
+		}
+
+		// dn has >1 RDN. Parent must be a valid DN with len(RDNs)-1 RDNs,
+		// and its RDN list must equal the original RDNs[1:].
+		parentParsed, err := ldap.ParseDN(parent)
+		if err != nil {
+			t.Fatalf("parentDNOf(%q) = %q; parent does not parse: %v", dn, parent, err)
+		}
+		if want := len(parsed.RDNs) - 1; len(parentParsed.RDNs) != want {
+			t.Fatalf("parentDNOf(%q) = %q; got %d RDNs, want %d",
+				dn, parent, len(parentParsed.RDNs), want)
+		}
+		for i, rdn := range parentParsed.RDNs {
+			origRDN := parsed.RDNs[i+1]
+			if rdn.String() != origRDN.String() {
+				t.Fatalf("parentDNOf(%q) = %q; RDN %d mismatch: got %q, want %q",
+					dn, parent, i, rdn.String(), origRDN.String())
+			}
+		}
+	})
+}
+
 // FuzzEscapeFilterArgs — filter-substitution contract: whatever a caller
 // passes to GetUser/GetGroup/GetOU/... is escaped via ldap.EscapeFilter
 // before substitution into the adapter template, and the result must be a

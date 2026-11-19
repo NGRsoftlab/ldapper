@@ -53,8 +53,26 @@ func (ldapper *LDAPper) getUserLocked(ctx context.Context, username, baseDN stri
 // domainDNS ancestor lookup, 1 for the primary group lookup). The domain
 // SID is NOT cached — for bulk operations against the same domain,
 // consider caching at the caller level.
+//
 // Returns ErrNotFoundOrNotVisible if the user lookup yields no entries
 // (not present or not visible to the bind identity).
+//
+// # Timeout semantics of PrimaryGroupResolver
+//
+// When the adapter implements PrimaryGroupResolver (e.g. MSADAdapter),
+// the resolver is invoked inside a single withCtx call that applies
+// opTimeouts.Search to the entire resolver invocation. That timeout is
+// applied via LDAPConn.SetTimeout, so it bounds each individual Bind /
+// Search the resolver issues on the supplied connection — it does NOT
+// bound the resolver's total wall-clock time. A resolver doing N
+// sequential LDAP round-trips can take up to N * opTimeouts.Search.
+//
+// The only reliable total-limit mechanism is a deadline on ctx: use
+// context.WithTimeout around the GetUserGroups call when a hard
+// end-to-end bound is required. This is by design — the resolver owns
+// its own multi-step logic, and a per-request timeout keeps a single
+// slow server response from stalling the whole thing, without
+// re-implementing a scheduler here.
 func (ldapper *LDAPper) GetUserGroups(ctx context.Context, username, baseDN string) ([]string, error) {
 	ldapper.opMu.Lock()
 	defer ldapper.opMu.Unlock()
@@ -68,10 +86,12 @@ func (ldapper *LDAPper) getUserGroupsLocked(ctx context.Context, username, baseD
 		return nil, err
 	}
 
-	filter := fmt.Sprintf(
-		ldapper.catalogAdapter.SearchUserGroupsFilterTemplate(),
-		escapeFilterArgs(ldapper.catalogAdapter.SearchUserGroupsFilterTemplateArgs(*user))...,
-	)
+	args := escapeFilterArgs(ldapper.catalogAdapter.SearchUserGroupsFilterTemplateArgs(*user))
+	filter, err := renderFilterTemplate(kindGroup,
+		ldapper.catalogAdapter.SearchUserGroupsFilterTemplate(), args)
+	if err != nil {
+		return nil, err
+	}
 
 	// NB: "1.1" tells the server to return only the DN; all we need here.
 	entries, err := ldapper.searchPaged(
@@ -93,7 +113,12 @@ func (ldapper *LDAPper) getUserGroupsLocked(ctx context.Context, username, baseD
 		groups = append(groups, entry.DN)
 	}
 
-	// Resolve the primary group if the adapter supports it
+	// Resolve the primary group if the adapter supports it.
+	//
+	// Per-request timeout: withCtx applies opTimeouts.Search to the whole
+	// resolver call via LDAPConn.SetTimeout, so each individual Bind /
+	// Search inside the resolver is bounded by that value. See the
+	// GetUserGroups doc comment for the per-request-vs-total distinction.
 	if resolver, ok := ldapper.catalogAdapter.(interfaces.PrimaryGroupResolver); ok {
 		var primaryGroupDN string
 

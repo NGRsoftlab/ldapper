@@ -4,9 +4,6 @@ package constants
 import "time"
 
 const (
-	LDAPURITemplate  = "ldap://%s:%d"
-	LDAPSURITemplate = "ldaps://%s:%d"
-
 	DefaultSearchSizeLimit = 0 // 0 — no size limit (server default)
 	DefaultSearchTimeLimit = 30
 

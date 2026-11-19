@@ -26,6 +26,13 @@ type Option func(*LDAPper)
 // bounds the total work regardless of cookie behavior, while seenCookies
 // catches the specific A→B→A cycle that MaxPages would only stop late.
 //
+// NB: MaxPages is the primary defense against a misbehaving server that
+// keeps returning fresh, non-empty paging cookies. searchPaged tracks every
+// distinct cookie it has seen in a set (to detect A→B→A cycles) and that
+// set has no upper bound when MaxPages is 0. Callers that must be resilient
+// against a hostile or buggy server should set MaxPages (or MaxEntries) to
+// a finite budget.
+//
 // MaxEntries == 0 means "no entry limit"; otherwise paged searches stop
 // after MaxEntries entries have been accumulated and return ErrPartialResult
 // with the truncated slice. Bounds client-side memory for very large

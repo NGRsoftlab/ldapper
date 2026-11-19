@@ -6,8 +6,8 @@ package ldapper_test
 // OpenLDAP integration tests against a real osixia/openldap container.
 //
 // OPENLDAPAdapter group filter supports both branches:
-//   (|(&(objectClass=groupOfNames)(member=%s))
-//     (&(objectClass=posixGroup)(memberUid=%s)))
+//   (|(&(objectClass=groupOfNames)(member=%[1]s))
+//     (&(objectClass=posixGroup)(memberUid=%[2]s)))
 // args = [user.DN, user.uid]. Both branches exercised below.
 //
 // Run with:
@@ -30,6 +30,7 @@ import (
 	"github.com/NGRsoftlab/ldapper"
 	"github.com/NGRsoftlab/ldapper/adapters"
 	"github.com/NGRsoftlab/ldapper/constants"
+	"github.com/NGRsoftlab/ldapper/interfaces"
 	"github.com/NGRsoftlab/ldapper/types"
 )
 
@@ -240,19 +241,6 @@ func waitForOpenLDAPReady(host string, port uint, timeout time.Duration) bool {
 			}
 		}
 		time.Sleep(500 * time.Millisecond)
-	}
-	return false
-}
-
-// containsDN reports whether any element of groups contains needle as a
-// case-insensitive substring. GetUserGroups returns DNs, and the case of
-// attribute types may vary across servers.
-func containsDN(groups []string, needle string) bool {
-	needle = strings.ToLower(needle)
-	for _, g := range groups {
-		if strings.Contains(strings.ToLower(g), needle) {
-			return true
-		}
 	}
 	return false
 }
@@ -878,14 +866,13 @@ func TestIntegrationOpenLDAP_Reconnect_RebindFailure_ClosesConnection(t *testing
 		"connection is nil after failed rebind; requireConnLocked wins over requireAuthLocked")
 }
 
-// Compile-time guard: the file relies on OPENLDAPAdapter implementing
-// CatalogAdapter (and not PrimaryGroupResolver — that distinction is
-// what makes GetUserGroups return only membership-based groups).
+// OPENLDAPAdapter must not implement PrimaryGroupResolver — there is no
+// primaryGroupID concept in the schema, and its presence would make
+// GetUserGroups try to resolve a non-existent attribute. Go has no static
+// "does not implement" assertion; the init-time check below panics if a
+// future edit adds the method.
 var _ = func() any {
-	var c any = adapters.OPENLDAPAdapter{}
-	if _, ok := c.(interface {
-		ResolvePrimaryGroupDN(context.Context, types.LDAPUser, any) (string, error)
-	}); ok {
+	if _, ok := any(adapters.OPENLDAPAdapter{}).(interfaces.PrimaryGroupResolver); ok {
 		panic("OPENLDAPAdapter must not implement PrimaryGroupResolver")
 	}
 	return nil

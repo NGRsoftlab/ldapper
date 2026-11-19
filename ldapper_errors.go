@@ -3,6 +3,7 @@ package ldapper
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
@@ -77,6 +78,12 @@ func isTimeoutError(err error) bool {
 // protocol response. Useful to distinguish "server unavailable" from
 // "credentials rejected" in security-sensitive paths where raw error text
 // must not be exposed.
+//
+// TLS handshake failures are also classified as transport errors: go-ldap's
+// Conn.StartTLS calls tls.Conn.Handshake() without wrapping the result, so
+// these errors do not satisfy net.Error even though the connection never
+// became usable. This matches the README's mTLS-diagnostics contract:
+// "TLS handshake failures ... surface as ErrUnavailable (transport class)".
 func isTransportError(err error) bool {
 	if err == nil {
 		return false
@@ -89,6 +96,30 @@ func isTransportError(err error) bool {
 		errors.Is(err, os.ErrDeadlineExceeded):
 		return true
 	}
+
+	// TLS-specific cases (crypto/tls package).
+	//
+	//   - *tls.CertificateVerificationError: the CLIENT rejected the
+	//     SERVER certificate (unknown CA, wrong SAN, expired, ...). This
+	//     is also the exact type errors.As-documented in the README.
+	//   - tls.AlertError: the SERVER sent a fatal alert, e.g.
+	//     bad_certificate when it rejected our client certificate during
+	//     an mTLS handshake. The README explicitly calls out "server
+	//     rejected client certificate" as a case that must surface as
+	//     ErrUnavailable.
+	//
+	// Both are value-or-pointer typed as the stdlib chooses; errors.As
+	// handles the assignment. If neither matches, fall through to the
+	// generic net.Error / SyscallError checks below.
+	var certErr *tls.CertificateVerificationError
+	if errors.As(err, &certErr) {
+		return true
+	}
+	var alertErr tls.AlertError
+	if errors.As(err, &alertErr) {
+		return true
+	}
+
 	// Any net.Error (including *net.OpError and timeout wrappers).
 	var netErr net.Error
 	if errors.As(err, &netErr) {
@@ -127,6 +158,9 @@ func classifyLDAPError(err error) error {
 
 	case ldap.IsErrorWithCode(err, ldap.LDAPResultNoSuchObject):
 		return fmt.Errorf("%w: %w", ErrNotFound, err)
+
+	case ldap.IsErrorWithCode(err, ldap.LDAPResultInsufficientAccessRights):
+		return fmt.Errorf("%w: %w", ErrInsufficientAccess, err)
 	}
 
 	// context.Canceled is safe to surface: it carries no credentials.

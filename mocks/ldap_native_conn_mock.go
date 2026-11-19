@@ -3,6 +3,7 @@ package mocks
 
 import (
 	"crypto/tls"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -43,12 +44,23 @@ func (m *MockLDAPConn) Search(req *ldap.SearchRequest) (*ldap.SearchResult, erro
 	return &ldap.SearchResult{}, nil
 }
 
+// Close is idempotent: CloseFunc fires at most once. A panic inside
+// CloseFunc is recovered and surfaced as a non-nil error so that a broken
+// test hook is visible to the caller — before this change, sync.Once
+// silently swallowed the panic, closed=true was already set, and CloseFunc
+// was never invoked again, hiding the failure.
 func (m *MockLDAPConn) Close() error {
 	m.closeOnce.Do(func() {
 		m.closed.Store(true)
-		if m.CloseFunc != nil {
-			m.closeErr = m.CloseFunc()
+		if m.CloseFunc == nil {
+			return
 		}
+		defer func() {
+			if r := recover(); r != nil {
+				m.closeErr = fmt.Errorf("MockLDAPConn.CloseFunc panicked: %v", r)
+			}
+		}()
+		m.closeErr = m.CloseFunc()
 	})
 	return m.closeErr
 }

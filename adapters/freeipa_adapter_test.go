@@ -3,6 +3,7 @@ package adapters
 
 import (
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/go-ldap/ldap/v3"
@@ -170,6 +171,56 @@ func TestFREEIPAAdapter_BindIdentity(t *testing.T) {
 			"FreeIPA user DN must nest uid under cn=users,cn=accounts")
 	})
 
+	// NEW (B5): uppercase baseDN RDN types must not produce duplicate
+	// cn=accounts / cn=users prefixes. The fix replaces substring matching
+	// with structural RDN comparison.
+	t.Run("uppercase cn=accounts/cn=users in baseDN is detected", func(t *testing.T) {
+		t.Parallel()
+
+		got, err := FREEIPAAdapter{}.BindIdentity("alice", "CN=USERS,CN=ACCOUNTS,DC=example")
+		require.NoError(t, err)
+
+		parsed, err := ldap.ParseDN(got)
+		require.NoError(t, err, "BindIdentity must produce a parsable DN: %q", got)
+
+		// Structural check: exactly one RDN each of {cn=accounts}
+		// and {cn=users}. A substring counter would be wrong here
+		// (e.g. "pcn=accountsfoo" contains "cn=accounts" as substring
+		// without being the same RDN), which is the whole reason the
+		// production code uses structural comparison too.
+		assert.Equal(t, 1, countRDN(parsed, "cn", "accounts"),
+			"duplicate cn=accounts RDN indicates a case-sensitive detection bug: %q", got)
+		assert.Equal(t, 1, countRDN(parsed, "cn", "users"),
+			"duplicate cn=users RDN indicates a case-sensitive detection bug: %q", got)
+	})
+
+	// NEW (B5): a baseDN whose *value* happens to contain "cn=accounts"
+	// as a substring must not be treated as if that RDN existed. The
+	// pre-fix substring-based detection would incorrectly skip prepending
+	// cn=accounts for "ou=pcn=accountsfoo,dc=example".
+	t.Run("substring in value is not treated as an RDN", func(t *testing.T) {
+		t.Parallel()
+
+		got, err := FREEIPAAdapter{}.BindIdentity("alice", "ou=pcn=accountsfoo,dc=example")
+		require.NoError(t, err)
+
+		parsed, err := ldap.ParseDN(got)
+		require.NoError(t, err, "BindIdentity must produce a parsable DN: %q", got)
+
+		// Structural assertion — count RDN attributes, not substrings.
+		// The literal value "pcn=accountsfoo" contains "cn=accounts" as
+		// a substring, so a substring count would return 2 and miss the
+		// fact that only one of them is a real cn=accounts RDN.
+		assert.Equal(t, 1, countRDN(parsed, "cn", "accounts"),
+			"cn=accounts must be prepended exactly once: %q", got)
+		assert.Equal(t, 1, countRDN(parsed, "cn", "users"),
+			"cn=users must be prepended exactly once: %q", got)
+
+		// The original (non-RDN) RDN must survive intact.
+		assert.Equal(t, 1, countRDN(parsed, "ou", "pcn=accountsfoo"),
+			"the original baseDN RDN must be preserved: %q", got)
+	})
+
 	t.Run("short uid without baseDN is rejected", func(t *testing.T) {
 		t.Parallel()
 
@@ -217,6 +268,29 @@ func TestFREEIPAAdapter_BindIdentity(t *testing.T) {
 		assert.Equal(t, "cn=accounts", parsed.RDNs[2].String())
 		assert.Equal(t, "dc=example", parsed.RDNs[3].String())
 	})
+}
+
+// countRDN counts single-valued RDN attributes in dn whose type and value
+// both equal (case-insensitively) the supplied typ/value. This mirrors the
+// production hasRDN helper's comparison rules and is used by tests to
+// assert on DN *structure* rather than on substrings — a substring count
+// would be fooled by values that happen to contain the needle (e.g.
+// "pcn=accountsfoo" contains "cn=accounts").
+func countRDN(dn *ldap.DN, typ, value string) int {
+	if dn == nil {
+		return 0
+	}
+	n := 0
+	for _, rdn := range dn.RDNs {
+		if len(rdn.Attributes) != 1 {
+			continue
+		}
+		a := rdn.Attributes[0]
+		if strings.EqualFold(a.Type, typ) && strings.EqualFold(a.Value, value) {
+			n++
+		}
+	}
+	return n
 }
 
 // ================== Filter templates ==================

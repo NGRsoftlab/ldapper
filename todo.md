@@ -1,2 +1,2 @@
-- other adapters
+- other adapters (SAMBA DC, 389-DS / OpenDJ / Oracle Unified Directory)
 - wide user/ou/group normalisation

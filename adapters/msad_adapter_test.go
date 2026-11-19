@@ -765,6 +765,56 @@ func TestBinarySidToString_RoundTrip(t *testing.T) {
 	}
 }
 
+// TestBinarySidToString_MaxSubAuthorities pins the upper bound of the
+// subAuthorityCount field: a single byte, so at most 255 sub-authorities
+// are representable. A real AD SID never has this many, but the decoder
+// must not panic or silently truncate on the boundary — corrupt or
+// adversarial data must surface as a well-formed SID string, and the
+// length check (8 + count*4) must accept exactly the required size.
+func TestBinarySidToString_MaxSubAuthorities(t *testing.T) {
+	t.Parallel()
+
+	const n = 255
+	b := make([]byte, 8+n*4)
+	b[0] = 1 // revision
+	b[1] = n // sub-authority count (max for a single byte)
+	// identifier authority S-1-5: the 6-byte BE field ends at b[7] = 5.
+	b[7] = 5
+	// Each sub-authority is a 4-byte LE uint32; use the index as the value.
+	for i := 0; i < n; i++ {
+		off := 8 + i*4
+		b[off] = byte(i) // i < 256, low byte is enough
+	}
+
+	got, err := binarySidToString(b)
+	require.NoError(t, err)
+
+	// Expected: "S-1-5-0-1-2-...-254".
+	want := "S-1-5"
+	for i := 0; i < n; i++ {
+		want += "-" + fmt.Sprintf("%d", i)
+	}
+	assert.Equal(t, want, got)
+}
+
+// TestBinarySidToString_TruncatedAtMaxSubAuthorities is the negative pair:
+// a buffer that declares 255 sub-authorities but is one byte short of the
+// required 8 + 255*4 length must be rejected with a clear truncation
+// error, not with a partial result.
+func TestBinarySidToString_TruncatedAtMaxSubAuthorities(t *testing.T) {
+	t.Parallel()
+
+	const n = 255
+	b := make([]byte, 8+n*4-1) // one byte short of the required length
+	b[0] = 1
+	b[1] = n
+	b[7] = 5
+
+	_, err := binarySidToString(b)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "truncated")
+}
+
 // encodeSID builds the binary form of a SID from its string form. Used
 // only by the round-trip test; the production code never needs the reverse.
 func encodeSID(t *testing.T, sid string) []byte {

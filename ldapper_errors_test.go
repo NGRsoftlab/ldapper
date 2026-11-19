@@ -3,6 +3,7 @@ package ldapper
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
@@ -15,6 +16,11 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+// alertBadCertificate mirrors crypto/tls.alertBadCertificate (42). The
+// constant is unexported in the stdlib, so tests must spell the value out.
+// Source: src/crypto/tls/alert.go — "alertBadCertificate alert = 42".
+const alertBadCertificate tls.AlertError = 42
 
 // fakeNetError is a minimal net.Error implementation for driving
 // isTimeoutError / isTransportError without touching real sockets.
@@ -81,6 +87,30 @@ func TestIsTransportError(t *testing.T) {
 		},
 		{name: "context.Canceled", err: context.Canceled, want: false},
 		{name: "plain error", err: errors.New("boom"), want: false},
+		{
+			name: "tls.CertificateVerificationError",
+			err: &tls.CertificateVerificationError{
+				Err: errors.New("x509: certificate signed by unknown authority"),
+			},
+			want: true,
+		},
+		{
+			name: "wrapped tls.CertificateVerificationError",
+			err: fmt.Errorf("handshake: %w", &tls.CertificateVerificationError{
+				Err: errors.New("x509: certificate has expired"),
+			}),
+			want: true,
+		},
+		{
+			name: "tls.AlertError (bad_certificate)",
+			err:  alertBadCertificate,
+			want: true,
+		},
+		{
+			name: "wrapped tls.AlertError",
+			err:  fmt.Errorf("handshake: %w", alertBadCertificate),
+			want: true,
+		},
 	}
 
 	for _, tt := range tests {
@@ -115,6 +145,9 @@ func TestClassifyLDAPError_LDAPResultCodes(t *testing.T) {
 		{"server down", ldap.LDAPResultServerDown, ErrUnavailable},
 		{"size limit exceeded", ldap.LDAPResultSizeLimitExceeded, ErrPartialResult},
 		{"no such object", ldap.LDAPResultNoSuchObject, ErrNotFound},
+		// NEW: search-path counterpart of the bind-path mapping already
+		// present in classifySensitiveBindError.
+		{"insufficient access", ldap.LDAPResultInsufficientAccessRights, ErrInsufficientAccess},
 	}
 
 	for _, tt := range tests {
@@ -134,6 +167,41 @@ func TestClassifyLDAPError_LDAPResultCodes(t *testing.T) {
 			assert.ErrorAs(t, got, &ldapErr)
 		})
 	}
+}
+
+// NEW: search-path TLS failures must surface as ErrUnavailable, matching
+// the README's mTLS-diagnostics contract. The original *tls.CertificateVerificationError
+// stays in the chain for errors.As-based diagnostics.
+func TestClassifyLDAPError_TLSCertificateVerificationError(t *testing.T) {
+	t.Parallel()
+
+	orig := &tls.CertificateVerificationError{
+		Err: errors.New("x509: certificate signed by unknown authority"),
+	}
+	got := classifyLDAPError(orig)
+
+	require.Error(t, got)
+	assert.ErrorIs(t, got, ErrUnavailable)
+	assert.NotErrorIs(t, got, ErrTimeout,
+		"cert-verification failure is a transport failure, not a timeout")
+
+	var cvErr *tls.CertificateVerificationError
+	assert.ErrorAs(t, got, &cvErr,
+		"the original TLS error must stay in the chain for diagnostics")
+}
+
+// NEW: server-side rejection of the client certificate arrives as a TLS
+// alert; it must also surface as ErrUnavailable.
+func TestClassifyLDAPError_TLSAlertError(t *testing.T) {
+	t.Parallel()
+
+	got := classifyLDAPError(alertBadCertificate)
+
+	require.Error(t, got)
+	assert.ErrorIs(t, got, ErrUnavailable)
+
+	var alertErr tls.AlertError
+	assert.ErrorAs(t, got, &alertErr)
 }
 
 func TestClassifyLDAPError_ContextCanceledPassesThrough(t *testing.T) {
@@ -244,6 +312,33 @@ func TestClassifySensitiveBindError_LDAPResultCodes(t *testing.T) {
 				"error text must not echo a password= marker: %q", msg)
 		})
 	}
+}
+
+// NEW: TLS handshake failures on the bind path must also surface as
+// ErrUnavailable, not as ErrInvalidCredentialsOrUnknown. Before the fix,
+// go-ldap's unwrapped Handshake() error bypassed isTransportError and fell
+// through to the "mask as credential error" default.
+func TestClassifySensitiveBindError_TLSErrors(t *testing.T) {
+	t.Parallel()
+
+	t.Run("certificate verification", func(t *testing.T) {
+		t.Parallel()
+
+		orig := &tls.CertificateVerificationError{
+			Err: errors.New("x509: certificate signed by unknown authority"),
+		}
+		got := classifySensitiveBindError(orig)
+
+		assert.Equal(t, ErrUnavailable, got,
+			"bind-path TLS failure must be classified as transport, not as credentials")
+	})
+
+	t.Run("alert from server", func(t *testing.T) {
+		t.Parallel()
+
+		got := classifySensitiveBindError(alertBadCertificate)
+		assert.Equal(t, ErrUnavailable, got)
+	})
 }
 
 func TestClassifySensitiveBindError_ContextCanceledPassesThrough(t *testing.T) {

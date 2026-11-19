@@ -4,6 +4,7 @@ package ldapper
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/go-ldap/ldap/v3"
 
@@ -20,6 +21,35 @@ const (
 	kindGroup lookupKind = "group"
 	kindOU    lookupKind = "ou"
 )
+
+// renderFilterTemplate applies escaped args to an adapter-supplied filter
+// template, then verifies the result is a syntactically valid LDAP filter.
+//
+// Adapters are trusted code, but their templates are configuration: a typo
+// in an adapter or a hand-written custom adapter could ship an invalid
+// template, and fmt.Sprintf on arity mismatch produces "...%!s(MISSING)..."
+// which is both misleading to read and impossible to distinguish from a
+// legitimate value later. Failing early with ErrInvalidArgument surfaces
+// the bug where it belongs — in the adapter — rather than as a mysterious
+// "Bad search filter" from the server.
+//
+// The extra ldap.CompileFilter is cheap (microseconds on typical filters)
+// and catches structurally broken templates (unbalanced parens, missing
+// attribute types) before the round-trip.
+func renderFilterTemplate(kind lookupKind, template string, args []any) (string, error) {
+	rendered := fmt.Sprintf(template, args...)
+	if strings.Contains(rendered, "%!") {
+		return "", fmt.Errorf(
+			"%w: %s filter template arity mismatch (template=%q, args=%d)",
+			ErrInvalidArgument, kind, template, len(args))
+	}
+	if _, err := ldap.CompileFilter(rendered); err != nil {
+		return "", fmt.Errorf(
+			"%w: %s filter template rendered an invalid filter: %v",
+			ErrInvalidArgument, kind, err)
+	}
+	return rendered, nil
+}
 
 // searchSingleEntryLocked performs a "single object by unique key" lookup:
 // validates inputs, builds the filter from the adapter template, and enforces
@@ -41,7 +71,10 @@ func (ldapper *LDAPper) searchSingleEntryLocked(
 		return nil, fmt.Errorf("%w: empty %s name", ErrInvalidArgument, kind)
 	}
 
-	filter := fmt.Sprintf(filterTemplate, ldap.EscapeFilter(name))
+	filter, err := renderFilterTemplate(kind, filterTemplate, []any{ldap.EscapeFilter(name)})
+	if err != nil {
+		return nil, err
+	}
 
 	// NB: SizeLimit=2 is enough to detect duplicates without over-fetching,
 	// and is independent of user-configured searchLimits.
@@ -50,7 +83,6 @@ func (ldapper *LDAPper) searchSingleEntryLocked(
 		2, ldapper.searchLimits.TimeLimit, false, filter, attributes, nil,
 	)
 
-	// searchSingleEntryLocked — around the Search call:
 	res, err := ldapper.withCtxResult(ctx, ldapper.opTimeouts.Search, func() (*ldap.SearchResult, error) {
 		return ldapper.connection.Search(req)
 	})
@@ -111,6 +143,14 @@ func (ldapper *LDAPper) newSearchRequest(
 //   - MaxEntries      bounds the total accumulated entries.
 //   - RequirePaging   makes a missing paging control fatal (ErrPartialResult).
 //   - Repeated non-empty cookies are treated as a runaway server.
+//
+// NB: seenCookies — the set used to detect repeated paging cookies — grows
+// unbounded while MaxPages == 0. That is intentional (0 = no limit, per the
+// same convention as MaxEntries and SizeLimit), but it means a hostile or
+// buggy server returning an endless sequence of fresh cookies will inflate
+// this set. Callers that must resist such a server should set MaxPages (or
+// MaxEntries) to a finite budget; searchPaged will then abort with
+// ErrPartialResult before the set can grow.
 func (ldapper *LDAPper) searchPaged(
 	ctx context.Context,
 	baseDN string,
@@ -222,7 +262,17 @@ func (ldapper *LDAPper) searchPaged(
 // CustomSearchPaged is a public proxy for searchPaged that accepts a
 // pre-built ldap.SearchRequest. Automatic paging is applied on top of the
 // request's controls.
-// NB: just public proxy-method for ldapper.searchPaged call with *ldap.SearchRequest param, automatic paging
+//
+// NB: public proxy-method for ldapper.searchPaged call with
+// *ldap.SearchRequest param, automatic paging.
+//
+// Order of checks: nil request is rejected BEFORE opMu is acquired and
+// BEFORE the connection / closed checks. This deliberately differs from
+// CustomSearch (see below) and is preserved for backward compatibility:
+// rejecting a nil request does not need the lock or the connection, so
+// avoiding both keeps the common "programming error, fail fast" path
+// cheap. Do not "fix" the asymmetry without adjusting the test that
+// pins it (TestCustomSearchPaged_NilRequest).
 func (ldapper *LDAPper) CustomSearchPaged(ctx context.Context, searchRequest *ldap.SearchRequest) ([]*ldap.Entry, error) {
 	if searchRequest == nil {
 		return nil, fmt.Errorf("%w: nil search request", ErrInvalidArgument)
@@ -246,6 +296,14 @@ func (ldapper *LDAPper) CustomSearchPaged(ctx context.Context, searchRequest *ld
 // No paging, no search-limit overrides, no DN validation are applied —
 // the caller is responsible for the request semantics.
 // Use CustomSearchPaged if you want automatic paging.
+//
+// Order of checks: opMu is acquired and requireConnLocked runs BEFORE the
+// nil-request check. This mirrors the historic behaviour and is
+// intentionally different from CustomSearchPaged (see above): here the
+// connection-state error takes precedence, so an uninitialized LDAPper
+// reports ErrClosed even when the caller also passed a nil request.
+// TestCustomSearch_NilRequest and TestCustomSearch_ConnRequired pin both
+// branches. Do not reorder without adjusting those tests.
 func (ldapper *LDAPper) CustomSearch(ctx context.Context, searchRequest *ldap.SearchRequest) (*ldap.SearchResult, error) {
 	ldapper.opMu.Lock()
 	defer ldapper.opMu.Unlock()

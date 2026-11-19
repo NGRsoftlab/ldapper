@@ -30,6 +30,105 @@ func withDialConn(t *testing.T, fn DialFunc) {
 	t.Cleanup(func() { dialConn = old })
 }
 
+// ================== runWithWatchdog (F1) ==================
+
+// TestRunWithWatchdog_Success applies the timeout, runs fn, resets the
+// timeout, and leaves conn untouched. Covers the happy path in isolation
+// from withCtx / withCtxResult.
+func TestRunWithWatchdog_Success(t *testing.T) {
+	t.Parallel()
+
+	var mu sync.Mutex
+	var timeouts []time.Duration
+	conn := &mocks.MockLDAPConn{
+		SetTimeoutFunc: func(d time.Duration) {
+			mu.Lock()
+			defer mu.Unlock()
+			timeouts = append(timeouts, d)
+		},
+	}
+
+	ran := false
+	err := runWithWatchdog(context.Background(), conn, 5*time.Second, func() error {
+		ran = true
+		return nil
+	})
+
+	require.NoError(t, err)
+	assert.True(t, ran)
+
+	mu.Lock()
+	defer mu.Unlock()
+	assert.Equal(t, []time.Duration{5 * time.Second, 0}, timeouts,
+		"SetTimeout must be applied then reset on the success path")
+}
+
+// TestRunWithWatchdog_PanicInFn_CleansUp pins A1: a panic in fn() must not
+// leak the watchdog goroutine or leave a stale timeout on the connection.
+// The panic itself is expected to propagate to the caller — the helper
+// does not swallow it.
+//
+// The cleanup assertion is indirect but rigorous: after recovery, we
+// cancel the context. If the watchdog goroutine had leaked, it would
+// observe ctx.Done() and close conn (CloseFunc would be invoked). The
+// cleanup is complete only when closeCount stays zero.
+func TestRunWithWatchdog_PanicInFn_CleansUp(t *testing.T) {
+	t.Parallel()
+
+	var mu sync.Mutex
+	var timeouts []time.Duration
+	closeCount := 0
+	conn := &mocks.MockLDAPConn{
+		SetTimeoutFunc: func(d time.Duration) {
+			mu.Lock()
+			defer mu.Unlock()
+			timeouts = append(timeouts, d)
+		},
+		CloseFunc: func() error {
+			mu.Lock()
+			defer mu.Unlock()
+			closeCount++
+			return nil
+		},
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	recovered := func() (r any) {
+		defer func() { r = recover() }()
+		_ = runWithWatchdog(ctx, conn, 5*time.Second, func() error {
+			panic("boom in fn")
+		})
+		return nil
+	}()
+
+	require.NotNil(t, recovered, "panic must propagate, not be swallowed")
+	assert.Equal(t, "boom in fn", recovered)
+
+	// The defer in runWithWatchdog ran before the panic unwound to us, so
+	// both SetTimeout calls and the watchdog stop are already done.
+	mu.Lock()
+	assert.Equal(t, []time.Duration{5 * time.Second, 0}, timeouts,
+		"SetTimeout must be applied then reset even when fn panics")
+	assert.Equal(t, 0, closeCount,
+		"watchdog must not close conn on the panic path")
+	mu.Unlock()
+
+	// Cancel AFTER the panic. A leaked watchdog goroutine would observe
+	// ctx.Done() and close the connection; the small sleep gives it a
+	// bounded chance to run on any scheduler.
+	cancel()
+	time.Sleep(50 * time.Millisecond)
+
+	mu.Lock()
+	defer mu.Unlock()
+	assert.Equal(t, 0, closeCount,
+		"watchdog goroutine must have been stopped before panic propagated; "+
+			"a non-zero closeCount indicates the goroutine leaked and reacted "+
+			"to the deferred context cancellation")
+}
+
 // ================== withCtx ==================
 
 func TestWithCtx_CtxAlreadyCancelled(t *testing.T) {
@@ -637,4 +736,30 @@ func TestDialAnyLocked_AllHostsFail(t *testing.T) {
 	assert.Empty(t, host)
 	assert.ErrorIs(t, err, ErrUnavailable)
 	assert.ErrorIs(t, err, lastErr, "last error must be in the chain for diagnostics")
+}
+
+// TestDialAnyLocked_CtxCancelledBetweenHosts pins A4: after the caller
+// aborts, remaining hosts must not be dialed in vain.
+func TestDialAnyLocked_CtxCancelledBetweenHosts(t *testing.T) {
+	// no t.Parallel — swaps dialConn.
+
+	var tried []string
+	ctx, cancel := context.WithCancel(context.Background())
+	withDialConn(t, func(_ context.Context, host string, _ uint, _, _ bool, _ *tls.Config, _ time.Duration) (*ldap.Conn, error) {
+		tried = append(tried, host)
+		// Cancel inside the first dial — the next iteration must observe
+		// ctx.Err() and return immediately, without trying "h2".
+		cancel()
+		return nil, errors.New("simulated dial failure")
+	})
+
+	l := &LDAPper{hosts: []string{"h1", "h2", "h3"}, port: 389}
+
+	conn, host, err := l.dialAnyLocked(ctx)
+	require.Error(t, err)
+	assert.Nil(t, conn)
+	assert.Empty(t, host)
+	assert.ErrorIs(t, err, context.Canceled)
+	assert.Equal(t, []string{"h1"}, tried,
+		"loop must abort after the first host once ctx is cancelled")
 }

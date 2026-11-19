@@ -42,6 +42,26 @@ func TestAttrsToMap_EmptyAttributes(t *testing.T) {
 	assert.Empty(t, got)
 }
 
+// TestAttrsToMap_DeduplicatesNames pins H1: a duplicate name in the
+// `attributes` slice must not depend on map-assignment ordering. Prior
+// behaviour was "last write wins" (Go evaluates the right-hand side
+// before the assignment, and the map just stores the result). With
+// dedup via "first occurrence wins", the result is deterministic and
+// the entry is queried once per distinct name.
+func TestAttrsToMap_DeduplicatesNames(t *testing.T) {
+	t.Parallel()
+
+	entry := newLDAPEntry("cn=user,dc=example", map[string][]string{
+		"cn": {"user"},
+	})
+
+	// Duplicates: "cn" appears three times.
+	got := attrsToMap(entry, []string{"cn", "cn", "cn"})
+
+	require.Len(t, got, 1)
+	assert.Equal(t, []string{"user"}, got["cn"])
+}
+
 // --- escapeFilterArgs ---
 
 func TestEscapeFilterArgs(t *testing.T) {
@@ -221,4 +241,97 @@ func TestCanonicalDN_EquivalenceWithParseDN(t *testing.T) {
 		canonicalDN(parsed.String()),
 		canonicalDN("cn=Smith\\, John,dc=example"),
 	)
+}
+
+// TestCanonicalDN_StructuralAmbiguity pins the B4 contract: structurally
+// different DNs that previously collapsed to the same key at a join point
+// must now produce distinct keys, while semantically equivalent spellings
+// keep mapping to the same key.
+func TestCanonicalDN_StructuralAmbiguity(t *testing.T) {
+	t.Parallel()
+
+	t.Run("comma in value must not alias with RDN separator", func(t *testing.T) {
+		t.Parallel()
+
+		// cn=a,ou=b    → two RDNs:  {cn=a}, {ou=b}
+		// cn=a\,ou=b   → one RDN:   {cn="a,ou=b"}
+		// Before escaping these produced the same canonical string.
+		assert.NotEqual(t,
+			canonicalDN(`cn=a,ou=b`),
+			canonicalDN(`cn=a\,ou=b`),
+			"comma in value must not alias with RDN separator")
+	})
+
+	t.Run("plus in value must not alias with attribute separator", func(t *testing.T) {
+		t.Parallel()
+
+		// cn=a+ou=b    → one RDN, two attributes
+		// cn=a\+ou=b   → one RDN, one attribute with value "a+ou=b"
+		assert.NotEqual(t,
+			canonicalDN(`cn=a+ou=b`),
+			canonicalDN(`cn=a\+ou=b`),
+			"plus in value must not alias with attribute separator")
+	})
+
+	t.Run("escaped and unescaped equals in value are the same DN", func(t *testing.T) {
+		t.Parallel()
+
+		// Both spellings parse to cn="a=b"; the canonical key must agree.
+		assert.Equal(t,
+			canonicalDN(`cn=a=b`),
+			canonicalDN(`cn=a\=b`),
+			"escaped and unescaped equals in value are the same DN")
+	})
+
+	t.Run("backslash: hex and escape spellings agree", func(t *testing.T) {
+		t.Parallel()
+
+		// \5c and \\ both decode to a single literal backslash.
+		assert.Equal(t,
+			canonicalDN(`cn=a\5cb,dc=x`),
+			canonicalDN(`cn=a\\b,dc=x`),
+			"hex and escaped backslash must produce the same key")
+	})
+
+	t.Run("escaped comma does not alias with structural plus", func(t *testing.T) {
+		t.Parallel()
+
+		// cn=a\,dc=x   → one RDN: {cn="a,dc=x"}
+		// cn=a+dc=x    → one RDN: {cn=a, dc=x}
+		// Same attribute count, same types, different structure — must differ.
+		assert.NotEqual(t,
+			canonicalDN(`cn=a\,dc=x`),
+			canonicalDN(`cn=a+dc=x`),
+			"escaped comma and structural plus describe different DNs")
+	})
+}
+
+// TestEscapeCanonicalValue pins the escaping rules applied to the value
+// before joining. The output is an opaque key, so the exact spelling is
+// asserted to catch accidental changes that would break the wire format
+// of keys produced for the catalog tree.
+func TestEscapeCanonicalValue(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{name: "empty", in: "", want: ""},
+		{name: "no special chars", in: "alice", want: "alice"},
+		{name: "comma", in: "a,b", want: `a\,b`},
+		{name: "plus", in: "a+b", want: `a\+b`},
+		{name: "equals", in: "a=b", want: `a\=b`},
+		{name: "backslash", in: `a\b`, want: `a\\b`},
+		{name: "multiple", in: `a,b+c=d\e`, want: `a\,b\+c\=d\\e`},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			assert.Equal(t, tt.want, escapeCanonicalValue(tt.in))
+		})
+	}
 }

@@ -33,7 +33,14 @@ func (a userOpsAdapter) SearchUserGroupsFilterTemplate() string {
 }
 
 func (a userOpsAdapter) SearchUserGroupsFilterTemplateArgs(_ types.LDAPUser) []any {
-	return a.groupsArgs
+	if a.groupsArgs != nil {
+		return a.groupsArgs
+	}
+	// The default template "(member=%[1]s)" expects exactly one argument.
+	// Returning nil here would cause renderFilterTemplate to reject the
+	// rendered filter ("%!s(MISSING)"), so the default must be non-empty
+	// even when a test does not care about the value.
+	return []any{"cn=dummy,dc=x"}
 }
 
 func (a userOpsAdapter) UserObjectFilter() string {

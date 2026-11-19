@@ -214,6 +214,56 @@ func TestSearchSingleEntryLocked_LDAPErrorClassified(t *testing.T) {
 	assert.ErrorIs(t, err, ErrUnavailable)
 }
 
+// NEW (B6+D3): an adapter template with mismatched arg count must fail
+// fast with ErrInvalidArgument, not be sent as a "Bad search filter".
+func TestSearchSingleEntryLocked_TemplateArityMismatch(t *testing.T) {
+	t.Parallel()
+
+	called := false
+	conn := &mocks.MockLDAPConn{
+		SearchFunc: func(*ldap.SearchRequest) (*ldap.SearchResult, error) {
+			called = true
+			return nil, nil
+		},
+	}
+	l := newTestLDAPper(conn)
+
+	// Template has 2 verbs, but searchSingleEntryLocked substitutes exactly 1.
+	_, err := l.searchSingleEntryLocked(context.Background(), kindUser,
+		"alice", "dc=example", "(cn=%s)(sn=%s)", nil)
+
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrInvalidArgument)
+	assert.Contains(t, err.Error(), "arity mismatch")
+	assert.Contains(t, err.Error(), "user")
+	assert.False(t, called, "search must not run with an invalid filter template")
+}
+
+// NEW (B6+D3): a template that renders a syntactically invalid filter must
+// also fail fast — CompileFilter catches unbalanced parens the "%!" check
+// would miss.
+func TestSearchSingleEntryLocked_TemplateInvalidSyntax(t *testing.T) {
+	t.Parallel()
+
+	called := false
+	conn := &mocks.MockLDAPConn{
+		SearchFunc: func(*ldap.SearchRequest) (*ldap.SearchResult, error) {
+			called = true
+			return nil, nil
+		},
+	}
+	l := newTestLDAPper(conn)
+
+	// Unbalanced ")" in the template.
+	_, err := l.searchSingleEntryLocked(context.Background(), kindUser,
+		"alice", "dc=example", "(cn=%s))", nil)
+
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrInvalidArgument)
+	assert.Contains(t, err.Error(), "invalid filter")
+	assert.False(t, called, "search must not run with a malformed filter")
+}
+
 // ================== searchPaged ==================
 
 func TestSearchPaged_ConnRequired(t *testing.T) {

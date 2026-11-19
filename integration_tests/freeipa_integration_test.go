@@ -38,6 +38,7 @@ import (
 	"github.com/NGRsoftlab/ldapper"
 	"github.com/NGRsoftlab/ldapper/adapters"
 	"github.com/NGRsoftlab/ldapper/constants"
+	"github.com/NGRsoftlab/ldapper/interfaces"
 	"github.com/NGRsoftlab/ldapper/types"
 )
 
@@ -191,16 +192,6 @@ func requireFreeIPAUsers(t *testing.T) {
 	}
 }
 
-func containsDN(groups []string, needle string) bool {
-	needle = strings.ToLower(needle)
-	for _, g := range groups {
-		if strings.Contains(strings.ToLower(g), needle) {
-			return true
-		}
-	}
-	return false
-}
-
 func newFreeIPAConn(t *testing.T, opts ...ldapper.Option) *ldapper.LDAPper {
 	t.Helper()
 	requireFreeIPA(t)
@@ -266,12 +257,11 @@ func TestIntegrationFreeIPA_SearchUserGroupsFilterTemplateArgs_ReturnsDNThenUID(
 
 // FreeIPA must not implement PrimaryGroupResolver: there is no
 // primaryGroupID concept in the schema, and its presence would make
-// GetUserGroups try to resolve a non-existent attribute.
+// GetUserGroups try to resolve a non-existent attribute. Go has no static
+// "does not implement" assertion; the init-time check below panics if a
+// future edit adds the method.
 var _ = func() any {
-	var c any = adapters.FREEIPAAdapter{}
-	if _, ok := c.(interface {
-		ResolvePrimaryGroupDN(context.Context, types.LDAPUser, any) (string, error)
-	}); ok {
+	if _, ok := any(adapters.FREEIPAAdapter{}).(interfaces.PrimaryGroupResolver); ok {
 		panic("FREEIPAAdapter must not implement PrimaryGroupResolver")
 	}
 	return nil

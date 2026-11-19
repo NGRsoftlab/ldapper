@@ -11,8 +11,10 @@ package ldapper_test
 // Note on group DNs in assertions:
 //   GetUserGroups returns group *DNs* (not cn values), and — because
 //   MSADAdapter implements PrimaryGroupResolver — it also includes the
-//   primary group (Domain Users by default). Assertions use containsDN
-//   (case-insensitive substring) rather than ElementsMatch.
+//   primary group (Domain Users by default). Memberships are asserted with
+//   containsDN (case-insensitive substring); the primary-group test uses
+//   the locale-independent primaryGroupToken attribute rather than the
+//   localized CN ("Domain Users" is English-only).
 //
 // Run with:
 //   go test -tags=integration_msad ./...
@@ -36,6 +38,7 @@ import (
 	"github.com/NGRsoftlab/ldapper"
 	"github.com/NGRsoftlab/ldapper/adapters"
 	"github.com/NGRsoftlab/ldapper/constants"
+	"github.com/NGRsoftlab/ldapper/interfaces"
 	"github.com/NGRsoftlab/ldapper/types"
 )
 
@@ -53,6 +56,12 @@ const (
 	msadUser2Pass = "Password2!"
 
 	msadTestOUDN = "ou=testou," + msadBaseDN
+
+	// msadPrimaryGroupRID is the SID RID of Domain Users in a default AD
+	// domain (well-known S-1-5-21-<domain>-513). Every freshly created
+	// user lands in this group as its primary group. The RID is
+	// locale-independent; the group's *name* is not.
+	msadPrimaryGroupRID = "513"
 )
 
 var (
@@ -189,19 +198,6 @@ func requireMSAD(t *testing.T) {
 	if !msadAvailable {
 		t.Skip("Samba AD DC not available; test skipped")
 	}
-}
-
-// containsDN reports whether any element of groups contains needle as a
-// case-insensitive substring. Necessary because GetUserGroups returns
-// full DNs whose attribute-type case varies across servers.
-func containsDN(groups []string, needle string) bool {
-	needle = strings.ToLower(needle)
-	for _, g := range groups {
-		if strings.Contains(strings.ToLower(g), needle) {
-			return true
-		}
-	}
-	return false
 }
 
 // newMSADConn returns an unauthenticated connection.
@@ -578,7 +574,9 @@ func TestIntegrationMSAD_GetSubOUs_SingleLevel(t *testing.T) {
 // ================== GetUserGroups ==================
 
 // Groups are DNs. For user1 the base filter matches admins; the resolver
-// also adds the primary group (Domain Users). Assertions must tolerate both.
+// also adds the primary group (Domain Users). Membership assertions use
+// containsDN — the primary group is checked separately via primaryGroupToken
+// (locale-independent).
 func TestIntegrationMSAD_GetUserGroups_AdminsMembership(t *testing.T) {
 	conn := newMSADAuthConn(t)
 
@@ -597,16 +595,38 @@ func TestIntegrationMSAD_GetUserGroups_ReadersMembership(t *testing.T) {
 		"expected a readers group in %v", groups)
 }
 
+// The MSADAdapter implements PrimaryGroupResolver — the primary group
+// (Domain Users, RID 513) must be present in GetUserGroups output.
+//
+// The group's CN is localized (e.g. "Domain Users" in English, "Utilisateurs
+// du domaine" in French, "Пользователи домена" in Russian), so this test
+// resolves the expected DN via the locale-independent primaryGroupToken
+// attribute computed by AD (always equal to the group's RID).
 func TestIntegrationMSAD_GetUserGroups_IncludesPrimaryGroup(t *testing.T) {
 	conn := newMSADAuthConn(t)
 
 	groups, err := conn.GetUserGroups(context.Background(), msadUser1SAM, msadBaseDN)
 	require.NoError(t, err)
-	// The MSADAdapter implements PrimaryGroupResolver — the primary group
-	// (Domain Users, RID 513) must be present alongside the group-membership
-	// entries. This exercises the child-domain resolver path end-to-end.
-	assert.True(t, containsDN(groups, "domain users"),
-		"expected Domain Users (primary group) in %v", groups)
+
+	// Find the group whose primaryGroupToken == RID of Domain Users.
+	// Samba 4 AD DC and Microsoft AD both expose this attribute.
+	req := ldap.NewSearchRequest(
+		msadBaseDN,
+		ldap.ScopeWholeSubtree,
+		ldap.NeverDerefAliases,
+		0, 0, false,
+		"(primaryGroupToken="+msadPrimaryGroupRID+")",
+		[]string{"distinguishedName"},
+		nil,
+	)
+	res, err := conn.CustomSearch(context.Background(), req)
+	require.NoError(t, err)
+	require.Len(t, res.Entries, 1,
+		"expected exactly one group with primaryGroupToken=%s", msadPrimaryGroupRID)
+
+	primaryDN := res.Entries[0].DN
+	assert.True(t, containsDN(groups, primaryDN),
+		"expected primary group %q in %v", primaryDN, groups)
 }
 
 func TestIntegrationMSAD_GetUserGroups_UserNotFound(t *testing.T) {
@@ -775,13 +795,7 @@ func TestIntegrationMSAD_Reconnect_RebindFailure_ClosesConnection(t *testing.T) 
 		"connection is nil after failed rebind; requireConnLocked wins over requireAuthLocked")
 }
 
-// Compile-time guard: the test file depends on adapters.MSADAdapter
-// implementing CatalogAdapter and PrimaryGroupResolver.
-var _ = func() any {
-	var c any = adapters.MSADAdapter{}
-	_, ok := c.(interface {
-		ResolvePrimaryGroupDN(context.Context, types.LDAPUser, any) (string, error)
-	})
-	_ = ok
-	return nil
-}
+// MSADAdapter MUST implement PrimaryGroupResolver: GetUserGroups relies on
+// the type assertion in getUserGroupsLocked to inject the primary group
+// (Domain Users) into the result. This is a true compile-time assertion.
+var _ interfaces.PrimaryGroupResolver = adapters.MSADAdapter{}

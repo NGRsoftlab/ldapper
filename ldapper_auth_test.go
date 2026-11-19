@@ -4,6 +4,7 @@ package ldapper
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 
 	"github.com/go-ldap/ldap/v3"
@@ -208,6 +209,28 @@ func TestBindConn_BindIdentityError(t *testing.T) {
 	require.Error(t, err)
 	assert.ErrorIs(t, err, ErrInvalidArgument)
 	assert.Contains(t, err.Error(), "cannot map login")
+}
+
+// NEW (D1): the adapter's error must remain reachable via errors.Is.
+// Before the fix, bindConnLocked wrapped it with %v, which dropped the
+// chain — callers could only match ErrInvalidArgument, not the adapter's
+// own sentinel.
+func TestBindConn_BindIdentityError_UnwrapsAdapterError(t *testing.T) {
+	t.Parallel()
+
+	sentinel := errors.New("adapter-specific failure")
+	l := newAuthTestLDAPper(&mocks.MockLDAPConn{})
+	l.catalogAdapter = fakeAdapter{
+		bindIdentityFn: func(string, string) (string, error) {
+			return "", fmt.Errorf("wrapped: %w", sentinel)
+		},
+	}
+
+	err := l.BindConn(context.Background(), "alice", "pass", "dc=x")
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrInvalidArgument)
+	assert.ErrorIs(t, err, sentinel,
+		"the adapter's wrapped sentinel must reach the caller via errors.Is")
 }
 
 func TestBindConn_BindFailure_MasksAndCloses(t *testing.T) {
@@ -456,6 +479,46 @@ func TestCheckUserCredentials_RestoreFails_BindOk(t *testing.T) {
 	assert.ErrorIs(t, err, ErrNotAuthenticated)
 	assert.Contains(t, err.Error(), "failed to restore service bind")
 	assert.False(t, l.isAuthenticated, "restore failure must invalidate auth state")
+}
+
+// NEW (B3): if the service-rebind is aborted by ctx cancellation (user
+// authenticated fine, caller killed ctx between user Bind and restore),
+// surface context.Canceled — not ErrNotAuthenticated. The fix is in the
+// `case restoreErr != nil` branch of CheckUserCredentials.
+func TestCheckUserCredentials_RestoreCancelled_SurfacesCancellation(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	conn := &mocks.MockLDAPConn{
+		SearchFunc: func(*ldap.SearchRequest) (*ldap.SearchResult, error) {
+			return &ldap.SearchResult{Entries: []*ldap.Entry{
+				newLDAPEntry("cn=alice,dc=x", nil),
+			}}, nil
+		},
+		BindFunc: func(u, _ string) error {
+			if u == "cn=alice,dc=x" {
+				// User bind succeeds cleanly; ctx stays alive so that
+				// withCtx does not fire on this call.
+				return nil
+			}
+			// Service restore: cancel ctx inside the operation, then
+			// return success. withCtx's post-check will observe the
+			// cancellation and surface context.Canceled to the caller.
+			cancel()
+			return nil
+		},
+	}
+	l := newAuthTestLDAPper(conn)
+	markAuthenticated(l, "svc", "svc-pass", "dc=x")
+
+	_, err := l.CheckUserCredentials(ctx, "alice", "alice-pass")
+
+	require.Error(t, err)
+	assert.ErrorIs(t, err, context.Canceled,
+		"restore cancellation must surface as context.Canceled")
+	assert.NotErrorIs(t, err, ErrNotAuthenticated,
+		"ErrNotAuthenticated misleads a caller who already decided to abort")
 }
 
 func TestCheckUserCredentials_BothFail_ReportsCredentialFailure(t *testing.T) {

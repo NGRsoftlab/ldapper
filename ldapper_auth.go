@@ -84,9 +84,15 @@ func (ldapper *LDAPper) bindConnLocked(ctx context.Context, username, password, 
 	// Ask the adapter how to present the login as a bind principal. The
 	// returned string is a DN or an accepted AD-style principal — it is
 	// NOT filter-escaped (that is only for filter values).
+	//
+	// The adapter's error is wrapped with %w (not %v) so that callers can
+	// errors.Is/As into it. The adapter is trusted code: all shipped
+	// adapters return non-sensitive messages ("empty login", "baseDN
+	// required for short-form bind", "invalid baseDN ..."), and BindIdentity
+	// never echoes the submitted credentials.
 	bindUsername, err := ldapper.catalogAdapter.BindIdentity(username, baseDN)
 	if err != nil {
-		return fmt.Errorf("%w: %v", ErrInvalidArgument, err)
+		return fmt.Errorf("%w: %w", ErrInvalidArgument, err)
 	}
 
 	// Bind with the adapter-supplied principal. A failed Bind invalidates
@@ -169,6 +175,14 @@ func (ldapper *LDAPper) CheckUserCredentials(ctx context.Context, username, pass
 	case bindErr != nil:
 		return nil, classifySensitiveBindError(bindErr)
 	case restoreErr != nil:
+		// The user authenticated (bindErr == nil) but the service session
+		// could not be restored. If the failure was ctx cancellation (the
+		// caller aborted mid-flight), surface it as such: ErrNotAuthenticated
+		// would mislead a caller who already decided to tear down.
+		if errors.Is(restoreErr, context.Canceled) ||
+			errors.Is(restoreErr, context.DeadlineExceeded) {
+			return nil, restoreErr
+		}
 		return nil, fmt.Errorf("%w: failed to restore service bind", ErrNotAuthenticated)
 	}
 

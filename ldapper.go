@@ -51,6 +51,16 @@ type LDAPper struct {
 // performed after Dial; when true, the connection stays in cleartext.
 // For LDAPS (useLDAPS=true) the flag has no effect.
 // NB: use useLDAPS=false with skipStartTLS=true only for dev/test purposes, not production
+//
+// ServerName default: when tlsCfg != nil and its ServerName is empty, the
+// constructor clones the config and sets ServerName to hosts[0]. This is
+// correct for the common "HA pair behind one certificate" deployment,
+// where every host resolves to a certificate carrying the same SAN.
+// With hosts on different certificates (e.g. multi-tenant failover, or a
+// mixed bag of internal/external names), set ServerName explicitly before
+// calling this constructor — otherwise failover to hosts[1..] will fail
+// TLS verification with a name-mismatch error, because the client will
+// still expect a certificate for hosts[0].
 func NewLDAPper(
 	ctx context.Context,
 	hosts []string,
@@ -96,6 +106,14 @@ func NewLDAPper(
 	var clonedTLSCfg *tls.Config
 	if tlsCfg != nil {
 		clonedTLSCfg = tlsCfg.Clone()
+		if clonedTLSCfg.ServerName == "" {
+			// Default the TLS SNI/verification name to the first host. This
+			// is safe when all hosts share a certificate (the typical HA
+			// setup); for mixed-certificate failover, the caller MUST set
+			// ServerName explicitly. See the constructor's doc comment for
+			// the full contract.
+			clonedTLSCfg.ServerName = hosts[0]
+		}
 	}
 
 	ldapper := &LDAPper{

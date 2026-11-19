@@ -3,6 +3,7 @@ package adapters
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/go-ldap/ldap/v3"
 
@@ -71,15 +72,24 @@ func (a FREEIPAAdapter) BindIdentity(login, baseDN string) (string, error) {
 	// under cn=accounts, uid sits under cn=users. Reversing this order
 	// produces uid=<login>,cn=accounts,cn=users,<baseDN> — a well-formed
 	// DN that no FreeIPA server would ever match.
-	accounts, err := appendRDN("cn", "accounts", baseDN)
-	if err != nil {
-		return "", err
+	toAppend := baseDN
+	var err error
+
+	if !strings.Contains(toAppend, "cn=accounts") {
+		toAppend, err = appendRDN("cn", "accounts", toAppend)
+		if err != nil {
+			return "", err
+		}
 	}
-	users, err := appendRDN("cn", "users", accounts)
-	if err != nil {
-		return "", err
+
+	if !strings.Contains(toAppend, "cn=users") {
+		toAppend, err = appendRDN("cn", "users", toAppend)
+		if err != nil {
+			return "", err
+		}
 	}
-	return appendRDN("uid", login, users)
+
+	return appendRDN("uid", login, toAppend)
 }
 
 // TYPE FILTERS

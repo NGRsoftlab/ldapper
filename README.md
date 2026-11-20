@@ -334,7 +334,7 @@ conn.GetUser(ctx, "jdoe", baseDN)
 
 Filter templates are validated before the round-trip:
 `renderFilterTemplate` rejects arity mismatches (the `%!s(MISSING)`
-marker) and structurural problems (via `ldap.CompileFilter`) with
+marker) and structural problems (via `ldap.CompileFilter`) with
 `ErrInvalidArgument`. A broken adapter is surfaced at the call site,
 not as a mysterious "Bad search filter" from the server.
 

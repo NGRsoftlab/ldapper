@@ -23,7 +23,8 @@ A lightweight, adapter-based LDAP client for Go. LDAPper wraps
 - **Efficient catalog tree discovery** — a single paged subtree search
   assembled into an `OU` tree on the client, with optional depth trimming.
 - **Sentinel errors** (`ErrNotFoundOrNotVisible`, `ErrUnavailable`,
-  `ErrInvalidCredentials`, …) designed for `errors.Is` / `errors.As`.
+  `ErrInvalidCredentials`, `ErrInsufficientAccess`, …) designed for
+  `errors.Is` / `errors.As`.
 - **End-to-end integration tests** for every shipped adapter, running
   against real directory servers in Docker (OpenLDAP, Samba 4 AD DC,
   FreeIPA, and OpenLDAP-with-ALDPro-schema).
@@ -162,12 +163,15 @@ plain structs and functions.
 │  ldapper.go                        constructors + LDAPper struct   │
 │  ldapper_connection.go             dial / failover / IsAlive /     │
 │                                    Reconnect / EnsureAlive / Close │
-│  ldapper_auth.go                   BindConn,               │
+│                                    + runWithWatchdog (per-op       │
+│                                      timeout & ctx watchdog)       │
+│  ldapper_auth.go                   BindConn,                       │
 │                                    CheckUserCredentials            │
 │  ldapper_search.go                 searchPaged,                    │
 │                                    searchSingleEntryLocked,        │
-│                                    newSearchRequest, CustomSearch, │
-│                                    CustomSearchPaged               │
+│                                    newSearchRequest,               │
+│                                    renderFilterTemplate,           │
+│                                    CustomSearch, CustomSearchPaged │
 │  ldapper_user_ops.go               GetUser, GetUserGroups,         │
 │                                    GetOUUsers                      │
 │  ldapper_group_ops.go              GetGroup                        │
@@ -179,9 +183,11 @@ plain structs and functions.
 │                                    OperationTimeouts, With/Set/Get │
 │  ldapper_errors.go                 sentinel errors + classifiers    │
 │  helpers.go                        attrsToMap, escapeFilterArgs,   │
-│                                    parentDNOf, canonicalDN         │
+│                                    parentDNOf, canonicalDN,        │
+│                                    escapeCanonicalValue            │
 │  validators.go                     validateDN / validateBaseDN /   │
-│                                    validateHost / formatHost       │
+│                                    validateHost / formatHost /     │
+│                                    isIPLiteral                     │
 └──────────────┬────────────────────────────────────┬────────────────┘
                │                                    │
      uses      │                                    │  uses
@@ -216,6 +222,30 @@ The two interfaces are the only seams:
 - **`interfaces.CatalogAdapter`** is the *only* place LDAPper knows
   anything about directory schema. All filters, attribute lists, value
   casts and bind-principal translation go through it.
+
+### Cancellation & watchdog
+
+`go-ldap`'s `Bind` / `StartTLS` are not context-aware. LDAPper bridges the
+gap with a small watchdog primitive in `ldapper_connection.go`:
+
+- `withCtx` / `withCtxResult` — the two operation wrappers. They compute
+  the effective timeout as `min(opTimeout, ctx.Deadline - now)`, apply
+  it via `LDAPConn.SetTimeout`, run the operation, and reset the
+  timeout to zero afterwards.
+- `runWithWatchdog` — the shared primitive. If the caller supplies a
+  cancellable context, a goroutine is spawned that closes the
+  underlying connection when `ctx` is done. The stop/join and the
+  timeout reset happen inside a `defer`, so a panic inside the
+  operation cannot leak the goroutine or leave a stale timeout behind.
+- `ctx.Err()` is treated as the authoritative signal of "was the
+  operation aborted" (a goroutine-local flag would race with the
+  operation returning). When it fires, the connection is published
+  unusable (`connection = nil`, `invalidateAuthLocked`) and the caller
+  receives a wrapped `context.Canceled` / `context.DeadlineExceeded`.
+
+The same watchdog is reused inside `dialHost` (for `StartTLS`) and
+`reconnectLocked` (for `Bind`), so all four cancellation-aware paths
+share one implementation.
 
 ### `LDAPper` struct
 
@@ -263,7 +293,11 @@ the explicit timeout and falls back to Go's `net.Dialer` default.
 client-side timeout" — the operations rely on `SearchRequest.TimeLimit`
 (server-side) and the caller's context deadline. Enabling
 `WithOperationTimeout` adds a client-side deadline around each individual
-`Bind` / `Search` call.
+`Bind` / `Search` call. This zero value also means that `Reconnect`
+applies **no** client-side Bind timeout when the cached credentials are
+replayed — the dial itself is still bounded by `dialTimeout`, so a dead
+peer cannot stall the reconnect indefinitely, but a slow `Bind` is not
+capped unless `ctx` has a deadline or `opTimeouts.Bind > 0`.
 
 ### Search flow (`GetUser` as example)
 
@@ -271,7 +305,9 @@ client-side timeout" — the operations rely on `SearchRequest.TimeLimit`
 conn.GetUser(ctx, "jdoe", baseDN)
         │
         ├── catalogAdapter.SearchUserFilterTemplate()
-        │       → "(uid=%s)" → fmt.Sprintf → "(uid=jdoe)"
+        │       → "(uid=%[1]s)" → renderFilterTemplate
+        │         (escapes, Sprintf, ldap.CompileFilter validation)
+        │       → "(uid=jdoe)"
         ├── catalogAdapter.UserAttrs()
         │       → []string{"cn", "mail", ...}
         │
@@ -295,6 +331,19 @@ conn.GetUser(ctx, "jdoe", baseDN)
    >1 entries  → ErrAmbiguousResult
                  ("too many entries for user ...")
 ```
+
+Filter templates are validated before the round-trip:
+`renderFilterTemplate` rejects arity mismatches (the `%!s(MISSING)`
+marker) and structurural problems (via `ldap.CompileFilter`) with
+`ErrInvalidArgument`. A broken adapter is surfaced at the call site,
+not as a mysterious "Bad search filter" from the server.
+
+**Note on ambiguity**: single-object lookups use
+`ScopeWholeSubtree` + `SizeLimit=2`. On MSAD, a user and a
+`contact`/`computer` object with the same `sAMAccountName` in
+different OUs will trigger `ErrAmbiguousResult` even though the
+caller only cared about the user. See
+[Adapter-specific gotchas](#adapter-specific-gotchas).
 
 ### Catalog tree flow (`GetCatalogTree`)
 
@@ -333,10 +382,11 @@ Two important details:
 
 - **`canonicalDN`** normalises attribute types and values to lowercase,
   sorts multi-valued RDN attributes by `type=value`, trims whitespace,
-  and preserves RDN order. This is not a full RFC 4517 matching-rules
-  implementation — it deliberately over-merges case-differing DNs so
-  equivalent entries link correctly. Malformed DNs fall back to a
-  lowercased raw string.
+  preserves RDN order, and **escapes `,`, `+`, `=`, and `\` inside
+  attribute values**. Without the last step, two structurally different
+  DNs would collide at a join point (`cn=a,ou=b` — two RDNs — vs
+  `cn=a\,ou=b` — one RDN whose value is `a,ou=b`). The output is an
+  opaque equivalence key, never re-parsed as a DN.
 - **`AncestorOfFold`** (not `AncestorOf`) is used so case-differing
   ancestors still match — otherwise subtree entries with different
   attribute-type case would be silently dropped.
@@ -344,6 +394,17 @@ Two important details:
 This is the whole reason `GetCatalogTree` is O(1) round-trips instead of
 O(N): the server streams pages of the subtree, and the parent-child
 wiring is done locally in `O(N)` with a single `map[string]*OUNormalizedInfo`.
+
+**Partial results are not returned from the tree functions.** If the
+server returns `SizeLimitExceeded`, budget exhaustion, or any other
+error after at least one page, `searchPaged` preserves the entries
+collected so far and returns `ErrPartialResult` **together with those
+entries** — but `WalkCatalogTree` / `GetCatalogTree` currently discard
+the partial data and return an empty `types.CatalogTree` (non-nil, empty
+slice) plus the error. Callers who need the partial data must drive
+`searchPaged` themselves (via `CustomSearchPaged`) and assemble the tree
+on their side. `GetCatalogTree`'s contract is: "non-nil tree, empty on
+failure, complete on success".
 
 ---
 
@@ -401,9 +462,12 @@ Other constructor rules:
   connection. The list is capped at `constants.DefaultMaxHostsLength`
   (50) to guard against accidentally passing a million hosts.
 - **Port** — must be in `[1, 65535]`.
-- **Host strings** — validated against URL-special characters; IPv6
-  literals are accepted without brackets (they are bracketed for the URI
-  internally by `formatHost`).
+- **Host strings** — validated against URL-special characters. IPv4
+  literals (`1.2.3.4`) and IPv6 literals (`2001:db8::1`, unbracketed)
+  are accepted; brackets are added by `formatHost` before the URI is
+  built. **IPv6 scoped literals (`fe80::1%eth0`) are rejected** —
+  `net.ParseIP` does not parse the `%zone` suffix, and scope IDs are
+  link-local-only. Use a globally routable IPv6 address instead.
 - **`dialConn` is a package-level variable** (of type `DialFunc`) so
   tests can swap it out via `withDialConn(t, fn)` without touching
   production code.
@@ -422,6 +486,20 @@ Client authentication is configured exactly as in the standard library:
 put the client certificate into `tls.Config.Certificates` (or
 `tls.Config.GetClientCertificate`), and the CA that signed the server
 certificate into `tls.Config.RootCAs`.
+
+#### `ServerName` and multi-host failover
+
+`NewLDAPper` clones the provided `*tls.Config` and, **if
+`tlsCfg.ServerName == ""`, sets it to `hosts[0]`**. This matches the
+common HA deployment where every host resolves to a certificate carrying
+the same SAN (name). The following two cases need explicit attention:
+
+- **Same SAN across hosts** — the default is correct; no action needed.
+- **Different SANs across hosts** (e.g. internal vs external names in a
+  mixed failover list) — **set `tlsCfg.ServerName` explicitly** before
+  calling the constructor. If you leave it empty, failover to
+  `hosts[1..]` will fail TLS verification with a name-mismatch error,
+  because the client will still expect a certificate for `hosts[0]`.
 
 #### LDAPS
 
@@ -463,16 +541,19 @@ conn, err := ldapper.NewAuthenticatedLDAPper(
 
 #### StartTLS
 
-`ServerName` is **required** for StartTLS: `go-ldap` calls
-`tls.Client(conn, cfg)` without a `ServerName` hint, so the standard
-library rejects the handshake with
+`go-ldap` calls `tls.Client(conn, cfg)` without a `ServerName` hint, and
+the standard library rejects the handshake with
 
 ```
 tls: either ServerName or InsecureSkipVerify must be specified in the tls.Config
 ```
 
-unless one of the two fields is set. `InsecureSkipVerify: true` defeats
-the point of TLS — prefer `ServerName`.
+unless one of the two fields is set. LDAPper's auto-fill (see
+[`ServerName` and multi-host failover](#servername-and-multi-host-failover))
+covers the common case, but you should still **set `ServerName`
+explicitly** if your failover list spans multiple certificates.
+`InsecureSkipVerify: true` defeats the point of TLS — prefer
+`ServerName`.
 
 ```go
 tlsCfg := &tls.Config{
@@ -545,14 +626,27 @@ returns `ErrInvalidCredentials`, exactly as for non-mTLS connections.
 
 TLS handshake failures — including "server rejected client certificate"
 — flow through `classifyLDAPError` and surface as `ErrUnavailable`
-(transport class). They are not distinguishable from a network outage
-via `errors.Is` today. Use `errors.As` against `*tls.CertificateVerificationError`
-or an `x509` error type if you need the root cause:
+(transport class). This is the case in both directions:
+
+- `*tls.CertificateVerificationError` — the **client** rejected the
+  **server** certificate (unknown CA, wrong SAN, expired, …).
+- `tls.AlertError` — the **server** rejected the **client**
+  certificate (e.g. `bad_certificate` during an mTLS handshake).
+
+Both are recognised by `isTransportError` (see
+[`ldapper_errors.go`](ldapper_errors.go)) and therefore reachable via
+`errors.Is(err, ErrUnavailable)`. For diagnostics of the underlying
+cause, use `errors.As`:
 
 ```go
 var cvErr *tls.CertificateVerificationError
 if errors.As(err, &cvErr) {
     log.Printf("TLS verification failed: %v", cvErr)
+}
+
+var alertErr tls.AlertError
+if errors.As(err, &alertErr) {
+    log.Printf("TLS alert: %v", alertErr)
 }
 ```
 
@@ -582,7 +676,9 @@ type CatalogAdapter interface {
     // Contract: templates use fmt-style positional verbs (%[N]s). All
     // arguments are escaped with ldap.EscapeFilter by LDAPper before
     // substitution, so implementers must return raw (unescaped) attribute
-    // values.
+    // values. LDAPper additionally validates the substituted filter via
+    // ldap.CompileFilter and rejects arity mismatches with
+    // ErrInvalidArgument before the round-trip.
     SearchUserFilterTemplate()       string  // 1 arg
     SearchUserGroupsFilterTemplate() string  // N args, use with the args helper
     SearchUserGroupsFilterTemplateArgs(ldapUser types.LDAPUser) []any
@@ -619,6 +715,14 @@ resolve a non-existent attribute.
 `LDAPConn` and MUST NOT call `LDAPper` methods** — the resolver is
 invoked while `opMu` is already held, so any re-entry into `LDAPper`
 would deadlock.
+
+**Timeout semantics.** The resolver is invoked inside a single
+`withCtx(ctx, opTimeouts.Search, …)` call. The timeout therefore applies
+**per-request** (each `LDAPConn.Bind` / `LDAPConn.Search` on the
+supplied connection) — it does **not** cap the resolver's total
+wall-clock time. A resolver doing N sequential round-trips can take up
+to N × `opTimeouts.Search`. For a hard end-to-end bound, attach a
+`context.WithTimeout` to the `GetUserGroups` call.
 
 The adapter is the only place LDAPper assumes anything about schema. See
 [Shipped adapters](#shipped-adapters) for the four adapters that ship
@@ -695,6 +799,15 @@ limits.SizeLimit = 100
 conn, _ := ldapper.NewLDAPper(..., ldapper.WithSearchLimits(limits))
 ```
 
+**`MaxPages` is also the primary defence against a misbehaving paging
+server.** `searchPaged` tracks every distinct paging cookie it has seen
+(to catch A→B→A cycles) in an in-memory set. When `MaxPages == 0` that
+set has **no upper bound**: a hostile or buggy server that returns an
+endless sequence of fresh cookies will inflate it indefinitely. Callers
+that must resist such a server should set `MaxPages` (or `MaxEntries`)
+to a finite budget; `searchPaged` will then abort with `ErrPartialResult`
+before the set can grow.
+
 ### Dial timeout
 
 ```go
@@ -744,7 +857,9 @@ conn, _ := ldapper.NewLDAPper(
 ```
 
 - Zero value disables the corresponding timeout (`Bind: 0, Search: 0` is
-  the default — backwards compatible).
+  the default — backwards compatible). In particular, **`Reconnect` does
+  not force a hidden default on the Bind step when `Bind == 0`**: only
+  `ctx` (and, for the dial phase, `dialTimeout`) bounds the call.
 - Negative durations are clamped to zero.
 - The timeout is applied via `LDAPConn.SetTimeout` (which is part of the
   `LDAPConn` interface contract — every implementation, including mocks,
@@ -752,6 +867,9 @@ conn, _ := ldapper.NewLDAPper(
   it does not cap subsequent operations.
 - In addition, `withCtx`/`withCtxResult` respect the caller's context
   deadline: the effective timeout is `min(opTimeout, ctx.Deadline - now)`.
+- For `PrimaryGroupResolver` adapters, `opTimeouts.Search` is a
+  **per-request** budget on each `LDAPConn.Search` the resolver issues,
+  not a total. See [Adapters](#adapters) for details.
 
 ---
 
@@ -762,7 +880,7 @@ conn, _ := ldapper.NewLDAPper(
 | `adapters.MSADAdapter`      | Microsoft Active Directory         | Uses `objectCategory`-based filters; recursive group search via the `LDAP_MATCHING_RULE_IN_CHAIN` OID (`1.2.840.113556.1.4.1941`); prefers `thumbnailPhoto` over `jpegPhoto`; implements `PrimaryGroupResolver` to resolve `primaryGroupID` into a group DN.                                                                  |
 | `adapters.OPENLDAPAdapter`  | OpenLDAP (and most RFC-4519 dialects) | Handles three group models — `groupOfNames` (via `member`), `groupOfUniqueNames` (via `uniqueMember`), and `posixGroup` (via `memberUid`). User search keyed by `uid` **or** `entryDN`. Short-form bind (`alice`) is expanded to `uid=<login>,<baseDN>`.                                                                      |
 | `adapters.ALDPROAdapter`    | ALD Pro                            | Recognizes `rbta-org-unit` alongside `organizationalUnit`; department mapped from `rbtadp`; two-branch group filter — `member`/`memberIndirect` (DN) for `groupOfNames`/`ipaUserGroup`/`posixGroup`, **and** `memberUid` (uid) for `posixGroup`. Bind is pass-through (UPN/DN).                                               |
-| `adapters.FREEIPAAdapter`   | FreeIPA                            | Recognizes `nsContainer` alongside `organizationalUnit`; department is intentionally **not** mapped; group lookup matches DN-valued `member`/`memberIndirect` **and** uid-valued `memberUid`. Short-form bind is expanded to `uid=<login>,cn=users,cn=accounts,<baseDN> (or just uid=<login>,<baseDN>) if baseDN containts cn=users,cn=accounts`. |
+| `adapters.FREEIPAAdapter`   | FreeIPA                            | Recognizes `nsContainer` alongside `organizationalUnit`; department is intentionally **not** mapped; group lookup matches DN-valued `member`/`memberIndirect` **and** uid-valued `memberUid`. Short-form bind is expanded to `uid=<login>,cn=users,cn=accounts,<baseDN>`, unless `baseDN` already contains those RDN nodes — the detection is **structural** (parsed via `ldap.ParseDN`, compared case-insensitively per-RDN), not a substring match.              |
 
 ### Adapter-specific gotchas
 
@@ -772,6 +890,15 @@ conn, _ := ldapper.NewLDAPper(
   sAMAccountName, or DN). Group search uses
   `LDAP_MATCHING_RULE_IN_CHAIN`, which **Samba 4 AD DC** and Microsoft AD
   both support — OpenLDAP and FreeIPA do **not**.
+
+  > **Ambiguity risk:** `GetUser` / `GetGroup` / `GetOU` use
+  > `ScopeWholeSubtree` + `SizeLimit=2` to detect duplicates. On AD, a
+  > user and a `contact`/`computer` object with the same
+  > `sAMAccountName` (across different OUs) both match the user filter,
+  > so the lookup fails with `ErrAmbiguousResult`. Pass a fully qualified
+  > principal (UPN or DN) or narrow the `baseDN` to the user's OU when
+  > this happens.
+
 - **`OPENLDAPAdapter`** — the user filter uses the indexed placeholder
   `%[1]s` so the same argument is substituted into both `uid=` and
   `entryDN=`, allowing lookup by either short name or full DN. The
@@ -796,12 +923,16 @@ conn, _ := ldapper.NewLDAPper(
   - `OPENLDAP` — short-form login is expanded to `uid=<login>,<baseDN>`.
   - `FreeIPA` — short-form login is expanded to
     `uid=<login>,cn=users,cn=accounts,<baseDN>` (the chain is built
-    deepest-first: `accounts` → `users` → `uid`, so the final DN is
-    `uid=alice,cn=users,cn=accounts,<baseDN>`).
+    deepest-first: `accounts` → `users` → `uid`). Whether each `cn=...`
+    node is added is decided by structural RDN comparison (case-
+    insensitive, single-valued RDN), not by substring matching the DN
+    string.
 - **`GetNormalizedOUInfoFromEntry.Name`** — all shipped adapters derive
-  `Name` from the **first RDN** of `entry.DN` (via the shared helper
-  `ouNameFromDN`), not from the `name`/`ou` attribute. Malformed DNs fall
-  back to the whole string instead of crashing.
+  `Name` from the **first RDN of `entry.DN`** via `ouNameFromDN`. The
+  helper does not check the RDN attribute type: it returns the first
+  attribute's value whatever it is (`ou=sales` → `"sales"`,
+  `cn=users` → `"users"`). It is meant for display (tree labels, log
+  lines), not identification. Malformed DNs fall back to the raw string.
 - **`GetNormalizedOUInfoFromEntry.OU`** — MSAD sets `OU` to the **full
   entry DN**; the other three adapters read the `ou` attribute, with
   `cn` fallback for ALDPro's `rbta-org-unit` and FreeIPA's `nsContainer`.
@@ -863,12 +994,15 @@ user, err := conn.CheckUserCredentials(ctx, username, password)
 `BindConn`:
 
 - Stores username, password and baseDN on the connection.
-- Performs the bind first, then probes baseDN with a base-object search
+- Asks the adapter's `BindIdentity` for the actual Simple Bind principal,
+  then performs the bind, then probes `baseDN` with a base-object search
   to confirm the tree is reachable under the bound identity. No post-bind
   user lookup is performed, and no `*types.LDAPUser` is returned — call
-  `GetUser` afterwards if you need the user entry. If the bind fails,
-  the base-DN probe is never issued and the error is
-  `ErrInvalidCredentials` (testable with `errors.Is`).
+  `GetUser` afterwards if you need the user entry.
+- If `BindIdentity` fails, the adapter's error is wrapped with `%w`, so
+  callers can `errors.Is` / `errors.As` into it. If the subsequent bind
+  fails, the error is `ErrInvalidCredentials` (or another bind-path
+  sentinel; testable with `errors.Is`).
 - On success, caches `isAuthenticated=true`, `bindUser`, `bindPassword`,
   `bindDN`. `bindUser` is the value returned by `BindIdentity`, **not**
   the raw login — that's what `Reconnect` replays.
@@ -891,7 +1025,11 @@ user, err := conn.CheckUserCredentials(ctx, username, password)
   an auth signal.
 - Restores the service bind via a deferred rebind. If the rebind itself
   fails, `isAuthenticated` is cleared and the error surfaces as
-  `ErrNotAuthenticated` (or is appended to the primary error).
+  `ErrNotAuthenticated` (or is appended to the primary error). **If the
+  rebind was aborted by `ctx` cancellation**, however, the raw
+  `context.Canceled` / `context.DeadlineExceeded` is surfaced instead —
+  `ErrNotAuthenticated` would mislead a caller who already decided to
+  tear down.
 
 All bind-path errors go through `classifySensitiveBindError`, which never
 echoes raw server text — passwords cannot leak into logs.
@@ -937,12 +1075,34 @@ users, err := conn.GetOUUsers(ctx, "OU=Staff,DC=corp,DC=example,DC=com")
   with `[]string{"1.1"}` (OID for "no attributes"), so only DNs come back
   from the server. Returns group **DNs** (not `cn` values). If the adapter
   implements `PrimaryGroupResolver` (only MSAD does), the primary group
-  DN is appended to the result.
+  DN is appended to the result. See [Adapters](#adapters) for the
+  per-request timeout semantics of the resolver.
 - **`GetOUUsers`** — takes a **DN**, not a short `ou` name. Uses the
   adapter's `UserObjectFilter` and `UserAttrs` to list all users under
   the subtree, subject to paging.
 - **`GetOU`** — takes the short `ou` value (e.g. `"Sales"`) plus a base DN.
 - **`GetGroup`** — takes the short `cn` value.
+
+Filter templates are validated **before** the search is sent: an arity
+mismatch (`%!s(MISSING)`) or a structurally broken filter surfaces as
+`ErrInvalidArgument` with the adapter template quoted in the message. See
+[Writing your own adapter](#writing-your-own-adapter) for the
+adapter-side obligations this depends on.
+
+**Asymmetry between `CustomSearch` and `CustomSearchPaged`:** the two
+methods check their inputs in different orders.
+
+- `CustomSearchPaged` rejects a `nil` `*ldap.SearchRequest` **before**
+  acquiring `opMu` and **before** running `requireConnLocked`. The nil
+  request is treated as a programming error and reported as
+  `ErrInvalidArgument` regardless of connection state.
+- `CustomSearch` acquires `opMu` and calls `requireConnLocked` first,
+  then rejects `nil`. An uninitialized or closed `LDAPper` reports
+  `ErrClosed`, even when the caller also passed a nil request.
+
+Both behaviours are pinned by tests (`TestCustomSearchPaged_NilRequest`,
+`TestCustomSearch_NilRequest`, `TestCustomSearch_ConnRequired`) and are
+intentional — do not "unify" them without adjusting those tests.
 
 All of these are safe to call concurrently: `opMu` serializes the
 underlying LDAP operations.
@@ -965,11 +1125,13 @@ tree, err := conn.GetCatalogTree(ctx, "DC=corp,DC=example,DC=com", 2)
 - `maxDepth` trims the resulting tree: `0` = no limit, `1` = roots only,
   `2` = roots + first level, etc. For `maxDepth == 1`, the tree is fetched
   with `ScopeSingleLevel` — a single round-trip, no full subtree read.
-- If the server returns `SizeLimitExceeded` after at least one page, the
-  partial tree is returned along with `ErrPartialResult` — callers can
-  choose to accept the partial result or bail out.
-- A walk error discards the partial tree — the returned
-  `types.CatalogTree.Tree` is always non-nil but empty on failure.
+- On failure the returned `types.CatalogTree.Tree` is **non-nil but
+  empty** — the tree builder deliberately discards any partial state, so
+  a caller trusting `tree.Tree` never sees half a hierarchy. If you need
+  partial data on `ErrPartialResult` (e.g. `SizeLimitExceeded` after the
+  first page), drive `CustomSearchPaged` yourself: `searchPaged` returns
+  the entries collected so far alongside `ErrPartialResult`, and the
+  wiring above is just the same `map[string]*OUNormalizedInfo` dance.
 
 ```go
 // Root-level OUs only (single-level scope, one round-trip):
@@ -1025,7 +1187,9 @@ if err := conn.EnsureAlive(ctx); err != nil {
   closed, `isAuthenticated` is cleared, and subsequent operations return
   `ErrClosed` until `BindConn` is called again. `bindDN` is
   preserved, so `CheckUserCredentials` continues to work after a
-  successful reconnect.
+  successful reconnect. If `opTimeouts.Bind == 0`, the rebind applies no
+  client-side Bind timeout (same contract as `withCtx`); the dial itself
+  is still bounded by `dialTimeout`.
 - **`EnsureAlive(ctx)`** — `IsAlive()` first; reconnect only when stale.
   **After `Close()` the client is terminal**: `EnsureAlive` returns
   `ErrClosed` and does **not** attempt to reconnect. That is the
@@ -1043,27 +1207,33 @@ preserved in the wrapped chain (`errors.As` still works).
 
 | Sentinel                       | Meaning |
 |--------------------------------|---------|
-| `ErrInvalidArgument`           | Config or argument validation failed (empty/invalid DN, empty username, invalid host, invalid port, `useLDAPS && skipStartTLS`, nil TLS config, nil adapter, …). |
+| `ErrInvalidArgument`           | Config or argument validation failed (empty/invalid DN, empty username, invalid host, invalid port, `useLDAPS && skipStartTLS`, nil TLS config, nil adapter, adapter-supplied filter template arity mismatch / malformed filter, …). |
 | `ErrInvalidCredentials`        | Bind rejected as bad credentials. Also returned by `CheckUserCredentials` when the user is missing (enumeration protection). |
 | `ErrInvalidCredentialsOrUnknown` | Bind-path classifier could not map the LDAP result code to a specific sentinel. Treat as inconclusive, not as a rejection. |
-| `ErrNotAuthenticated`          | `CheckUserCredentials` called on a connection without a successful prior `BindConn`/`NewAuthenticatedLDAPper`, or the service rebind was lost. |
-| `ErrUnavailable`               | Directory unreachable (dial failure, `LDAPResultUnavailable`/`Busy`/`ServerDown`, transport errors). |
+| `ErrNotAuthenticated`          | `CheckUserCredentials` called on a connection without a successful prior `BindConn`/`NewAuthenticatedLDAPper`, or the service rebind was lost (non-cancellation failure). |
+| `ErrUnavailable`               | Directory unreachable (dial failure, `LDAPResultUnavailable`/`Busy`/`ServerDown`, transport errors — **including TLS handshake failures from `tls.CertificateVerificationError` and `tls.AlertError`**). |
 | `ErrTimeout`                   | Timeout / deadline exceeded (`LDAPResultTimeout`, `LDAPResultTimeLimitExceeded`, `net.Error.Timeout`, `context.DeadlineExceeded`). |
 | `ErrClosed`                    | The connection is nil (never initialized, or `Close()` was called, or a failed reconnect left it nil). |
 | `ErrNotFound`                  | Search produced a definitive "no such object" (`LDAPResultNoSuchObject`). Rare — subtree searches usually return zero entries instead. |
 | `ErrNotFoundOrNotVisible`      | Subtree search returned zero entries. The object may not exist, or may be hidden by ACL. Do not infer "does not exist". |
 | `ErrAmbiguousResult`           | Single-object lookup matched more than one entry. |
 | `ErrPartialResult`             | Paged search was interrupted by `SizeLimitExceeded`, budget exhaustion, or a missing paging control (when `RequirePaging` is true). The returned slice/tree is partial. |
-| `ErrInsufficientAccess`        | Bind path returned `LDAPResultInsufficientAccessRights`. Surfaced by `classifySensitiveBindError`. |
+| `ErrInsufficientAccess`        | LDAP returned `LDAPResultInsufficientAccessRights`. Surfaced by both `classifyLDAPError` (search path) and `classifySensitiveBindError` (bind path). |
 
 Bind-path failures **never** wrap the raw LDAP text — this prevents
 credential leakage into logs when the server echoes back the submitted
 password. All bind errors are mapped to bare sentinels by
 `classifySensitiveBindError`.
 
-BindConn can return ErrNotFoundOrNotVisible if baseDN is unreachable under 
-the bound identity (for example, when the bind principal has no read access to the tree root). 
-This is produced by the base-DN probe, not by a user lookup.
+BindConn can return `ErrNotFoundOrNotVisible` if `baseDN` is unreachable
+under the bound identity (for example, when the bind principal has no
+read access to the tree root). This is produced by the base-DN probe,
+not by a user lookup.
+
+`CheckUserCredentials` can return `context.Canceled` /
+`context.DeadlineExceeded` when the caller aborts during the service
+rebind — the raw ctx error is surfaced rather than masked as
+`ErrNotAuthenticated`. See [Authentication](#authentication).
 
 Non-bind failures use `classifyLDAPError`, which wraps both the sentinel
 and the original error:
@@ -1144,7 +1314,10 @@ Rules of thumb:
    `SearchGroupFilterTemplate` and `SearchOUFilterTemplate` take exactly
    one argument. `SearchUserGroupsFilterTemplate` may take any number,
    but `SearchUserGroupsFilterTemplateArgs` must return exactly that many
-   values in the same order.
+   values in the same order. LDAPper validates arity and the compiled
+   filter, returning `ErrInvalidArgument` on mismatch — this surfaces
+   adapter bugs at the call site rather than as a "Bad search filter"
+   from the server.
 3. **Group membership format**:
 - Schema stores DN-valued `member` → use `(member=%[1]s)` and
   return `[user.DN]`.
@@ -1161,12 +1334,22 @@ Rules of thumb:
    Simple Bind principal. If the adapter accepts both DN and short-form
    logins, `SearchUserFilterTemplate` must match both (typically by
    unioning the schema attribute with `entryDN=`). See
-   `OPENLDAPAdapter`/`FREEIPAAdapter` for examples.
+   `OPENLDAPAdapter`/`FREEIPAAdapter` for examples. Errors returned by
+   `BindIdentity` are wrapped with `%w` by `BindConn`, so they remain
+   reachable through `errors.Is` / `errors.As`. Do not put credentials in
+   the error message — it will be surfaced to the caller.
 7. **`PrimaryGroupResolver`** — implement only if your schema has a real
    concept of "primary group" that is not covered by ordinary group
    membership (like AD's `primaryGroupID`). The resolver MUST use only
    the provided `LDAPConn` and MUST NOT call `LDAPper` methods — the lock
-   is already held.
+   is already held. `opTimeouts.Search` applies per-request, not as a
+   total — see [Adapters](#adapters).
+8. **`appendRDN`** (internal helper, used by FreeIPA/OpenLDAP adapters)
+   validates `attrType` against RFC 4514's `descr` / `numericoid`
+   grammar before returning. If you build DNs from caller-controlled
+   attribute types in a custom adapter, call `appendRDN` rather than
+   `ldap.DN.String()` directly — the latter happily renders `foo bar=x`
+   which `ldap.ParseDN` then rejects.
 
 See `adapters/msad_adapter.go`, `adapters/openldap_adapter.go`,
 `adapters/aldpro_adapter.go` and `adapters/freeipa_adapter.go` for
@@ -1180,8 +1363,6 @@ Defaults live in `constants/constants.go`:
 
 | Constant                         | Default | Meaning |
 |----------------------------------|---------|---------|
-| `LDAPURITemplate`                | `"ldap://%s:%d"`  | Used for plain / StartTLS dials |
-| `LDAPSURITemplate`               | `"ldaps://%s:%d"` | Used for LDAPS dials |
 | `DefaultSearchSizeLimit`         | `0`     | `0` = no client-side size limit |
 | `DefaultSearchTimeLimit`         | `30`    | Seconds |
 | `DefaultMaxHostsLength`          | `50`    | Upper bound on the `hosts` slice |
@@ -1205,12 +1386,22 @@ Options (`type Option func(*LDAPper)`):
 
 Negative values are clamped to `0` ("no limit"/"Go default"). The zero
 value of `OperationTimeouts` disables the client-side timeout, so it is
-backwards compatible with code that does not configure it.
+backwards compatible with code that does not configure it. In
+particular, `opTimeouts.Bind == 0` disables the client-side Bind
+timeout applied by `withCtx` **and** by `reconnectLocked` — reconnect
+does not force `constants.DefaultDialTimeout` on the Bind step.
 
 `With*` options are applied by `NewLDAPper` before the object is
 returned to the caller; there is no concurrent access at that point.
 `Set*`/`Get*` take `opMu`, so they are safe to call concurrently with
 search operations.
+
+**`MaxPages` and `MaxEntries`** are complementary memory guards for paged
+searches: `MaxPages` bounds the number of round-trips (and, indirectly,
+the size of the internal `seenCookies` set), `MaxEntries` bounds the
+total entries accumulated locally. Setting either is recommended for
+long-running services that page through large subtrees — leaving both at
+`0` means "no limit", per the same convention as `SizeLimit`.
 
 ---
 
@@ -1223,33 +1414,43 @@ The package is designed for testability at every layer.
 Unit tests run without any network access and cover:
 
 - **Input validation** — `validators_test.go`: DN / base DN / host /
-  port / TLS-config / option validation, `formatHost` IPv4-vs-IPv6.
-- **Core helpers** — `helpers_test.go`: `attrsToMap`,
-  `escapeFilterArgs`, `parentDNOf` (including multi-valued RDN
-  preservation), `canonicalDN` (case folding, RDN-order significance,
-  escaped-comma round-trip, malformed fallback).
+  port / TLS-config / option validation, `formatHost` IPv4-vs-IPv6,
+  `isIPLiteral` IP-vs-DNS detection, and the IPv6-scoped-literal
+  limitation.
+- **Core helpers** — `helpers_test.go`: `attrsToMap` (including
+  duplicate-name deduplication), `escapeFilterArgs`, `parentDNOf`
+  (including multi-valued RDN preservation), `canonicalDN`
+  (case folding, RDN-order significance, escaped-comma round-trip,
+  structural ambiguity between `cn=a,ou=b` and `cn=a\,ou=b`, malformed
+  fallback), `escapeCanonicalValue`.
 - **Errors** — `ldapper_errors_test.go`: `classifyLDAPError`,
   `classifySensitiveBindError` (including the "no secret leak" regression
-  test), `isTimeoutError`, `isTransportError`.
+  test and the TLS-error classification), `isTimeoutError`,
+  `isTransportError`.
 - **Options & limits** — `ldapper_options_test.go`:
   `With/Set/GetSearchLimits`, `With/Set/GetDialTimeout`,
   `With/Set/GetOperationTimeout`, clamping, `-race` guards.
 - **Search primitives** — `ldapper_search_test.go`:
-  `searchSingleEntryLocked`, `searchPaged` (single page, multiple pages,
+  `searchSingleEntryLocked` (including arity and syntax validation via
+  `renderFilterTemplate`), `searchPaged` (single page, multiple pages,
   `MaxPages`/`MaxEntries` budgets, `RequirePaging` on/off, repeated-cookie
   runaway, `SizeLimitExceeded`-preserves-entries, context-cancelled
   during/between pages, raw error propagation),
   `CustomSearch`, `CustomSearchPaged`.
-- **Connection** — `ldapper_connection_test.go`: `withCtx` /
+- **Connection** — `ldapper_connection_test.go`: `runWithWatchdog` (happy
+  path, panic path with defer-based cleanup, timeout reset), `withCtx` /
   `withCtxResult` (deadline merging, watchdog, cancellation invalidating
   the connection), `Close`, `IsAlive`, `EnsureAlive`, `Reconnect`,
-  `dialAnyLocked`. Tests that swap the package-level `dialConn` seam are
-  **not** parallel — the swap is process-wide.
+  `dialAnyLocked` (including ctx-cancellation between hosts). Tests that
+  swap the package-level `dialConn` seam are **not** parallel — the swap
+  is process-wide.
 - **Auth** — `ldapper_auth_test.go`: `invalidateAuthLocked`,
   `restoreServiceBindLocked`, `bindConnLocked` / `verifyBaseDNLocked`
-  (success path, 0-entry base probe, transport failure), `BindConn`,
+  (success path, 0-entry base probe, transport failure), `BindConn`
+  (including `errors.Is`-reachability of `BindIdentity` errors),
   `CheckUserCredentials` (user-not-found masking, restore-failure path,
-  context-cancelled path).
+  restore-cancellation surfacing `context.Canceled`, context-cancelled
+  user-bind path).
 - **User / group / OU ops** — `ldapper_user_ops_test.go`,
   `ldapper_group_ops_test.go`, `ldapper_ou_ops_test.go`.
 - **Catalog tree** — `ldapper_catalog_tree_discovery_test.go`:
@@ -1265,7 +1466,9 @@ Unit tests run without any network access and cover:
   mapping, OU mapping, filter templates compiled by `ldap.CompileFilter`,
   args ordering, attribute lists, distinguishing-attribute guards,
   MSAD `ResolvePrimaryGroupDN` child-domain regression, FreeIPA
-  `BindIdentity` chain order.
+  `BindIdentity` structural-RDN detection (case-insensitive,
+  substring-vs-RDN regression), `appendRDN` `attrType` validation,
+  `binarySidToString` boundary (`subAuthorityCount == 255`).
 
 ```bash
 go test ./...
@@ -1273,12 +1476,32 @@ go test -race -count=20 ./...
 go vet ./...
 ```
 
-Test helpers:
+### Fuzz tests
 
-- **`utils_test.go`** (package `ldapper`):
-  `newLDAPEntry(dn, attrs) *ldap.Entry` — builds a `*ldap.Entry` with
-  both `Values` and `ByteValues` populated so `GetRawAttributeValue`
-  works in tests.
+`go test -run=^$ -fuzz=FuzzXxx ./...` drives the load-bearing invariants:
+
+- `FuzzCanonicalDN_NoPanic` / `FuzzCanonicalDN_CaseEquivalence`
+  (`helpers_fuzz_test.go`) — case-folding and no-panic contracts of the
+  tree-linking key.
+- `FuzzParentDNOf` (`helpers_fuzz_test.go`) — valid input yields parent =
+  `RDNs[1:]`, malformed / single-RDN input yields `""`.
+- `FuzzEscapeFilterArgs`, `FuzzValidateDN_SentinelContract`,
+  `FuzzValidateHost_SentinelContract` (`helpers_fuzz_test.go`) — filter
+  escaping and sentinel-error contracts.
+- `FuzzAppendRDN` (`adapters/builtin_adapter_helpers_test.go`) — DN
+  built by `appendRDN` must parse, and its first RDN must carry the
+  supplied `attrType` / value.
+- `FuzzAdapterFilterTemplates` (`adapters/filters_fuzz_test.go`) — for
+  every shipped adapter and every user-controlled input, the rendered
+  filter must compile; template arity is checked independently, catching
+  both under-supply (`%!s(MISSING)`) and over-supply (silently dropped
+  args).
+
+### Test helpers
+
+- **`utils_test.go`** (package `ldapper`): `newLDAPEntry(dn, attrs)
+  *ldap.Entry` — builds a `*ldap.Entry` with both `Values` and
+  `ByteValues` populated so `GetRawAttributeValue` works in tests.
 - **`ldapper_connection_test.go`**: `withDialConn(t, fn)` — swaps the
   package-level `dialConn` seam for the duration of a test and restores
   it via `t.Cleanup`.
@@ -1300,6 +1523,12 @@ Test helpers:
   - `requireValidFilter(t, filter)` — fails the test if
     `ldap.CompileFilter` rejects the filter, with the raw text included
     in the diagnostic.
+- **`integration_helpers_test.go`** (package `ldapper_test`, **no build
+  tag**) — shared helpers available to all four tagged integration
+  suites. Currently holds `containsDN` (case-insensitive substring match
+  for group DNs). Keep it dependency-free: only the standard library.
+  If a helper needs testify / `ldap/v3`, move it into the specific tagged
+  file that uses it.
 
 > **Tip:** tests that swap `dialConn` **must not** call `t.Parallel()`.
 > The swap is process-wide; parallel tests would stomp on each other.
@@ -1339,9 +1568,11 @@ What each suite exercises:
   cached password fails and leaves the client unusable (`ErrClosed`).
 - **MS AD** — real Samba 4 AD DC, exercising the AD-only
   `LDAP_MATCHING_RULE_IN_CHAIN` group expansion and the
-  `PrimaryGroupResolver` path (Domain Users must appear in
-  `GetUserGroups` output). Gracefully skips if the container cannot be
-  started.
+  `PrimaryGroupResolver` path. The primary-group test resolves the
+  expected DN via `primaryGroupToken` (the well-known RID 513), so it
+  is locale-independent — "Domain Users" only works in English AD
+  deployments, and the suite avoids that assumption. Gracefully skips
+  if the container cannot be started.
 - **FreeIPA** — real FreeIPA container, verifying that
   `ipa group-add-member` populates DN-valued `member`/`memberIndirect`,
   and cross-checking `GetUserGroups` against an independent
@@ -1371,6 +1602,17 @@ What each suite exercises:
 All integration tests assert error conditions with `errors.Is(err,
 ldapper.Err*)` against the sentinel contract — not against error text —
 so message rewording does not break them.
+
+Compile-time guards for the `PrimaryGroupResolver` contract are installed
+in each suite:
+
+- `msad_integration_test.go` — `var _ interfaces.PrimaryGroupResolver = adapters.MSADAdapter{}`
+  (the interface **must** be implemented).
+- `openldap_integration_test.go`, `freeipa_integration_test.go`,
+  `aldpro_integration_test.go` — an `init()`-time panic when the
+  adapter unexpectedly satisfies `interfaces.PrimaryGroupResolver`.
+  Go has no static "does not implement" assertion, so the runtime panic
+  is the closest equivalent.
 
 ---
 

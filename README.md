@@ -14,8 +14,9 @@ A lightweight, adapter-based LDAP client for Go. LDAPper wraps
   deterministically.
 - **Multi-host failover** and transparent reconnection.
 - **Pluggable catalog adapters** so the same API works against Microsoft
-  Active Directory, OpenLDAP, ALD Pro, FreeIPA, and any other directory you
-  write an adapter for.
+  Active Directory, Samba 4 AD DC, OpenLDAP, 389 Directory Server,
+  OpenDJ, Oracle Unified Directory, ALD Pro, FreeIPA, and any other
+  directory you write an adapter for.
 - **Connection-level search limits** (`SizeLimit`, `TimeLimit`, `MaxPages`,
   `MaxEntries`, `RequirePaging`) injected once at construction time.
 - **Client-side operation timeouts** applied around individual `Bind` /
@@ -26,20 +27,23 @@ A lightweight, adapter-based LDAP client for Go. LDAPper wraps
   `ErrInvalidCredentials`, `ErrInsufficientAccess`, …) designed for
   `errors.Is` / `errors.As`.
 - **End-to-end integration tests** for every shipped adapter, running
-  against real directory servers in Docker (OpenLDAP, Samba 4 AD DC,
-  FreeIPA, and OpenLDAP-with-ALDPro-schema).
+  against real directory servers in Docker.
 
 ---
 
 ## Test status
 
-| Layer                       | Where it runs                                        | Build tag                | Notes |
-|-----------------------------|------------------------------------------------------|--------------------------|-------|
-| Unit tests                  | `go test -race ./...` (GitHub Actions, every push)    | —                        | No external dependencies; includes the race detector. |
-| Integration — OpenLDAP      | `go test -tags=integration_openldap ./...`            | `integration_openldap`   | Spins up `osixia/openldap:1.5.0` via testcontainers. |
-| Integration — MS AD         | `go test -tags=integration_msad ./...`                | `integration_msad`       | Spins up a Samba 4 AD DC; gracefully skips if Docker is unavailable. |
-| Integration — FreeIPA       | `go test -tags=integration_freeipa ./...`             | `integration_freeipa`    | Spins up a FreeIPA server; heavy image, gracefully skips on failure. |
-| Integration — ALDPro        | `go test -tags=integration_aldpro ./...`              | `integration_aldpro`     | OpenLDAP + custom ALDPro schema. |
+| Layer                          | Where it runs                                        | Build tag                | Notes |
+|--------------------------------|------------------------------------------------------|--------------------------|-------|
+| Unit tests                     | `go test -race ./...` (GitHub Actions, every push)    | —                        | No external dependencies; includes the race detector. |
+| Integration — OpenLDAP         | `go test -tags=integration_openldap ./...`            | `integration_openldap`   | Spins up `osixia/openldap:1.5.0` via testcontainers. |
+| Integration — MS AD            | `go test -tags=integration_msad ./...`                | `integration_msad`       | Spins up a Samba 4 AD DC; gracefully skips if Docker is unavailable. |
+| Integration — Samba AD DC      | `go test -tags=integration_samba ./...`               | `integration_samba`      | Same image as MS AD; exercises `SAMBAAdapter`. |
+| Integration — 389-DS           | `go test -tags=integration_389ds ./...`               | `integration_389ds`      | `389ds/dirsrv` (LDAP on `:3389`). |
+| Integration — OpenDJ           | `go test -tags=integration_opendj ./...`              | `integration_opendj`     | `openidentityplatform/opendj` (`:1389`). |
+| Integration — OUD              | `go test -tags=integration_oud ./...`                 | `integration_oud`        | Same image as OpenDJ (compat proxy; see below). |
+| Integration — FreeIPA          | `go test -tags=integration_freeipa ./...`             | `integration_freeipa`    | Spins up a FreeIPA server; heavy image, gracefully skips on failure. |
+| Integration — ALDPro           | `go test -tags=integration_aldpro ./...`              | `integration_aldpro`     | OpenLDAP + custom ALDPro schema. |
 
 Coverage is measured with `go test -coverprofile=coverage.out ./...` and
 uploaded to Codecov on every push to `main` and on pull requests. The
@@ -48,8 +52,12 @@ current coverage report is available at
 
 The default `go test ./...` is intentionally fast and Docker-free: all
 integration suites live behind build tags so they do not compile into
-the default test binary (Go allows only one `TestMain` per package, so
-the tags are also what keeps the four suites from colliding).
+the default test binary. Go allows only one `TestMain` per package, so
+each tag also isolates a single suite in the compiled test binary — and
+that means **tags must be run one at a time**, not combined. In
+particular, `integration_opendj` and `integration_oud` cannot be passed
+together: both define `TestMain` in `package ldapper_test`, so combining
+them is a `compile: duplicate symbol` error.
 
 ## Table of contents
 
@@ -201,8 +209,8 @@ plain structs and functions.
 │  Close                       │    │                               │
 └──────────────┬───────────────┘    └──────────────┬────────────────┘
                │                                   │
-   prod: *ldap.Conn                  prod: adapters.{MSAD, OPENLDAP,
-   test: mocks.MockLDAPConn                ALDPRO, FREEIPA}Adapter
+   prod: *ldap.Conn       prod: adapters.{MSAD, SAMBA, OPENLDAP,
+   test: mocks.MockLDAPConn      DS389, OpenDJ, OUD, ALDPRO, FREEIPA}
                                      test: fakeAdapter
                                      (ldapper_auth_test.go)
 
@@ -339,8 +347,8 @@ marker) and structural problems (via `ldap.CompileFilter`) with
 not as a mysterious "Bad search filter" from the server.
 
 **Note on ambiguity**: single-object lookups use
-`ScopeWholeSubtree` + `SizeLimit=2`. On MSAD, a user and a
-`contact`/`computer` object with the same `sAMAccountName` in
+`ScopeWholeSubtree` + `SizeLimit=2`. On MSAD and Samba AD DC, a user
+and a `contact`/`computer` object with the same `sAMAccountName` in
 different OUs will trigger `ErrAmbiguousResult` even though the
 caller only cared about the user. See
 [Adapter-specific gotchas](#adapter-specific-gotchas).
@@ -706,10 +714,10 @@ type PrimaryGroupResolver interface {
 ```
 
 `GetUserGroups` checks for this interface via a type assertion. Only
-`MSADAdapter` implements it (for AD's `primaryGroupID` resolution); the
-others deliberately do not, because their schemas have no such concept
-and the presence of the interface would cause `GetUserGroups` to try to
-resolve a non-existent attribute.
+`MSADAdapter` and `SAMBAAdapter` implement it (for AD's `primaryGroupID`
+resolution); the others deliberately do not, because their schemas have
+no such concept and the presence of the interface would cause
+`GetUserGroups` to try to resolve a non-existent attribute.
 
 **`PrimaryGroupResolver` implementations MUST use only the provided
 `LDAPConn` and MUST NOT call `LDAPper` methods** — the resolver is
@@ -725,7 +733,7 @@ to N × `opTimeouts.Search`. For a hard end-to-end bound, attach a
 `context.WithTimeout` to the `GetUserGroups` call.
 
 The adapter is the only place LDAPper assumes anything about schema. See
-[Shipped adapters](#shipped-adapters) for the four adapters that ship
+[Shipped adapters](#shipped-adapters) for the adapters that ship
 with the library.
 
 ### Search limits
@@ -875,40 +883,73 @@ conn, _ := ldapper.NewLDAPper(
 
 ## Shipped adapters
 
-| Adapter                     | Directory                          | Notes                                                                                                                                                                                                                                                                                                                         |
-|-----------------------------|------------------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `adapters.MSADAdapter`      | Microsoft Active Directory         | Uses `objectCategory`-based filters; recursive group search via the `LDAP_MATCHING_RULE_IN_CHAIN` OID (`1.2.840.113556.1.4.1941`); prefers `thumbnailPhoto` over `jpegPhoto`; implements `PrimaryGroupResolver` to resolve `primaryGroupID` into a group DN.                                                                  |
-| `adapters.OPENLDAPAdapter`  | OpenLDAP (and most RFC-4519 dialects) | Handles three group models — `groupOfNames` (via `member`), `groupOfUniqueNames` (via `uniqueMember`), and `posixGroup` (via `memberUid`). User search keyed by `uid` **or** `entryDN`. Short-form bind (`alice`) is expanded to `uid=<login>,<baseDN>`.                                                                      |
-| `adapters.ALDPROAdapter`    | ALD Pro                            | Recognizes `rbta-org-unit` alongside `organizationalUnit`; department mapped from `rbtadp`; two-branch group filter — `member`/`memberIndirect` (DN) for `groupOfNames`/`ipaUserGroup`/`posixGroup`, **and** `memberUid` (uid) for `posixGroup`. Bind is pass-through (UPN/DN).                                               |
-| `adapters.FREEIPAAdapter`   | FreeIPA                            | Recognizes `nsContainer` alongside `organizationalUnit`; department is intentionally **not** mapped; group lookup matches DN-valued `member`/`memberIndirect` **and** uid-valued `memberUid`. Short-form bind is expanded to `uid=<login>,cn=users,cn=accounts,<baseDN>`, unless `baseDN` already contains those RDN nodes — the detection is **structural** (parsed via `ldap.ParseDN`, compared case-insensitively per-RDN), not a substring match.              |
+The eight adapters group into three schema families. Members of the same
+family share almost all behaviour — the new adapters are implemented by
+embedding the family's "base" adapter and overriding only the pieces
+that genuinely differ. This keeps the code (and its tests) small and
+avoids drift between family members.
+
+| Adapter                    | Directory                                        | Family              | Notes |
+|----------------------------|--------------------------------------------------|---------------------|-------|
+| `adapters.MSADAdapter`     | Microsoft Active Directory                       | AD                  | Baseline for the AD family. `objectCategory`-based filters; recursive group expansion via `LDAP_MATCHING_RULE_IN_CHAIN` (`1.2.840.113556.1.4.1941`); prefers `thumbnailPhoto` over `jpegPhoto`; implements `PrimaryGroupResolver` for `primaryGroupID`. |
+| `adapters.SAMBAAdapter`    | Samba 4 AD DC                                    | AD (embeds MSAD)    | Samba 4 presents an AD-compatible schema — sAMAccountName, userPrincipalName, objectSid, primaryGroupID, LDAP_MATCHING_RULE_IN_CHAIN (since Samba 4.11). Embeds `MSADAdapter`; inherits `PrimaryGroupResolver`. |
+| `adapters.OPENLDAPAdapter` | OpenLDAP (and most RFC-4519 dialects)            | OpenLDAP            | Baseline for the OpenLDAP family. Three group models — `groupOfNames` (`member`), `groupOfUniqueNames` (`uniqueMember`), `posixGroup` (`memberUid`). User search keyed by `uid` **or** `entryDN`. Short-form bind expands to `uid=<login>,<baseDN>`. |
+| `adapters.DS389Adapter`    | 389 Directory Server (and forks)                 | OpenLDAP (embeds OPENLDAP) | Netscape-derived. Adds `nsAccount` / `nsOrgPerson` to the user object filter (they often appear on top of `inetOrgPerson` / `posixAccount`), and requests `nsAccountLock` in `UserAttrs`. Group model and bind expansion inherited. |
+| `adapters.OpenDJAdapter`   | OpenDJ (ForgeRock / Open Identity Platform)      | OpenLDAP (embeds OPENLDAP) | Same group model; adds the virtual `isMemberOf` attribute to `UserAttrs` — OpenDJ computes it on user entries so callers can read group membership without a separate search. |
+| `adapters.OUDAdapter`      | Oracle Unified Directory                         | OpenLDAP (embeds OpenDJ) | OUD is Oracle's fork of OpenDJ: identical group model, user schema, and virtual `isMemberOf`. Embeds `OpenDJAdapter`; exists so call sites read naturally and OUD-specific quirks can be added later. |
+| `adapters.ALDPROAdapter`   | ALD Pro (Astra Linux Directory Pro)              | FreeIPA-style       | Recognizes `rbta-org-unit` alongside `organizationalUnit`; department from `rbtadp`; two-branch group filter (`member`/`memberIndirect` DN + `memberUid` uid). Bind is pass-through (UPN/DN). |
+| `adapters.FREEIPAAdapter`  | FreeIPA                                          | FreeIPA             | Recognizes `nsContainer` alongside `organizationalUnit`; department is intentionally not mapped; two-branch group filter. Short-form bind expanded to `uid=<login>,cn=users,cn=accounts,<baseDN>`, with **structural** RDN detection (case-insensitive; substring matching was a bug we fixed). |
+
+All eight adapters are stateless and safe to reuse across connections.
 
 ### Adapter-specific gotchas
 
-- **`MSADAdapter`** — `GetUser` matches on `sAMAccountName` /
-  `userPrincipalName` / `distinguishedName`. The value passed to
-  `NewAuthenticatedLDAPper` must therefore be a valid AD principal (UPN,
+- **`MSADAdapter` / `SAMBAAdapter`** — `GetUser` matches on
+  `sAMAccountName` / `userPrincipalName` / `distinguishedName`. The value
+  passed to `NewAuthenticatedLDAPper` must be a valid AD principal (UPN,
   sAMAccountName, or DN). Group search uses
   `LDAP_MATCHING_RULE_IN_CHAIN`, which **Samba 4 AD DC** and Microsoft AD
-  both support — OpenLDAP and FreeIPA do **not**.
+  both support — OpenLDAP, 389-DS, OpenDJ, OUD and FreeIPA do **not**.
 
   > **Ambiguity risk:** `GetUser` / `GetGroup` / `GetOU` use
-  > `ScopeWholeSubtree` + `SizeLimit=2` to detect duplicates. On AD, a
-  > user and a `contact`/`computer` object with the same
+  > `ScopeWholeSubtree` + `SizeLimit=2` to detect duplicates. On AD and
+  > Samba, a user and a `contact`/`computer` object with the same
   > `sAMAccountName` (across different OUs) both match the user filter,
   > so the lookup fails with `ErrAmbiguousResult`. Pass a fully qualified
   > principal (UPN or DN) or narrow the `baseDN` to the user's OU when
   > this happens.
 
-- **`OPENLDAPAdapter`** — the user filter uses the indexed placeholder
-  `%[1]s` so the same argument is substituted into both `uid=` and
-  `entryDN=`, allowing lookup by either short name or full DN. The
-  user-groups filter is a union of three branches:
+  > **Samba container gotcha (integration tests only):** the Samba 4 AD
+  > DC container needs `Privileged: true` and a proper FQDN in
+  > `Hostname`; the suite gracefully skips if the container cannot start.
+
+- **`OPENLDAPAdapter` / `DS389Adapter` / `OpenDJAdapter` / `OUDAdapter`**
+  — the user filter uses the indexed placeholder `%[1]s` so the same
+  argument is substituted into both `uid=` and `entryDN=`, allowing
+  lookup by either short name or full DN. The user-groups filter is a
+  union of the group models:
   ```
   (|(&(objectClass=groupOfNames)(member=%[1]s))
     (&(objectClass=groupOfUniqueNames)(uniqueMember=%[1]s))
     (&(objectClass=posixGroup)(memberUid=%[2]s)))
   ```
-  with args `[user.DN, user.uid]`.
+  with args `[user.DN, user.uid]`. DS389 overrides `UserObjectFilter`
+  and `UserAttrs`; OpenDJ and OUD override only `UserAttrs`. The group
+  filter is inherited.
+
+- **`DS389Adapter`** — 389-DS exposes account state via
+  `nsAccountLock: true`. Unlike OpenLDAP, the attribute is on the user
+  entry, so it is included in `UserAttrs`. The user filter additionally
+  includes `nsAccount` / `nsOrgPerson` — they commonly appear alongside
+  `inetOrgPerson` on 389-DS entries. A container gotcha for the
+  integration suite: 389-DS listens on `:3389`, not `:389`.
+
+- **`OpenDJAdapter` / `OUDAdapter`** — OpenDJ computes the virtual
+  `isMemberOf` attribute on user entries. Requesting it in `UserAttrs`
+  lets callers read group membership directly from the user entry. It is
+  harmless on servers that do not implement it (the attribute is simply
+  absent), which keeps the adapter usable against plain OpenLDAP too.
+
 - **`ALDPROAdapter`** — the user-groups filter:
   ```
   (|(&(|(objectClass=groupOfNames)(objectClass=ipaUserGroup)(objectClass=posixGroup))
@@ -916,28 +957,33 @@ conn, _ := ldapper.NewLDAPper(
     (&(objectClass=posixGroup)(memberUid=%[2]s)))
   ```
   with args `[user.DN, user.uid]`.
+
 - **`FREEIPAAdapter`** — the user-groups filter uses the same shape as
   ALDPro (two positional args, DN and uid).
+
 - **`BindIdentity`**:
-  - `MSAD` / `ALDPro` — pass-through. The server performs the mapping.
-  - `OPENLDAP` — short-form login is expanded to `uid=<login>,<baseDN>`.
+  - `MSAD` / `SAMBA` / `ALDPro` — pass-through. The server performs the
+    mapping.
+  - `OPENLDAP` / `389-DS` / `OpenDJ` / `OUD` — short-form login is
+    expanded to `uid=<login>,<baseDN>`.
   - `FreeIPA` — short-form login is expanded to
     `uid=<login>,cn=users,cn=accounts,<baseDN>` (the chain is built
     deepest-first: `accounts` → `users` → `uid`). Whether each `cn=...`
     node is added is decided by structural RDN comparison (case-
     insensitive, single-valued RDN), not by substring matching the DN
     string.
+
 - **`GetNormalizedOUInfoFromEntry.Name`** — all shipped adapters derive
   `Name` from the **first RDN of `entry.DN`** via `ouNameFromDN`. The
   helper does not check the RDN attribute type: it returns the first
   attribute's value whatever it is (`ou=sales` → `"sales"`,
   `cn=users` → `"users"`). It is meant for display (tree labels, log
   lines), not identification. Malformed DNs fall back to the raw string.
-- **`GetNormalizedOUInfoFromEntry.OU`** — MSAD sets `OU` to the **full
-  entry DN**; the other three adapters read the `ou` attribute, with
-  `cn` fallback for ALDPro's `rbta-org-unit` and FreeIPA's `nsContainer`.
 
-All four adapters are stateless and safe to reuse across connections.
+- **`GetNormalizedOUInfoFromEntry.OU`** — `MSAD` and `SAMBA` set `OU` to
+  the **full entry DN**; the other six adapters read the `ou` attribute,
+  with `cn` fallback for ALDPro's `rbta-org-unit` and FreeIPA's
+  `nsContainer`.
 
 ### Attribute mapping in `GetNormalizedUserInfo`
 
@@ -946,35 +992,35 @@ never from an attribute. Every adapter reads the remaining fields from LDAP
 attributes; `—` means "hardcoded to empty" (attribute not read even if
 present).
 
-| `UserNormalizedInfo` field | MSAD                     | OpenLDAP           | ALD Pro           | FreeIPA      |
-|----------------------------|--------------------------|--------------------|-------------------|--------------|
-| `DistinguishedName`        | struct `DN`              | struct `DN`        | struct `DN`       | struct `DN`  |
-| `CommonName`               | `cn`                     | `cn`               | `cn`              | `cn`         |
-| `Mobile`                   | `mobile`                 | `mobile`           | `mobile`          | `mobile`     |
-| `Phone`                    | `telephoneNumber`        | `telephoneNumber`  | `telephoneNumber` | `telephoneNumber` |
-| `Mail`                     | `mail`                   | `mail`             | `mail`            | `mail`       |
-| `Department`               | `department`             | `departmentNumber` | `rbtadp`          | —            |
-| `Title`                    | `title`                  | `title`            | `title`           | `title`      |
-| `Manager`                  | `manager`                | `manager`          | `manager`         | `manager`    |
-| `Photo`                    | `thumbnailPhoto` → `jpegPhoto` | `jpegPhoto`  | `jpegPhoto`       | `jpegPhoto`  |
-| `Company`                  | `company`                | `o`                | `o`               | `o`          |
-| `Country`                  | `co`                     | —                  | `co`              | `co`         |
-| `Address`                  | `streetAddress`          | `postalAddress`    | `streetAddress`   | `street`     |
-| `City`                     | `l`                      | —                  | `l`               | `l`          |
-| `Index`                    | `postalCode`             | —                  | `postalCode`      | `postalCode` |
+| `UserNormalizedInfo` field | MSAD / SAMBA             | OpenLDAP family (OPENLDAP, 389-DS, OpenDJ, OUD) | ALD Pro           | FreeIPA      |
+|----------------------------|--------------------------|-------------------------------------------------|-------------------|--------------|
+| `DistinguishedName`        | struct `DN`              | struct `DN`                                     | struct `DN`       | struct `DN`  |
+| `CommonName`               | `cn`                     | `cn`                                            | `cn`              | `cn`         |
+| `Mobile`                   | `mobile`                 | `mobile`                                        | `mobile`          | `mobile`     |
+| `Phone`                    | `telephoneNumber`        | `telephoneNumber`                               | `telephoneNumber` | `telephoneNumber` |
+| `Mail`                     | `mail`                   | `mail`                                          | `mail`            | `mail`       |
+| `Department`               | `department`             | `departmentNumber`                              | `rbtadp`          | —            |
+| `Title`                    | `title`                  | `title`                                         | `title`           | `title`      |
+| `Manager`                  | `manager`                | `manager`                                       | `manager`         | `manager`    |
+| `Photo`                    | `thumbnailPhoto` → `jpegPhoto` | `jpegPhoto`                               | `jpegPhoto`       | `jpegPhoto`  |
+| `Company`                  | `company`                | `o`                                             | `o`               | `o`          |
+| `Country`                  | `co`                     | —                                               | `co`              | `co`         |
+| `Address`                  | `streetAddress`          | `postalAddress`                                 | `streetAddress`   | `street`     |
+| `City`                     | `l`                      | —                                               | `l`               | `l`          |
+| `Index`                    | `postalCode`             | —                                               | `postalCode`      | `postalCode` |
 
 Key differences to keep in mind:
 
 - **`Department`** — four different sources (`department`,
   `departmentNumber`, `rbtadp`, or none). FreeIPA simply does not map it.
-- **`Address`** — MSAD and ALD Pro use `streetAddress`, OpenLDAP uses
-  `postalAddress`, FreeIPA uses `street`.
-- **`Company`** — MSAD uses the `company` attribute, the other three use `o`.
-- **`Photo`** — only MSAD falls back from `thumbnailPhoto` to `jpegPhoto`;
-  the other three read `jpegPhoto` only and do **not** consult
+- **`Address`** — MSAD/Samba/ALDPro use `streetAddress`, OpenLDAP family
+  uses `postalAddress`, FreeIPA uses `street`.
+- **`Company`** — MSAD/Samba use the `company` attribute, the others use `o`.
+- **`Photo`** — only MSAD/Samba fall back from `thumbnailPhoto` to
+  `jpegPhoto`; the others read `jpegPhoto` only and do **not** consult
   `thumbnailPhoto`.
-- **`Country` / `City` / `Index`** — OpenLDAP hardcodes these to empty
-  regardless of the entry's attributes.
+- **`Country` / `City` / `Index`** — OpenLDAP family hardcodes these to
+  empty regardless of the entry's attributes.
 
 ---
 
@@ -1074,7 +1120,7 @@ users, err := conn.GetOUUsers(ctx, "OU=Staff,DC=corp,DC=example,DC=com")
   `SearchUserGroupsFilterTemplate` / `SearchUserGroupsFilterTemplateArgs`
   with `[]string{"1.1"}` (OID for "no attributes"), so only DNs come back
   from the server. Returns group **DNs** (not `cn` values). If the adapter
-  implements `PrimaryGroupResolver` (only MSAD does), the primary group
+  implements `PrimaryGroupResolver` (MSAD and Samba), the primary group
   DN is appended to the result. See [Adapters](#adapters) for the
   per-request timeout semantics of the resolver.
 - **`GetOUUsers`** — takes a **DN**, not a short `ou` name. Uses the
@@ -1353,7 +1399,10 @@ Rules of thumb:
 
 See `adapters/msad_adapter.go`, `adapters/openldap_adapter.go`,
 `adapters/aldpro_adapter.go` and `adapters/freeipa_adapter.go` for
-complete, production-quality examples.
+complete, production-quality examples. For examples of embedding a
+family base adapter (`SAMBAAdapter` embeds `MSADAdapter`; `DS389Adapter`
+and `OpenDJAdapter` embed `OPENLDAPAdapter`; `OUDAdapter` embeds
+`OpenDJAdapter`), see the corresponding files in `adapters/`.
 
 ---
 
@@ -1469,6 +1518,11 @@ Unit tests run without any network access and cover:
   `BindIdentity` structural-RDN detection (case-insensitive,
   substring-vs-RDN regression), `appendRDN` `attrType` validation,
   `binarySidToString` boundary (`subAuthorityCount == 255`).
+  Family-base delegation is pinned explicitly: `SAMBAAdapter` is
+  verified to match `MSADAdapter` on every method; `DS389Adapter` /
+  `OpenDJAdapter` are verified to keep the inherited `OPENLDAPAdapter`
+  behaviour and only extend it where documented; `OUDAdapter` is
+  verified to match `OpenDJAdapter`.
 
 ```bash
 go test ./...
@@ -1492,10 +1546,10 @@ go vet ./...
   built by `appendRDN` must parse, and its first RDN must carry the
   supplied `attrType` / value.
 - `FuzzAdapterFilterTemplates` (`adapters/filters_fuzz_test.go`) — for
-  every shipped adapter and every user-controlled input, the rendered
-  filter must compile; template arity is checked independently, catching
-  both under-supply (`%!s(MISSING)`) and over-supply (silently dropped
-  args).
+  **every** shipped adapter (all eight, including the family extensions)
+  and every user-controlled input, the rendered filter must compile;
+  template arity is checked independently, catching both under-supply
+  (`%!s(MISSING)`) and over-supply (silently dropped args).
 
 ### Test helpers
 
@@ -1524,7 +1578,7 @@ go vet ./...
     `ldap.CompileFilter` rejects the filter, with the raw text included
     in the diagnostic.
 - **`integration_helpers_test.go`** (package `ldapper_test`, **no build
-  tag**) — shared helpers available to all four tagged integration
+  tag**) — shared helpers available to all eight tagged integration
   suites. Currently holds `containsDN` (case-insensitive substring match
   for group DNs). Keep it dependency-free: only the standard library.
   If a helper needs testify / `ldap/v3`, move it into the specific tagged
@@ -1540,23 +1594,41 @@ End-to-end tests spin up real directories via
 [testcontainers-go](https://golang.testcontainers.org/) and require a
 running Docker daemon. Each suite lives in a separate file behind its own
 build tag, because Go allows **only one `TestMain` per package** — the
-tags keep the suites from compiling together.
+tags keep the suites from compiling together. For the same reason,
+**tags must be run one at a time**: combining any two suites (e.g.
+`integration_opendj` + `integration_oud`) into a single `go test` call
+compiles two `TestMain` functions into `package ldapper_test`, which is
+a duplicate-symbol error.
 
-| File                              | Build tag                | Container                          |
-|-----------------------------------|--------------------------|------------------------------------|
-| `openldap_integration_test.go`    | `integration_openldap`   | `osixia/openldap:1.5.0`            |
-| `msad_integration_test.go`        | `integration_msad`       | `nowszy/samba-ad-dc` (Samba 4 AD)  |
-| `freeipa_integration_test.go`     | `integration_freeipa`    | `freeipa/freeipa-server:rocky-9`   |
-| `aldpro_integration_test.go`      | `integration_aldpro`     | `osixia/openldap` + ALDPro schema  |
+| File                              | Build tag                | Container                                       |
+|-----------------------------------|--------------------------|-------------------------------------------------|
+| `openldap_integration_test.go`    | `integration_openldap`   | `osixia/openldap:1.5.0`                         |
+| `msad_integration_test.go`        | `integration_msad`       | `nowszy/samba-ad-dc` (Samba 4 AD)               |
+| `sambadc_integration_test.go`     | `integration_samba`      | `nowszy/samba-ad-dc` (Samba 4 AD, `SAMBAAdapter`) |
+| `ds389_integration_test.go`       | `integration_389ds`      | `389ds/dirsrv` (LDAP on `:3389`)                |
+| `opendj_integration_test.go`      | `integration_opendj`     | `openidentityplatform/opendj` (`:1389`)         |
+| `oracleud_integration_test.go`    | `integration_oud`        | `openidentityplatform/opendj` (OUD-compat proxy)|
+| `freeipa_integration_test.go`     | `integration_freeipa`    | `freeipa/freeipa-server:rocky-9`                |
+| `aldpro_integration_test.go`      | `integration_aldpro`     | `osixia/openldap` + ALDPro schema               |
 
 Run one suite at a time:
 
 ```bash
 go test -tags=integration_openldap ./...
 go test -tags=integration_msad     ./...
+go test -tags=integration_samba    ./...
+go test -tags=integration_389ds    ./...
+go test -tags=integration_opendj   ./...
+go test -tags=integration_oud      ./...
 go test -tags=integration_freeipa  ./...
 go test -tags=integration_aldpro   ./...
 ```
+
+In CI (`.github/workflows/integration.yml`) every suite is its own job.
+Light-weight suites (`openldap`, `aldpro`) run on every PR that touches
+adapters or integration files; the heavier ones (`msad`, `samba`,
+`389ds`, `opendj`, `oud`, `freeipa`) run only on schedule / manual
+triggers, so PR feedback stays fast.
 
 What each suite exercises:
 
@@ -1573,6 +1645,30 @@ What each suite exercises:
   is locale-independent — "Domain Users" only works in English AD
   deployments, and the suite avoids that assumption. Gracefully skips
   if the container cannot be started.
+- **Samba AD DC** — same container image as MS AD, exercised through
+  `SAMBAAdapter`. Because `SAMBAAdapter` embeds `MSADAdapter`, the suite
+  is the Samba-flavoured mirror of the MS AD tests: same filters, same
+  `LDAP_MATCHING_RULE_IN_CHAIN` group expansion, same
+  `PrimaryGroupResolver` path with `primaryGroupToken=513`. This is the
+  end-to-end proof that the embedding introduced no drift.
+- **389-DS** — `DS389Adapter` against `389ds/dirsrv` (listening on
+  `:3389`). Exercises the extended `UserObjectFilter` (which now
+  includes `nsAccount` / `nsOrgPerson`) and the extra `nsAccountLock`
+  attribute; group model (via the inherited `groupOfNames` /
+  `posixGroup` union) and short-form bind expansion are verified
+  end-to-end.
+- **OpenDJ** — `OpenDJAdapter` against `openidentityplatform/opendj`
+  (`:1389`). Same group model as OpenLDAP, plus the virtual
+  `isMemberOf` attribute — the suite exercises both branches of the
+  group filter and both short-form and full-DN binds.
+- **OUD** — `OUDAdapter` against the **same OpenDJ image**, used as an
+  OUD-compatible proxy: a real Oracle OUD image requires an Oracle
+  licence and is not redistributable, but OUD is Oracle's fork of
+  OpenDJ and shares the same LDAP engine, group model, user schema and
+  virtual `isMemberOf` attribute. The suite therefore serves as an
+  OUD contract test even though the running binary is OpenDJ. As noted
+  above, it cannot be combined with `integration_opendj` in the same
+  `go test` invocation (both define `TestMain`).
 - **FreeIPA** — real FreeIPA container, verifying that
   `ipa group-add-member` populates DN-valued `member`/`memberIndirect`,
   and cross-checking `GetUserGroups` against an independent
@@ -1603,16 +1699,19 @@ All integration tests assert error conditions with `errors.Is(err,
 ldapper.Err*)` against the sentinel contract — not against error text —
 so message rewording does not break them.
 
-Compile-time guards for the `PrimaryGroupResolver` contract are installed
-in each suite:
+Guards for the `PrimaryGroupResolver` contract are installed per suite,
+in both directions:
 
-- `msad_integration_test.go` — `var _ interfaces.PrimaryGroupResolver = adapters.MSADAdapter{}`
-  (the interface **must** be implemented).
-- `openldap_integration_test.go`, `freeipa_integration_test.go`,
-  `aldpro_integration_test.go` — an `init()`-time panic when the
-  adapter unexpectedly satisfies `interfaces.PrimaryGroupResolver`.
-  Go has no static "does not implement" assertion, so the runtime panic
-  is the closest equivalent.
+- **Positive** (the adapter **must** implement the interface):
+  - `msad_integration_test.go` — `var _ interfaces.PrimaryGroupResolver = adapters.MSADAdapter{}`
+  - `sambadc_integration_test.go` — `var _ interfaces.PrimaryGroupResolver = adapters.SAMBAAdapter{}`
+- **Negative** (the adapter must **not** implement it — presence of the
+  interface would make `GetUserGroups` try to resolve a non-existent
+  attribute). Go has no static "does not implement" assertion, so each
+  file does an `init()`-time panic if the interface is unexpectedly
+  satisfied: `openldap_integration_test.go`, `freeipa_integration_test.go`,
+  `aldpro_integration_test.go`, `ds389_integration_test.go`,
+  `opendj_integration_test.go`, `oracleud_integration_test.go`.
 
 ---
 

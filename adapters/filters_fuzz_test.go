@@ -30,7 +30,11 @@ var allShippedAdapters = []struct {
 	adapter filterTemplateAdapter
 }{
 	{"MSAD", MSADAdapter{}},
+	{"Samba", SAMBAAdapter{}},
 	{"OpenLDAP", OPENLDAPAdapter{}},
+	{"389-DS", DS389Adapter{}},
+	{"OpenDJ", OpenDJAdapter{}},
+	{"OUD", OUDAdapter{}},
 	{"ALDPro", ALDPROAdapter{}},
 	{"FreeIPA", FREEIPAAdapter{}},
 }

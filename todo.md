@@ -1,1 +1,1 @@
-- wide user/ou/group normalisation for different adapters
+- wide user/ou/group normalization for different adapters
